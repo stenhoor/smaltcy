@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-smaltcy (repository `smalt-graph-db`, npm `@smaltworks/smaltcy`) is a graph database for the browser in TypeScript:
+smaltcy (repository `stenhoor/smaltcy`, npm `@smaltworks/smaltcy`) is a graph database for the browser in TypeScript:
 Cypher compiles to graph plans, an engine runs plans on pluggable stores, and a WebGPU graph view draws graphs. It is
 part of the smalt family: smaltdb's CLAUDE.md has the family's shared working rules, and they apply here too.
 
@@ -12,10 +12,12 @@ badges unchanged from the family. smaltcy has no mark or product colour yet (ADR
 
 ## Workflow
 
-Early development (owner, 2026-11-12): no pull requests. When work is done and `npm run check` passes, commit and push
-it straight to `main`. This replaces the family rule of one PR per task until the owner says otherwise.
+The family's rules: one task per branch and pull request; open it once CI passes; the owner merges. Before pushing,
+`npm run check` and `npm run test:quick`. (smaltcy started in `apbeers/smalt-graph-db`, where work went straight to
+`main`; that ended with the move here, 2026-11-13.) CI runs on pull requests and on pushes to `main`, and can be run by
+hand on a branch (Actions → CI → Run workflow; tick `full` for the full browser suite).
 
-The site (https://andrewbeers.me/smalt-graph-db/) deploys from `.github/workflows/docs.yml` only: the repository's
+The site (https://stenhoor.github.io/smaltcy/) deploys from `.github/workflows/docs.yml` only: the repository's
 Settings → Pages → Source must stay **GitHub Actions**. With "Deploy from a branch", GitHub publishes the repository's
 root on every push and replaces the site with a 404 (2026-11-12). A push that touches no docs or source doesn't
 redeploy; run the Docs workflow by hand to republish.

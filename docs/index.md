@@ -16,7 +16,7 @@ hero:
       link: /guide/getting-started
     - theme: alt
       text: GitHub
-      link: https://github.com/apbeers/smalt-graph-db
+      link: https://github.com/stenhoor/smaltcy
 features:
   - title: Cypher in, rows and graphs out
     details: MATCH, OPTIONAL MATCH, WITH, variable-length paths, shortest paths, aggregates, CREATE, MERGE, SET and DELETE, in a hand-written parser.

@@ -18,7 +18,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const argv = process.argv.slice(2);
 const shots = resolve(argv.includes('--shots') ? argv[argv.indexOf('--shots') + 1] : join(tmpdir(), 'smaltcy-playground-shots'));
 const QUICK = argv.includes('--quick');
-const BASE = '/smalt-graph-db/';
+const BASE = '/smaltcy/';
 mkdirSync(shots, { recursive: true });
 
 execFileSync(join(root, 'node_modules/.bin/vitepress'), ['build', 'docs'], { cwd: root, stdio: 'inherit' });

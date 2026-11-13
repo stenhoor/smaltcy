@@ -18,8 +18,9 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/apbeers/smalt-graph-db.git"
+    "url": "git+https://github.com/stenhoor/smaltcy.git"
   },
+  "homepage": "https://stenhoor.github.io/smaltcy/",
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",

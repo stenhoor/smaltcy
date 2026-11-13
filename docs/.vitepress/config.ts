@@ -6,9 +6,9 @@ import { smaltworksMenu, smaltworksFooter } from './theme/smaltworks'
 import { runnablePlugin } from './theme/runnable'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
-const REPO = 'https://github.com/apbeers/smalt-graph-db'
+const REPO = 'https://github.com/stenhoor/smaltcy'
 // GitHub Pages serves the site under the repository's name.
-const BASE = process.env.SMALTCY_BASE ?? '/smalt-graph-db/'
+const BASE = process.env.SMALTCY_BASE ?? '/smaltcy/'
 
 export default defineConfig({
   title: 'smaltcy',
