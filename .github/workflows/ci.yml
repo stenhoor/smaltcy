@@ -1,0 +1,63 @@
+name: CI
+
+# Pushes to main (everything lands there), pull requests, and by hand. Run by hand with "full" for the long browser
+# suites (bigger graphs, layouts run to rest): about 6 minutes, against about 2 for the quick ones.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Run the full browser suites
+        type: boolean
+        default: false
+
+# A newer push to the same branch cancels the run it replaces.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run docs:build
+
+  # The browser suite: the site (playground, tech demo, runnable docs) in Playwright's image with the SwiftShader WebGPU
+  # adapter. The graph view and the timeline on their own are tested in smaltkit, where they live.
+  browser:
+    name: browser (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.1-noble
+      options: --user 1001
+    env:
+      NPM_CONFIG_PREFIX: /tmp/npm-global
+      NODE_PATH: /tmp/npm-global/lib/node_modules
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: playground
+            script: test/browser/playground.mjs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm install -g playwright@1.64.1
+      - run: node ${{ matrix.script }} ${{ inputs.full && ' ' || '--quick' }}
