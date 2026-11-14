@@ -10,6 +10,14 @@ trim ::= 'trim' '(' STRING ')'
 
 The text without white space at either end.
 
+## Parameters
+
+- `STRING`: text
+
+## Returns
+
+A string.
+
 ## Examples
 
 ```cypher

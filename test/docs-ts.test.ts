@@ -7,7 +7,7 @@ import { expect, test } from 'vitest';
  * The TypeScript examples in the guide pages below are type-checked against the package's entry points, so the guide
  * to using the pieces can't drift from the code. Each block is a module of its own.
  */
-const PAGES = ['docs/guide/modules.md', 'docs/guide/time-travel.md', 'docs/guide/quick-start.md', 'docs/guide/agents.md', 'docs/reference/api.md'];
+const PAGES = ['docs/guide/modules.md', 'docs/guide/time-travel.md', 'docs/guide/quick-start.md', 'docs/guide/agents.md', 'docs/reference/api.md', 'docs/reference/plans.md', 'docs/reference/stores.md'];
 
 test('the modules guide type-checks', () => {
   const dir = resolve('.cache/docs-ts');

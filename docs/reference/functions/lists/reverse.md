@@ -12,6 +12,14 @@ A list in reverse order, or a string with its characters reversed.
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a list or a string
+
+## Returns
+
+A list or a string, as given.
+
 ## Examples
 
 ```cypher

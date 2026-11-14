@@ -10,9 +10,10 @@ what a store can do (its capabilities) and its statistics, and plans each query 
 
 ```ts
 import { open, CsrStore } from '@smaltworks/smaltcy';
+import { network } from '@smaltworks/smaltcy/datasets';
 
 const db = open();             // MemoryStore
-db.load(bigGraph);
+db.load(network(20000));
 const fast = open({ store: CsrStore.from(db.store) }); // read-only, compact
 fast.query('MATCH (a)-[:KNOWS*1..3]-(b) RETURN count(*)');
 ```
@@ -34,3 +35,27 @@ A store implements `GraphStore` from `@smaltworks/smaltcy/engine`:
 
 Every store must pass `test/store-conformance.test.ts`, the Cypher suites and the differential test, which runs the
 same queries on random graphs in every store and compares the rows.
+
+## Working demo
+
+One graph in both stores: the same query gives the same rows, and the read-only `CsrStore` refuses a write. The
+comments show what it prints.
+
+```ts
+import { open, CsrStore, SmaltcyError } from '@smaltworks/smaltcy';
+import { social } from '@smaltworks/smaltcy/datasets';
+
+const db = open(); // MemoryStore
+db.load(social());
+const fast = open({ store: CsrStore.from(db.store) });
+
+const q = "MATCH (:Person {name: 'Ada'})-[:KNOWS*1..2]->(p) RETURN p.name AS name ORDER BY name";
+console.log(db.query(q)); // [{ name: 'Alan' }, { name: 'Edsger' }, { name: 'Grace' }]
+console.log(fast.query(q)); // [{ name: 'Alan' }, { name: 'Edsger' }, { name: 'Grace' }]
+
+try {
+  fast.run("CREATE (:Person {name: 'Linus'})");
+} catch (err) {
+  if (err instanceof SmaltcyError) console.log(err.code); // SMALTCY_UNSUPPORTED
+}
+```

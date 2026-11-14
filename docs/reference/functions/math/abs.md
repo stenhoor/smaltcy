@@ -10,6 +10,14 @@ abs ::= 'abs' '(' X ')'
 
 The absolute value.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+A number.
+
 ## Examples
 
 ```cypher

@@ -10,6 +10,14 @@ sin ::= 'sin' '(' X ')'
 
 The sine of an angle in radians.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+A number.
+
 ## Examples
 
 ```cypher

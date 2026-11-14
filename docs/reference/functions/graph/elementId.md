@@ -12,6 +12,14 @@ The id of a node or relationship as text: `n` and the id for a node, `r` and the
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a node or relationship
+
+## Returns
+
+A string: `n` or `r`, then the id.
+
 ## Examples
 
 ```cypher

@@ -10,6 +10,14 @@ log10 ::= 'log10' '(' X ')'
 
 The base-10 logarithm.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+A number.
+
 ## Examples
 
 ```cypher

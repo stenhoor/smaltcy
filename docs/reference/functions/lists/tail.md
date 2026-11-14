@@ -12,6 +12,14 @@ A list without its first element.
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `LIST`: a list
+
+## Returns
+
+A list.
+
 ## Examples
 
 ```cypher

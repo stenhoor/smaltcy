@@ -10,6 +10,14 @@ e ::= 'e' '(' ')'
 
 *e*, the base of natural logarithms.
 
+## Parameters
+
+None.
+
+## Returns
+
+A float.
+
 ## Examples
 
 ```cypher

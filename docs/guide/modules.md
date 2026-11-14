@@ -121,6 +121,12 @@ console.log(engine.explainText(plan));
 
 [Plans](/reference/plans) describes every operation.
 
+`EXPLAIN` shows the plan Cypher compiles to and the steps the engine chose for it, without running it:
+
+```cypher
+EXPLAIN MATCH (a:Person {name: 'Ada'})-[:KNOWS]->(b) RETURN b.name
+```
+
 ## Cypher, without running it
 
 `compile` turns Cypher into a plan. Keep it, send it to a worker or a server, or run it on any engine later:

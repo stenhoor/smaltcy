@@ -79,6 +79,20 @@ evenly: `createGraphView(canvas, { layoutTicks: 100 })`.
 
 ## From query results
 
+Every example in these docs draws its result this way. Run this one: the paths it returns are drawn below the table,
+and you can switch between 2D and 3D, pin the layout and fit the view.
+
+```cypher
+MATCH p = (:Person {name: 'Ada'})-[:KNOWS*1..2]->()
+RETURN p
+```
+
+| p |
+| --- |
+| Ada → Alan |
+| Ada → Alan → Grace |
+| Ada → Alan → Edsger |
+
 The playground collects every node, relationship and path in a result and draws them. The same in a few lines:
 
 ```ts

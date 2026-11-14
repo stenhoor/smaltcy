@@ -13,6 +13,16 @@ The number of relationships at a node: `DIRECTION` is `'out'`, `'in'` or `'both'
 - smaltcy's own: not openCypher. It reads the count from the store, without matching each relationship.
 - Another direction fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `NODE`: a node
+- `DIRECTION`: optional: `'out'`, `'in'` or `'both'` (the default)
+- `TYPE`: optional: a relationship type, as text
+
+## Returns
+
+An integer.
+
 ## Examples
 
 ```cypher

@@ -12,6 +12,14 @@ One commit, as `commits()` gives it, or `null` when there's no such version.
 
 - A version that isn't a number fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `VERSION`: an integer: a version number
+
+## Returns
+
+A map, or `null`.
+
 ## Examples
 
 ```cypher dataset=ontology

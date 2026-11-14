@@ -12,6 +12,14 @@ True when a list, string or map has nothing in it.
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a list, string or map
+
+## Returns
+
+A boolean.
+
 ## Examples
 
 ```cypher

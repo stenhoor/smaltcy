@@ -12,6 +12,16 @@ The part of the text from position `START` (the first is 0), `LENGTH` characters
 
 - A negative `START` fails with `SMALTCY_TYPE`; a `LENGTH` past the end stops at the end.
 
+## Parameters
+
+- `STRING`: text
+- `START`: an integer, 0 or more: where the part starts
+- `LENGTH`: optional: an integer, how many characters
+
+## Returns
+
+A string.
+
 ## Examples
 
 ```cypher

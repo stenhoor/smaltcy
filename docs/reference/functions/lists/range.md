@@ -12,6 +12,16 @@ The integers from `START` to `END`, both included, `STEP` apart (1 by default; n
 
 - Arguments that aren't integers, and a step of 0, fail with `SMALTCY_TYPE`. A range of more than ten million fails with `SMALTCY_UNSUPPORTED`.
 
+## Parameters
+
+- `START`: an integer: the first value
+- `END`: an integer: the last value, included
+- `STEP`: optional: a non-zero integer, 1 by default
+
+## Returns
+
+A list of integers.
+
 ## Examples
 
 ```cypher

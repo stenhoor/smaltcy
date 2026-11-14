@@ -10,6 +10,14 @@ timestamp ::= 'timestamp' '(' ')'
 
 The time now, in milliseconds since 1970 (UTC).
 
+## Parameters
+
+None.
+
+## Returns
+
+An integer: milliseconds since 1970.
+
 ## Examples
 
 ```cypher

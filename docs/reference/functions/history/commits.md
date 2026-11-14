@@ -10,6 +10,14 @@ commits ::= 'commits' '(' ')'
 
 Every commit up to the version read, oldest first, as maps: `version`, `time` (milliseconds), `at` (ISO 8601), `author`, `message`, `changes`, `nodes` and `relationships` (the totals after it), and its counts.
 
+## Parameters
+
+None.
+
+## Returns
+
+A list of maps, or `null` on a graph without history.
+
 ## Examples
 
 ```cypher dataset=ontology

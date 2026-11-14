@@ -10,6 +10,14 @@ count ::= 'count' '(' ('*' | 'DISTINCT'? X) ')'
 
 The number of rows, with `*`, or of values that aren't `null`.
 
+## Parameters
+
+- `X`: any value; `*` counts rows
+
+## Returns
+
+An integer.
+
 ## Examples
 
 ```cypher

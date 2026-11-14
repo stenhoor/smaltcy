@@ -12,6 +12,14 @@ The sum of the values; 0 when there are none.
 
 - A value that isn't a number fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a number, from each row
+
+## Returns
+
+A number.
+
 ## Examples
 
 ```cypher

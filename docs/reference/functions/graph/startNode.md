@@ -12,6 +12,14 @@ The node a relationship starts at.
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `RELATIONSHIP`: a relationship
+
+## Returns
+
+A node.
+
 ## Examples
 
 ```cypher

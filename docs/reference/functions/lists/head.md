@@ -12,6 +12,14 @@ A list's first element, or `null` for an empty list.
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `LIST`: a list
+
+## Returns
+
+The first element, or `null`.
+
 ## Examples
 
 ```cypher

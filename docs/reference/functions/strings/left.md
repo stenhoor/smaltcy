@@ -10,6 +10,15 @@ left ::= 'left' '(' STRING ',' N ')'
 
 The first `N` characters of the text.
 
+## Parameters
+
+- `STRING`: text
+- `N`: an integer: how many characters
+
+## Returns
+
+A string.
+
 ## Examples
 
 ```cypher

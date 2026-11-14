@@ -23,3 +23,16 @@ const result = await db.run('MATCH (n) RETURN count(n) AS n');
 | `close()` | Ends the worker |
 
 Errors arrive as `SmaltcyError`s with the same `code` and `position` they have in the worker.
+
+The examples in these docs run this way: the first **Run** starts a worker, and every query after it runs there, off
+the page's thread. This one reads a 2,000-person network:
+
+```cypher dataset=network
+MATCH (p:Person)-[:KNOWS]-(f)
+WITH p, count(f) AS friends
+RETURN max(friends) AS most, round(avg(friends), 1) AS average, count(p) AS people
+```
+
+| most | average | people |
+| --- | --- | --- |
+| 49 | 4 | 2000 |

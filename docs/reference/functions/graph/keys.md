@@ -12,6 +12,14 @@ The property keys of a node or relationship, or the keys of a map, as a list of 
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a node, a relationship or a map
+
+## Returns
+
+A list of strings.
+
 ## Examples
 
 ```cypher

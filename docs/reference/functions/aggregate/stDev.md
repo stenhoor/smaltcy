@@ -12,6 +12,14 @@ The standard deviation of a sample: divided by *n* - 1. 0 for fewer than two val
 
 - A value that isn't a number fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a number, from each row
+
+## Returns
+
+A float.
+
 ## Examples
 
 ```cypher

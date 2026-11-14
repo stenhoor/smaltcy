@@ -10,6 +10,14 @@ toUpper ::= 'toUpper' '(' STRING ')'
 
 The text in upper case.
 
+## Parameters
+
+- `STRING`: text
+
+## Returns
+
+A string.
+
 ## Examples
 
 ```cypher

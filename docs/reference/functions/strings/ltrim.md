@@ -10,6 +10,14 @@ ltrim ::= 'ltrim' '(' STRING ')'
 
 The text without white space at its start.
 
+## Parameters
+
+- `STRING`: text
+
+## Returns
+
+A string.
+
 ## Examples
 
 ```cypher

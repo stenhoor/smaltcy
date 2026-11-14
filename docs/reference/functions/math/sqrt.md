@@ -10,6 +10,14 @@ sqrt ::= 'sqrt' '(' X ')'
 
 The square root; `NaN` for a negative number.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+A number.
+
 ## Examples
 
 ```cypher

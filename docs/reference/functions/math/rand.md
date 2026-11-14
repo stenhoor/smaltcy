@@ -10,6 +10,14 @@ rand ::= 'rand' '(' ')'
 
 A random float from 0 up to, not including, 1: a new one each call.
 
+## Parameters
+
+None.
+
+## Returns
+
+A float from 0 up to 1.
+
 ## Examples
 
 ```cypher

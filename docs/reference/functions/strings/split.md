@@ -10,6 +10,15 @@ split ::= 'split' '(' STRING ',' DELIMITER ')'
 
 The parts of the text between occurrences of `DELIMITER`, as a list.
 
+## Parameters
+
+- `STRING`: text
+- `DELIMITER`: the text between the parts
+
+## Returns
+
+A list of strings.
+
 ## Examples
 
 ```cypher

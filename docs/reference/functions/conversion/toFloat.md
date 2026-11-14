@@ -13,6 +13,14 @@ A number or text as a float. Text that isn't a number gives `null`.
 - A `null` argument gives `null`. A value of another type fails with `SMALTCY_TYPE`.
 - Dividing by `toFloat(x)` divides as floats: `toFloat(7) / 2` is `3.5`.
 
+## Parameters
+
+- `X`: a number or string
+
+## Returns
+
+A float, or `null` for text that isn't a number.
+
 ## Examples
 
 ```cypher

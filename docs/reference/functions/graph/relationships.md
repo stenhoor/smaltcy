@@ -12,6 +12,14 @@ A path's relationships, in order, as a list.
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `PATH`: a path
+
+## Returns
+
+A list of relationships.
+
 ## Examples
 
 ```cypher
