@@ -12,6 +12,14 @@ The number of elements in a list, characters in a string, keys in a map, or rela
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a list, string, map or path
+
+## Returns
+
+An integer.
+
 ## Examples
 
 ```cypher

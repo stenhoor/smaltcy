@@ -10,6 +10,14 @@ acos ::= 'acos' '(' X ')'
 
 The arccosine, in radians.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+A number.
+
 ## Examples
 
 ```cypher

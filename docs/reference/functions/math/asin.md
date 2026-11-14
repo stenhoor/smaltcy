@@ -10,6 +10,14 @@ asin ::= 'asin' '(' X ')'
 
 The arcsine, in radians.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+A number.
+
 ## Examples
 
 ```cypher

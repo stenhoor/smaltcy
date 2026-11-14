@@ -10,6 +10,15 @@ atan2 ::= 'atan2' '(' Y ',' X ')'
 
 The angle, in radians, of the point (`X`, `Y`) from the x-axis.
 
+## Parameters
+
+- `Y`: a number: the y coordinate
+- `X`: a number: the x coordinate
+
+## Returns
+
+A number, in radians.
+
 ## Examples
 
 ```cypher

@@ -29,4 +29,18 @@ The format is plain:
 Node `id`s in a file only connect its relationships; they can be strings. `load` runs in one transaction: a file
 with a relationship to a missing node loads nothing.
 
+`toJSON()` saves every node with its labels and properties, every relationship with its type and properties, and the
+indexes. This counts what it would save from the sample graph the examples use:
+
+```cypher
+MATCH (n)
+WITH count(n) AS nodes
+MATCH ()-[r]->()
+RETURN nodes, count(r) AS relationships
+```
+
+| nodes | relationships |
+| --- | --- |
+| 22 | 39 |
+
 Durable storage in the browser (OPFS, through smaltdb's pager) is planned: see [ADR 0001](/adr/0001-smaltcy#persistence).

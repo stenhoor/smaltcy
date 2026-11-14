@@ -10,6 +10,14 @@ sign ::= 'sign' '(' X ')'
 
 -1, 0 or 1, as `X` is negative, zero or positive.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+-1, 0 or 1.
+
 ## Examples
 
 ```cypher

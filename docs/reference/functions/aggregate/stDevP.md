@@ -12,6 +12,14 @@ The standard deviation of a whole population: divided by *n*. 0 for no values.
 
 - A value that isn't a number fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a number, from each row
+
+## Returns
+
+A float.
+
 ## Examples
 
 ```cypher

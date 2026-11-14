@@ -10,6 +10,14 @@ toLower ::= 'toLower' '(' STRING ')'
 
 The text in lower case.
 
+## Parameters
+
+- `STRING`: text
+
+## Returns
+
+A string.
+
 ## Examples
 
 ```cypher

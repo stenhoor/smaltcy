@@ -12,6 +12,14 @@ Every change to a node or relationship up to the version read, oldest first: its
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a node or relationship
+
+## Returns
+
+A list of maps, or `null` on a graph without history.
+
 ## Examples
 
 ```cypher dataset=ontology

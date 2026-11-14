@@ -12,6 +12,14 @@ The properties of a node or relationship, as a map. A map gives itself.
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a node, a relationship or a map
+
+## Returns
+
+A map.
+
 ## Examples
 
 ```cypher

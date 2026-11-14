@@ -10,6 +10,14 @@ min ::= 'min' '(' 'DISTINCT'? X ')'
 
 The smallest value, in Cypher's order; `null` when there are none.
 
+## Parameters
+
+- `X`: any value, from each row
+
+## Returns
+
+A value of the kind given, or `null`.
+
 ## Examples
 
 ```cypher

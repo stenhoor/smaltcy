@@ -10,6 +10,14 @@ length ::= 'length' '(' PATH ')'
 
 The number of relationships in a path. On a string or a list, its size.
 
+## Parameters
+
+- `PATH`: a path, or a list or string
+
+## Returns
+
+An integer.
+
 ## Examples
 
 ```cypher

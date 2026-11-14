@@ -10,6 +10,14 @@ rtrim ::= 'rtrim' '(' STRING ')'
 
 The text without white space at its end.
 
+## Parameters
+
+- `STRING`: text
+
+## Returns
+
+A string.
+
 ## Examples
 
 ```cypher

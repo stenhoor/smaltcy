@@ -10,6 +10,14 @@ exp ::= 'exp' '(' X ')'
 
 *e* to the power `X`.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+A number.
+
 ## Examples
 
 ```cypher

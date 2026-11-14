@@ -12,6 +12,14 @@ The mean of the values; `null` when there are none.
 
 - A value that isn't a number fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a number, from each row
+
+## Returns
+
+A float, or `null`.
+
 ## Examples
 
 ```cypher

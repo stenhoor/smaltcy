@@ -10,6 +10,15 @@ round ::= 'round' '(' X (',' DIGITS)? ')'
 
 `X` rounded to the nearest whole number, or to `DIGITS` decimal places. Halves round away from zero.
 
+## Parameters
+
+- `X`: a number
+- `DIGITS`: optional: an integer, how many decimal places; negative rounds to tens, hundreds …
+
+## Returns
+
+A number.
+
 ## Examples
 
 ```cypher

@@ -12,6 +12,14 @@ A node's labels, as a list of strings.
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `NODE`: a node
+
+## Returns
+
+A list of strings.
+
 ## Examples
 
 ```cypher dataset=family

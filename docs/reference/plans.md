@@ -84,3 +84,51 @@ arguments. A mistake in a plan fails with `SMALTCY_PLAN`, not a wrong answer.
 
 Plans are versioned with `planVersion` (now `1`) and stay JSON: a plan can be stored, sent to a worker or written by
 hand.
+
+## Working demo
+
+The same query, compiled from Cypher and written by hand as a plan, on one graph: both give the same rows, and a plan
+with a mistake fails before it runs. The comments show what it prints.
+
+```ts
+import { compile, open, SmaltcyError } from '@smaltworks/smaltcy';
+import { PLAN_VERSION, e, type QueryPlan } from '@smaltworks/smaltcy/engine';
+
+const db = open();
+db.run("CREATE (:P {name: 'a'})-[:R]->(:P {name: 'b'})-[:R]->(:P {name: 'c'})");
+
+// From Cypher.
+const compiled = compile("MATCH (x:P {name: 'a'})-[:R*2]->(y) RETURN y.name AS name");
+console.log(db.engine.run(compiled.plan).rows); // [['c']]
+
+// By hand: the plan at the top of this page.
+const plan: QueryPlan = {
+  kind: 'query',
+  planVersion: PLAN_VERSION,
+  slots: 4,
+  slotNames: ['x', 'r', 'y', 'name'],
+  root: {
+    op: 'project',
+    discard: false,
+    items: [{ slot: 3, expr: e.prop(e.slot(2), 'name') }],
+    input: {
+      op: 'match',
+      optional: false,
+      input: { op: 'argument', slots: [] },
+      pattern: {
+        nodes: [{ slot: 0, labels: ['P'], props: e.map({ name: e.lit('a') }) }, { slot: 2, labels: [] }],
+        rels: [{ slot: 1, from: 0, to: 1, dir: 'out', types: ['R'], min: 2, max: 2 }],
+      },
+    },
+  },
+  columns: [{ name: 'name', slot: 3 }],
+};
+console.log(db.engine.run(plan).rows); // [['c']]
+
+// A plan that reads a slot past its end fails validation.
+try {
+  db.engine.run({ ...plan, columns: [{ name: 'name', slot: 9 }] });
+} catch (err) {
+  if (err instanceof SmaltcyError) console.log(err.code); // SMALTCY_PLAN
+}
+```

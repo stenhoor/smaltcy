@@ -10,6 +10,14 @@ pi ::= 'pi' '(' ')'
 
 π.
 
+## Parameters
+
+None.
+
+## Returns
+
+A float.
+
 ## Examples
 
 ```cypher

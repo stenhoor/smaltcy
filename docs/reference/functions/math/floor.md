@@ -10,6 +10,14 @@ floor ::= 'floor' '(' X ')'
 
 The largest whole number not more than `X`.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+A whole number.
+
 ## Examples
 
 ```cypher

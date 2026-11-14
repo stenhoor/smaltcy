@@ -12,6 +12,14 @@ A number, text or boolean as an integer, cut towards zero. Text that isn't a num
 
 - A `null` argument gives `null`. A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a number, string or boolean
+
+## Returns
+
+An integer, or `null` for text that isn't a number.
+
 ## Examples
 
 ```cypher

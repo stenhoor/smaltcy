@@ -10,6 +10,14 @@ atan ::= 'atan' '(' X ')'
 
 The arctangent, in radians.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+A number.
+
 ## Examples
 
 ```cypher

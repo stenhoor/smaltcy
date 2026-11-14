@@ -10,6 +10,15 @@ right ::= 'right' '(' STRING ',' N ')'
 
 The last `N` characters of the text.
 
+## Parameters
+
+- `STRING`: text
+- `N`: an integer: how many characters
+
+## Returns
+
+A string.
+
 ## Examples
 
 ```cypher

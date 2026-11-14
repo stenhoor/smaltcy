@@ -12,6 +12,14 @@ A list's last element, or `null` for an empty list.
 
 - A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `LIST`: a list
+
+## Returns
+
+The last element, or `null`.
+
 ## Examples
 
 ```cypher

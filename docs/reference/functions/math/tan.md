@@ -10,6 +10,14 @@ tan ::= 'tan' '(' X ')'
 
 The tangent of an angle in radians.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+A number.
+
 ## Examples
 
 ```cypher

@@ -10,6 +10,14 @@ log ::= 'log' '(' X ')'
 
 The natural logarithm.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+A number.
+
 ## Examples
 
 ```cypher

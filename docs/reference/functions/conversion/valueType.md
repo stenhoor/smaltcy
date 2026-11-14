@@ -12,6 +12,14 @@ The name of a value's type: `NULL`, `BOOLEAN`, `INTEGER`, `FLOAT`, `STRING`, `LI
 
 - A number is named by its value: a whole number is `INTEGER`, even when it was written `7.0`.
 
+## Parameters
+
+- `X`: any value
+
+## Returns
+
+A string.
+
 ## Examples
 
 ```cypher

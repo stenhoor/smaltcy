@@ -10,6 +10,14 @@ collect ::= 'collect' '(' 'DISTINCT'? X ')'
 
 The values as a list, in the order of the rows, without `null`s.
 
+## Parameters
+
+- `X`: any value, from each row
+
+## Returns
+
+A list.
+
 ## Examples
 
 ```cypher

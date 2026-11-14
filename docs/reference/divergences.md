@@ -17,6 +17,14 @@ Numbers are JavaScript doubles. Whether a value is an integer or a float is know
 - Integers are exact up to 2⁵³.
 - `valueType()` names a number by its value: `valueType(7.0)` is `INTEGER`, though `toString(7.0)` is `'7.0'`.
 
+```cypher
+RETURN 7 / 2 AS ints, 7.0 / 2 AS floats, toFloat(7) / 2 AS converted, valueType(7.0) AS type, toString(7.0) AS text
+```
+
+| ints | floats | converted | type | text |
+| --- | --- | --- | --- | --- |
+| 3 | 3.5 | 3.5 | INTEGER | 7.0 |
+
 ## Not yet supported
 
 - `CALL` procedures and subqueries, `FOREACH`, `LOAD CSV`, `USE` and multiple graphs.

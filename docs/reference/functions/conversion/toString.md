@@ -12,6 +12,14 @@ A number, boolean or string as text. A whole-number float keeps its point: `toSt
 
 - A `null` argument gives `null`. A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a number, boolean or string
+
+## Returns
+
+A string.
+
 ## Examples
 
 ```cypher

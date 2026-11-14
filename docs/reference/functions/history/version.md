@@ -10,6 +10,14 @@ version ::= 'version' '(' ')'
 
 The version the query reads.
 
+## Parameters
+
+None.
+
+## Returns
+
+An integer, or `null` on a graph without history.
+
 ## Examples
 
 ```cypher dataset=ontology

@@ -10,6 +10,14 @@ ceil ::= 'ceil' '(' X ')'
 
 The smallest whole number not less than `X`.
 
+## Parameters
+
+- `X`: a number
+
+## Returns
+
+A whole number.
+
 ## Examples
 
 ```cypher

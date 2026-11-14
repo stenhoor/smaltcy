@@ -12,6 +12,14 @@ toBoolean ::= 'toBoolean' '(' X ')'
 
 - A `null` argument gives `null`. A value of another type fails with `SMALTCY_TYPE`.
 
+## Parameters
+
+- `X`: a boolean, string or number
+
+## Returns
+
+A boolean, or `null` for other text.
+
 ## Examples
 
 ```cypher

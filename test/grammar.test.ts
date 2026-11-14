@@ -176,6 +176,10 @@ describe('function pages', () => {
     const name = page.split('/')[1]!;
     const own = parseEbnf(blocks[0]!);
     expect([...own.rules.keys()], `${page}: its rule is named after the page`).toEqual([name]);
+    // Its Parameters list names the arguments its diagram has, in order.
+    const params = [...(/## Parameters\n\n([\s\S]*?)\n## /.exec(md)?.[1] ?? '').matchAll(/^- `([A-Z][A-Z0-9_]*)`/gm)].map((m) => m[1]);
+    const args = [...new Set(blocks[0]!.match(/\b[A-Z][A-Z0-9_]*\b/g) ?? [])].filter((a) => !/^'/.test(a) && blocks[0]!.includes(` ${a}`));
+    expect(params, `${page}: Parameters`).toEqual(args.filter((a) => !blocks[0]!.includes(`'${a}'`)));
     // Parsed with the site's grammar, so a rule name the page shares with it is an error; the arguments are tokens.
     const both = parseEbnf(`${site}\n${blocks[0]}`);
     for (const n of new Set(blocks[0]!.match(/\b[A-Z][A-Z0-9_]*\b/g) ?? [])) if (ARGUMENT.test(n) && !both.rules.has(n)) TOKENS[n] = ARGUMENTS;
