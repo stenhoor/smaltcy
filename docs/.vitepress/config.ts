@@ -18,7 +18,7 @@ export default defineConfig({
   rewrites: { 'adr/README.md': 'adr/index.md' },
   lastUpdated: false,
   head: [
-    ['link', { rel: 'icon', type: 'image/svg+xml', href: `${BASE}favicon.svg` }],
+    ['link', { rel: 'icon', type: 'image/svg+xml', href: `${BASE}favicon-32.svg` }],
     ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
     ['link', { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' }],
     ['link', { rel: 'stylesheet', href: 'https://fonts.googleapis.com/css2?family=Geist:wght@400;500;700&family=Geist+Mono:wght@400;500&family=Martian+Mono:wght@400;600&display=swap' }],
@@ -55,6 +55,7 @@ export default defineConfig({
     },
   },
   themeConfig: {
+    logo: { light: '/lockup.svg', dark: '/lockup-on-dark.svg', alt: 'smaltcy' },
     siteTitle: false,
     nav: [
       { text: 'Playground', link: '/playground' },
