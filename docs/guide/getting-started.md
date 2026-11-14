@@ -1,14 +1,18 @@
-# Getting started
+# Installation
 
-smaltcy is a graph database that runs in the page. Every example in these docs runs where it stands: press **Run**
-under one to see its result, drawn as a graph when it has nodes or relationships ([sample data](./sample-data)). You store nodes and relationships, each with labels or a type
-and properties, and you query them with Cypher.
+smaltcy is a graph database that runs in the page. You store nodes and relationships, each with labels or a type and
+properties, and you query them with Cypher. Every example in these docs runs where it stands: press **Run** under one
+to see its result, drawn as a graph when it has nodes or relationships ([sample data](./sample-data)).
 
 ## Install
 
 ```sh
-npm install @smaltworks/smaltcy
+npm install --save-exact @smaltworks/smaltcy@0.1.0
 ```
+
+smaltcy 0.1.0 is not on npm yet. It has no runtime dependencies but smaltkit, the family's shared kit, which npm
+fetches and builds from GitHub until it is published. The package has an entry point for each part, so a page loads
+only what it uses: [Using the pieces](./modules) lists them.
 
 ## A first graph
 
@@ -71,6 +75,7 @@ db.transaction((tx) => {
 
 ## Next
 
-- The [playground](/playground) runs Cypher on sample graphs and draws the results.
 - [Examples](./examples) shows common queries.
+- [Sample data](./sample-data): the graphs the examples run on.
 - The [Cypher reference](/reference/cypher) lists what smaltcy reads.
+- The [playground](/playground) runs Cypher on sample graphs and draws the results.

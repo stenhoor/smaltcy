@@ -26,5 +26,5 @@
       "@smaltworks/smaltcy/worker-runtime": ["./src/worker/runtime.ts"]
     }
   },
-  "include": ["src", "test", "bench", "scripts/*.ts"]
+  "include": ["src", "test", "bench", "scripts/*.ts", "docs/.vitepress/env.d.ts"]
 }

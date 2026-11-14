@@ -1,12 +1,9 @@
----
-dataset: social
----
-
 # Sample data
 
-Every example in these docs runs where it stands: press **Run**, and the result shows as a table and, when it holds
-nodes, relationships or paths, as a graph drawn on the GPU. **Edit** changes the query; each run starts from the
-dataset as generated, so nothing a run writes stays. The same datasets are in
+Every example in these docs runs where it stands, on one of these graphs: press **Run**, and the result shows as a
+table and, when it holds nodes, relationships or paths, as a graph drawn on the GPU. The table printed under an
+example is its tested result. **Edit** changes the query. Each Run starts from the dataset as generated, plus what the
+examples above it on the same page and dataset write, so nothing a Run writes stays. The same datasets are in
 `@smaltworks/smaltcy/datasets`, and in the [playground](/playground).
 
 ## Social
@@ -19,12 +16,27 @@ MATCH (p:Person)-[r]->(x)
 RETURN p, r, x
 ```
 
+| p | r | x |
+| --- | --- | --- |
+| (:Person {"name":"Ada","born":1815}) | [:LIVES_IN] | (:City {"name":"London"}) |
+| (:Person {"name":"Ada","born":1815}) | [:KNOWS {"since":1833}] | (:Person {"name":"Alan","born":1912}) |
+| (:Person {"name":"Ada","born":1815}) | [:LIKES] | (:Topic {"name":"Algorithms"}) |
+| (:Person {"name":"Alan","born":1912}) | [:LIVES_IN] | (:City {"name":"London"}) |
+| (:Person {"name":"Alan","born":1912}) | [:KNOWS {"since":1936}] | (:Person {"name":"Grace","born":1906}) |
+| … 34 more rows | | |
+
 Who is two steps from Ada, and how:
 
 ```cypher
 MATCH path = (:Person {name: 'Ada'})-[:KNOWS*1..2]-(p:Person)
 RETURN path
 ```
+
+| path |
+| --- |
+| Ada → Alan |
+| Ada → Alan → Grace |
+| Ada → Alan → Edsger |
 
 ## The smalt family
 
@@ -35,12 +47,30 @@ MATCH (a)-[r]->(b)
 RETURN a, r, b
 ```
 
+| a | r | b |
+| --- | --- | --- |
+| (:Product:Engine {"name":"smaltdb","line":"A fast alternative database for the browser, written in TypeScript."}) | [:RUNS_ON] | (:Platform {"name":"OPFS"}) |
+| (:Product:Engine {"name":"smaltdb","line":"A fast alternative database for the browser, written in TypeScript."}) | [:RUNS_ON] | (:Platform {"name":"Web Workers"}) |
+| (:Product:Language {"name":"smaltql","line":"The SQL you know, for smaltdb."}) | [:BUILT_ON] | (:Product:Engine {"name":"smaltdb","line":"A fast alternative database for the browser, written in TypeScript."}) |
+| (:Product:Language {"name":"smaltdf","line":"Dataframes for smaltdb. Small and fast."}) | [:BUILT_ON] | (:Product:Engine {"name":"smaltdb","line":"A fast alternative database for the browser, written in TypeScript."}) |
+| (:Product:Language {"name":"smaltcy","line":"A graph database for the browser that speaks Cypher."}) | [:RUNS_ON] | (:Platform {"name":"Web Workers"}) |
+| … 20 more rows | | |
+
 Everything an analyst reaches in up to three steps:
 
 ```cypher dataset=family
 MATCH path = (:Role {name: 'Analyst'})-[*1..3]->(x)
 RETURN path
 ```
+
+| path |
+| --- |
+| Analyst → smaltbi |
+| Analyst → smaltbi → smaltdb |
+| Analyst → smaltbi → smaltdb → OPFS |
+| Analyst → smaltbi → smaltdb → Web Workers |
+| Analyst → smaltbi → smaltql |
+| … 11 more rows |
 
 ## Metro
 
@@ -53,6 +83,15 @@ WHERE id(a) < id(b)
 RETURN a, c, b
 ```
 
+| a | c | b |
+| --- | --- | --- |
+| (:Station {"name":"Rokami","x":0,"y":4}) | [:CONNECTS {"line":"Line 1","minutes":2}] | (:Station {"name":"Velan","x":0,"y":3}) |
+| (:Station {"name":"Velan","x":0,"y":3}) | [:CONNECTS {"line":"Line 1","minutes":1}] | (:Station {"name":"Hamrovel","x":0,"y":2}) |
+| (:Station {"name":"Hamrovel","x":0,"y":2}) | [:CONNECTS {"line":"Line 1","minutes":3}] | (:Station {"name":"Loantu","x":0,"y":1}) |
+| (:Station {"name":"Loantu","x":0,"y":1}) | [:CONNECTS {"line":"Line 1","minutes":4}] | (:Station {"name":"Fordloton","x":0,"y":0}) |
+| (:Station {"name":"Fordloton","x":0,"y":0}) | [:CONNECTS {"line":"Line 2","minutes":3}] | (:Station {"name":"Mian","x":1,"y":0}) |
+| … 153 more rows | | |
+
 The route with the fewest stops from one end of Line 1 to the other:
 
 ```cypher dataset=metro
@@ -63,15 +102,33 @@ MATCH p = shortestPath((a)-[:CONNECTS*]->(b))
 RETURN p
 ```
 
+| p |
+| --- |
+| Rokami → Velan → Hamrovel → Loantu → Fordloton |
+
 Stations where you can change lines:
 
 ```cypher dataset=metro
 MATCH (s:Station)-[:ON]->(l:Line)
-WITH s, collect(l.name) AS lines
+WITH s, collect(DISTINCT l.name) AS lines
 WHERE size(lines) > 1
 RETURN s.name AS station, lines
 ORDER BY size(lines) DESC, station
 ```
+
+| station | lines |
+| --- | --- |
+| Andovel | ["Line 3","Line 5"] |
+| Anmi | ["Line 3","Line 5"] |
+| Dogatetu | ["Line 4","Line 8"] |
+| Doloford | ["Line 3","Line 5"] |
+| Fordloton | ["Line 1","Line 2"] |
+| Gatefordlo | ["Line 3","Line 5"] |
+| Gatesaro | ["Line 3","Line 5"] |
+| Gatetonis | ["Line 4","Line 8"] |
+| Hamloan | ["Line 3","Line 5"] |
+| Sahamro | ["Line 3","Line 5"] |
+| Tugatetu | ["Line 4","Line 8"] |
 
 ## Network
 
@@ -84,6 +141,15 @@ RETURN path
 LIMIT 300
 ```
 
+| path |
+| --- |
+| Bo 1 → Ana 0 |
+| Bo 1 → Ana 0 → Dara 3 |
+| Bo 1 → Ana 0 → Femi 5 |
+| Bo 1 → Ana 0 → Gus 6 |
+| Bo 1 → Ana 0 → Pia 15 |
+| … 295 more rows |
+
 The best-connected people and their communities:
 
 ```cypher dataset=network
@@ -93,6 +159,19 @@ ORDER BY friends DESC
 LIMIT 10
 ```
 
+| name | community | friends |
+| --- | --- | --- |
+| Bo 1 | 5 | 49 |
+| Jun 9 | 0 | 46 |
+| Ana 0 | 0 | 41 |
+| Uma 20 | 2 | 40 |
+| Sol 18 | 1 | 36 |
+| Chen 27 | 3 | 33 |
+| Sol 43 | 0 | 33 |
+| Femi 5 | 0 | 32 |
+| Hana 7 | 5 | 32 |
+| Chen 2 | 3 | 31 |
+
 How far apart two people are:
 
 ```cypher dataset=network
@@ -100,6 +179,10 @@ MATCH (a:Person {name: 'Bo 1'}), (b:Person {name: 'Gus 6'})
 MATCH p = shortestPath((a)-[:KNOWS*]-(b))
 RETURN p
 ```
+
+| p |
+| --- |
+| Bo 1 → Gus 6 |
 
 ## Real-world shapes
 
@@ -141,6 +224,10 @@ MATCH p = (e)-[:REPORTS_TO*]->(:Employee {level: 0})
 RETURN p
 ```
 
+| p |
+| --- |
+| Tara Petrov → Umar Mensah → Rosa Byrne 2 → Quinn Kowalski → Sven Duarte → Ada Tanaka |
+
 ### Package dependencies
 
 The most depended-on packages:
@@ -151,6 +238,14 @@ RETURN p.name AS package, count(d) AS dependents
 ORDER BY dependents DESC
 LIMIT 5
 ```
+
+| package | dependents |
+| --- | --- |
+| router-web | 45 |
+| glob-parse | 36 |
+| color-tiny | 28 |
+| micro-parse | 27 |
+| lint-queue | 23 |
 
 ### Airline routes
 
@@ -164,6 +259,10 @@ MATCH p = shortestPath((a)-[:ROUTE*]-(b))
 RETURN p
 ```
 
+| p |
+| --- |
+| AAA International → AAE International → ALN Regional |
+
 ### Power grid
 
 Every substation within three lines of the first one built:
@@ -176,6 +275,15 @@ RETURN p
 LIMIT 200
 ```
 
+| p |
+| --- |
+| Central 0001 → Central 0002 |
+| Central 0001 → Central 0002 → Central 0003 |
+| Central 0001 → Central 0002 → Central 0003 → Central 0004 |
+| Central 0001 → Central 0002 → Central 0003 → Central 0006 |
+| Central 0001 → Central 0002 → Central 0003 → Central 0007 |
+| … 31 more rows |
+
 ### Git history
 
 The merges, and the branch each brought in:
@@ -185,6 +293,15 @@ MATCH (m:Merge)-[:PARENT]->(c:Commit)
 WHERE c.branch <> 'main'
 RETURN m.hash AS merge, c.branch AS branch, m.author AS author
 ```
+
+| merge | branch | author |
+| --- | --- | --- |
+| d2c201e | feature/search-1 | dara |
+| 5c9bdd6 | fix/API-5 | bo |
+| 6f41dac | feature/logging-2 | ana |
+| 6529e8e | fix/cache-6 | ana |
+| 39737cf | fix/login-9 | chen |
+| … 26 more rows | | |
 
 ### Supply chain
 
@@ -197,6 +314,15 @@ MATCH p = (:Supplier)-[:SUPPLIES*4]->(s)
 RETURN p
 ```
 
+| p |
+| --- |
+| Ironvale Mining 1 → Precision Parts 1 → Assembly Plant Quito 1 → Distribution Centre Tallinn 1 → Store #1 Seoul |
+| Copperline 2 → Precision Parts 1 → Assembly Plant Quito 1 → Distribution Centre Tallinn 1 → Store #1 Seoul |
+| Cobalt Ridge 1 → Glassworks 1 → Assembly Plant Quito 1 → Distribution Centre Tallinn 1 → Store #1 Seoul |
+| Silica Sands 3 → Glassworks 1 → Assembly Plant Quito 1 → Distribution Centre Tallinn 1 → Store #1 Seoul |
+| Copperline 1 → Circuit Co 1 → Assembly Plant Quito 1 → Distribution Centre Tallinn 1 → Store #1 Seoul |
+| … 12 more rows |
+
 ### Microservices
 
 The calls that cross from one team to another:
@@ -206,3 +332,12 @@ MATCH (a:Service)-[c:CALLS]->(b:Service)
 WHERE a.team <> b.team
 RETURN a, c, b
 ```
+
+| a | c | b |
+| --- | --- | --- |
+| (:Service:Gateway {"name":"payments-gateway","team":"payments","language":"go"}) | [:CALLS {"rpm":3323}] | (:Service:Gateway {"name":"checkout-gateway","team":"checkout","language":"go"}) |
+| (:Service:Gateway {"name":"search-gateway","team":"search","language":"go"}) | [:CALLS {"rpm":1838}] | (:Service:Gateway {"name":"checkout-gateway","team":"checkout","language":"go"}) |
+| (:Service:Gateway {"name":"catalog-gateway","team":"catalog","language":"go"}) | [:CALLS {"rpm":2141}] | (:Service:Gateway {"name":"checkout-gateway","team":"checkout","language":"go"}) |
+| (:Service:Gateway {"name":"accounts-gateway","team":"accounts","language":"go"}) | [:CALLS {"rpm":3649}] | (:Service:Gateway {"name":"catalog-gateway","team":"catalog","language":"go"}) |
+| (:Service:Gateway {"name":"shipping-gateway","team":"shipping","language":"go"}) | [:CALLS {"rpm":603}] | (:Service:Gateway {"name":"payments-gateway","team":"payments","language":"go"}) |
+| … 24 more rows | | |
