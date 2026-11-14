@@ -4,13 +4,14 @@ import { describe, expect, test } from 'vitest';
 import { EXAMPLES, type DatasetKey } from '../docs/.vitepress/theme/components/examples.js';
 import { airline, family, gitHistory, metro, microservices, network, ontology, orgChart, packages, powerGrid, social, supplyChain } from '../src/datasets/index.js';
 import { open } from '../src/index.js';
-import { DATASET_SIZE, WITH_HISTORY, datasetOf, printed, setupFor, type DatasetName } from '../docs/.vitepress/theme/cypher.js';
+import { DATASET_SIZE, WITH_HISTORY, datasetOf, printed, setupFor, statements, type DatasetName } from '../docs/.vitepress/theme/cypher.js';
 import type { SetupStep } from '../docs/.vitepress/theme/playground.js';
 
 /**
  * Examples are tests (BRAND.md, Documentation, rule 5). Every ```cypher example in the docs runs as its playground
  * runs it (theme/cypher.ts): on its dataset (the fence's `dataset=`, else the page's front matter `play: dataset`,
- * else `social`), fresh, after the examples above it on that dataset that write. The table printed under it is its
+ * else `social`; `empty` is a graph with nothing in it), fresh, after the examples above it on that dataset that
+ * write. Statements separated by `;` run in order, and the last one's result is the example's. The table printed under it is its
  * tested result, row for row; a long one prints its first rows and `… N more rows`. An example marked
  * `<!-- docs:error CODE -->` must fail with CODE. Blocks marked `noplay` run on `social` with the parameters below.
  *
@@ -30,6 +31,7 @@ function markdown(dir: string): string[] {
 }
 
 const DATA: Record<DatasetName, () => ReturnType<typeof social>> = {
+  empty: () => ({ nodes: [], relationships: [] }),
   social,
   family,
   metro,
@@ -138,12 +140,15 @@ function run(ex: Example) {
   if (ex.noplay) return g.run(ex.code, { year: 1900 });
   for (const s of setupFor(ex.setup, name)) {
     try {
-      g.run(s.code);
+      for (const st of statements(s.code)) g.run(st);
     } catch (e) {
       if (!s.fails) throw e;
     }
   }
-  return g.run(ex.code);
+  // Statements separated by semicolons run in order; the last one's result is the example's.
+  const parts = statements(ex.code);
+  for (const st of parts.slice(0, -1)) g.run(st);
+  return g.run(parts[parts.length - 1]!);
 }
 
 const files = markdown('docs');

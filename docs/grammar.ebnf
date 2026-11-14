@@ -1,0 +1,123 @@
+/* smaltcy's Cypher, in W3C EBNF. The syntax diagrams on the reference pages are drawn from this file, and the agent
+   guide (/agents.md) prints it. It is written from the parser (src/cypher/parser.ts), and test/grammar.test.ts derives
+   statements from it that the parser must read. Keywords are written in upper case and match in any case; so do
+   function names. name, string-literal, numeric-literal, integer and parameter are tokens: see the Cypher reference's
+   overview. The parser reads some forms only to reject them later, such as a RETURN that isn't last: the prose on
+   each clause's page says where a clause may stand. */
+
+statement ::= 'EXPLAIN'? (query | create-index | drop-index) ';'?
+
+query ::= at-clause? single-query ('UNION' 'ALL'? single-query)*
+
+at-clause ::= 'AT' ('VERSION' | 'TIME') (numeric-literal | string-literal | parameter)
+
+single-query ::= clause+
+
+clause ::= match-clause | unwind-clause | with-clause | return-clause
+         | create-clause | merge-clause | set-clause | remove-clause | delete-clause
+
+/* Reading */
+
+match-clause ::= 'OPTIONAL'? 'MATCH' pattern ('WHERE' expr)?
+
+unwind-clause ::= 'UNWIND' expr 'AS' name
+
+with-clause ::= 'WITH' projection ('WHERE' expr)?
+
+return-clause ::= 'RETURN' projection
+
+projection ::= 'DISTINCT'? ('*' (',' return-item)* | return-item (',' return-item)*)
+               order-by? ('SKIP' expr)? ('LIMIT' expr)?
+
+return-item ::= expr ('AS' name)?
+
+order-by ::= 'ORDER' 'BY' sort-item (',' sort-item)*
+
+sort-item ::= expr ('ASC' | 'ASCENDING' | 'DESC' | 'DESCENDING')?
+
+/* Writing */
+
+create-clause ::= 'CREATE' pattern
+
+merge-clause ::= 'MERGE' pattern-part ('ON' ('CREATE' | 'MATCH') 'SET' set-item (',' set-item)*)*
+
+set-clause ::= 'SET' set-item (',' set-item)*
+
+set-item ::= name ('.' name)+ '=' expr
+           | name ('=' | '+=') expr
+           | name (':' name)+
+
+remove-clause ::= 'REMOVE' remove-item (',' remove-item)*
+
+remove-item ::= name ('.' name)+ | name (':' name)+
+
+delete-clause ::= 'DETACH'? 'DELETE' expr (',' expr)*
+
+/* Indexes */
+
+create-index ::= 'CREATE' 'INDEX' ( name? ('IF' 'NOT' 'EXISTS')? 'FOR' '(' name ':' name ')' 'ON' '(' name '.' name ')'
+                                  | 'ON' ':' name '(' name ')' )
+
+drop-index ::= 'DROP' 'INDEX' 'ON' ':' name '(' name ')'
+
+/* Patterns */
+
+pattern ::= pattern-part (',' pattern-part)*
+
+pattern-part ::= (name '=')? (pattern-element | shortest-path)
+
+shortest-path ::= ('shortestPath' | 'allShortestPaths') '(' node-pattern relationship-pattern node-pattern ')'
+
+pattern-element ::= node-pattern (relationship-pattern node-pattern)* | '(' pattern-element ')'
+
+node-pattern ::= '(' name? (':' name)* pattern-properties? ')'
+
+relationship-pattern ::= '<-' relationship-detail? '-'
+                       | '-' relationship-detail? ('->' | '-')
+
+relationship-detail ::= '[' name? (':' name ('|' ':'? name)*)? ('*' hops?)? pattern-properties? ']'
+
+hops ::= integer ('..' integer?)? | '..' integer?
+
+pattern-properties ::= map-literal | parameter
+
+/* Expressions. How tightly the operators bind is in the Cypher reference's overview, not in the diagrams. */
+
+expr ::= atom
+       | pattern-predicate
+       | expr binary-operator expr
+       | ('NOT' | '-' | '+') expr
+       | expr 'IS' 'NOT'? 'NULL'
+       | expr '.' name
+       | expr '[' expr ']'
+       | expr '[' expr? '..' expr? ']'
+       | name (':' name)+
+
+binary-operator ::= 'OR' | 'XOR' | 'AND'
+                  | '=' | '<>' | '!=' | '<' | '<=' | '>' | '>='
+                  | 'STARTS' 'WITH' | 'ENDS' 'WITH' | 'CONTAINS' | 'IN' | '=~'
+                  | '+' | '-' | '*' | '/' | '%' | '^'
+
+atom ::= literal | parameter | name | function-call | list-literal | map-literal
+       | list-comprehension | pattern-comprehension | quantifier | case-expr | exists-subquery
+       | '(' expr ')'
+
+literal ::= numeric-literal | string-literal | 'TRUE' | 'FALSE' | 'NULL'
+
+function-call ::= name '(' ('DISTINCT'? (expr (',' expr)* | '*'))? ')'
+
+list-literal ::= '[' (expr (',' expr)*)? ']'
+
+map-literal ::= '{' ((name | string-literal) ':' expr (',' (name | string-literal) ':' expr)*)? '}'
+
+list-comprehension ::= '[' name 'IN' expr ('WHERE' expr)? ('|' expr)? ']'
+
+pattern-comprehension ::= '[' (name '=')? node-pattern (relationship-pattern node-pattern)+ ('WHERE' expr)? '|' expr ']'
+
+pattern-predicate ::= node-pattern (relationship-pattern node-pattern)+
+
+quantifier ::= ('ANY' | 'ALL' | 'NONE' | 'SINGLE') '(' name 'IN' expr 'WHERE' expr ')'
+
+case-expr ::= 'CASE' expr? ('WHEN' expr 'THEN' expr)+ ('ELSE' expr)? 'END'
+
+exists-subquery ::= 'EXISTS' '{' 'MATCH'? pattern ('WHERE' expr)? '}'
