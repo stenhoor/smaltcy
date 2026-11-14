@@ -77,5 +77,5 @@ db.transaction((tx) => {
 
 - [Examples](./examples) shows common queries.
 - [Sample data](./sample-data): the graphs the examples run on.
-- The [Cypher reference](/reference/cypher) lists what smaltcy reads.
+- The [Cypher reference](/reference/cypher/) lists what smaltcy reads.
 - The [playground](/playground) runs Cypher on sample graphs and draws the results.

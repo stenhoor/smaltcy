@@ -70,5 +70,5 @@ RETURN path
 
 - [Installation](./getting-started): the package, its entry points, parameters, indexes and transactions.
 - [Examples](./examples): common queries, step by step.
-- [The Cypher reference](../reference/cypher) and the [functions](../reference/functions).
+- [The Cypher reference](../reference/cypher/) and the [functions](../reference/functions).
 - The [playground](../playground): any query on any sample graph, with the graph drawn beside the rows.

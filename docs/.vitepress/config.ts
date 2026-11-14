@@ -3,13 +3,18 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { smaltLight, smaltDark } from './theme/shiki'
 import { smaltworksMenu, smaltworksFooter } from './theme/smaltworks'
+import { readFileSync } from 'node:fs'
 import { playgroundPlugin } from './theme/playground'
+import { railroadPlugin } from './theme/railroad'
 import { agentDocs, packageVersion } from './theme/agents'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const REPO = 'https://github.com/stenhoor/smaltcy'
 // GitHub Pages serves the site under the repository's name.
 const BASE = process.env.SMALTCY_BASE ?? '/smaltcy/'
+// smaltcy's Cypher, written from the parser and tested against it (test/grammar.test.ts): the syntax diagrams and the
+// agent guide read it.
+const GRAMMAR = readFileSync(path.resolve(here, '../grammar.ebnf'), 'utf8')
 
 export default defineConfig({
   title: 'smaltcy',
@@ -25,7 +30,8 @@ export default defineConfig({
       version: packageVersion(path.resolve(here, '../../package.json')),
       url: `https://stenhoor.github.io${BASE}`,
       intro: 'guide/agents.md',
-      guide: ['reference/cypher', 'reference/functions', 'reference/divergences', 'reference/api'],
+      grammar: GRAMMAR,
+      guide: ['reference/cypher/', 'reference/functions', 'reference/divergences', 'reference/api'],
     })
   },
   head: [
@@ -49,6 +55,8 @@ export default defineConfig({
     config(md) {
       // Every cypher example runs where it stands, on its sample dataset (BRAND.md, Documentation, rule 7; theme/cypher.ts).
       md.use(playgroundPlugin, { languages: ['cypher'] })
+      // ```railroad fences draw rules of the grammar as syntax diagrams (rule 4).
+      md.use(railroadPlugin, { grammar: GRAMMAR })
       // Links that leave docs/ point at the file on GitHub.
       const fallback = md.renderer.rules.link_open ?? ((t, i, o, _e, s) => s.renderToken(t, i, o))
       md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
@@ -78,7 +86,7 @@ export default defineConfig({
           {
             text: 'Language',
             items: [
-              { text: 'Cypher', link: '/reference/cypher' },
+              { text: 'Cypher', link: '/reference/cypher/' },
               { text: 'Functions', link: '/reference/functions' },
               { text: 'Where it differs', link: '/reference/divergences' },
             ],
@@ -132,7 +140,28 @@ export default defineConfig({
       {
         text: 'Reference',
         items: [
-          { text: 'Cypher', link: '/reference/cypher' },
+          {
+            text: 'Cypher',
+            collapsed: false,
+            items: [
+              { text: 'Overview', link: '/reference/cypher/' },
+              { text: 'MATCH', link: '/reference/cypher/match' },
+              { text: 'RETURN', link: '/reference/cypher/return' },
+              { text: 'WITH', link: '/reference/cypher/with' },
+              { text: 'UNWIND', link: '/reference/cypher/unwind' },
+              { text: 'CREATE', link: '/reference/cypher/create' },
+              { text: 'MERGE', link: '/reference/cypher/merge' },
+              { text: 'SET', link: '/reference/cypher/set' },
+              { text: 'REMOVE', link: '/reference/cypher/remove' },
+              { text: 'DELETE', link: '/reference/cypher/delete' },
+              { text: 'UNION', link: '/reference/cypher/union' },
+              { text: 'CREATE INDEX', link: '/reference/cypher/indexes' },
+              { text: 'EXPLAIN', link: '/reference/cypher/explain' },
+              { text: 'AT VERSION and AT TIME', link: '/reference/cypher/at' },
+              { text: 'Patterns', link: '/reference/cypher/patterns' },
+              { text: 'Expressions', link: '/reference/cypher/expressions' },
+            ],
+          },
           { text: 'Functions', link: '/reference/functions' },
           { text: 'Where it differs', link: '/reference/divergences' },
           { text: 'API', link: '/reference/api' },

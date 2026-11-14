@@ -11,7 +11,7 @@ import type { GraphClient } from '../../../src/worker/client'
 import type { GraphView } from '../../../src/render/index'
 import { collect, controlsHint, fmt, toRender } from './graph-results'
 
-export const DATASETS = ['social', 'family', 'metro', 'network', 'ontology', 'org-chart', 'packages', 'airline', 'power-grid', 'git-history', 'supply-chain', 'microservices'] as const
+export const DATASETS = ['empty', 'social', 'family', 'metro', 'network', 'ontology', 'org-chart', 'packages', 'airline', 'power-grid', 'git-history', 'supply-chain', 'microservices'] as const
 export type DatasetName = (typeof DATASETS)[number]
 /** Datasets the examples load with their history, for AT VERSION, AT TIME and the temporal functions. */
 export const WITH_HISTORY: ReadonlySet<DatasetName> = new Set(['ontology'])
@@ -28,7 +28,35 @@ export const DATASET_SIZE: Partial<Record<DatasetName, number>> = {
   microservices: 300,
 }
 
-/** The dataset an example runs on, from its attributes. */
+/** Splits Cypher into statements at semicolons outside strings, quoted names and comments. */
+export function statements(text: string): string[] {
+  const out: string[] = []
+  let start = 0
+  let i = 0
+  const push = (end: number) => {
+    const s = text.slice(start, end).trim()
+    if (s && !/^(\/\/[^\n]*\n?|\/\*[\s\S]*?\*\/|\s)*$/.test(s)) out.push(s)
+  }
+  while (i < text.length) {
+    const c = text[i]
+    if (c === "'" || c === '"' || c === '`') {
+      for (i++; i < text.length && text[i] !== c; i++) if (text[i] === '\\' && c !== '`') i++
+      i++
+    } else if (c === '/' && text[i + 1] === '/') {
+      while (i < text.length && text[i] !== '\n') i++
+    } else if (c === '/' && text[i + 1] === '*') {
+      const end = text.indexOf('*/', i + 2)
+      i = end < 0 ? text.length : end + 2
+    } else if (c === ';') {
+      push(i)
+      start = ++i
+    } else i++
+  }
+  push(text.length)
+  return out
+}
+
+/** The dataset an example runs on, from its attributes. `empty` is a graph with nothing in it. */
 export function datasetOf(attrs: Attributes): DatasetName {
   const name = attrs.dataset ?? 'social'
   if (!(DATASETS as readonly string[]).includes(name)) throw new Error(`Unknown dataset ${name} for a cypher example`)
@@ -73,12 +101,25 @@ export function cypherRunner(): () => Promise<Runner> {
     let queue: Promise<unknown> = Promise.resolve()
     const run = async (code: string, setup: SetupStep[], attrs: Attributes): Promise<PlayResult> => {
       const name = datasetOf(attrs)
-      const dataset = { name, size: DATASET_SIZE[name], history: WITH_HISTORY.has(name) }
       const steps = setupFor(setup, name)
-      // The dataset as generated: the worker reloads it when a write changed it.
-      await client.dataset(dataset)
-      for (const s of steps) await client.run(s.code).catch((e) => (s.fails ? undefined : Promise.reject(e)))
-      const r = await client.run(code)
+      // The dataset as generated: the worker reloads it when a write changed it. The empty graph is the smallest one,
+      // emptied.
+      if (name === 'empty') {
+        await client.dataset({ name: 'family' })
+        await client.run('MATCH (n) DETACH DELETE n')
+      } else await client.dataset({ name, size: DATASET_SIZE[name], history: WITH_HISTORY.has(name) })
+      // A step expected to fail runs up to its failing statement.
+      for (const s of steps) {
+        try {
+          for (const st of statements(s.code)) await client.run(st)
+        } catch (e) {
+          if (!s.fails) throw e
+        }
+      }
+      const parts = statements(code)
+      if (!parts.length) return { columns: [], rows: [], note: 'Nothing to run' }
+      for (const st of parts.slice(0, -1)) await client.run(st)
+      const r = await client.run(parts[parts.length - 1]!)
       if (r.explain) {
         const plan = String(r.rows[0]?.[0] ?? '')
         return { columns: [], rows: [], note: 'The plan, not run:', render: (host) => void host.append(Object.assign(document.createElement('pre'), { className: 'cy-run-plan', textContent: plan })) }
