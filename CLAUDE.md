@@ -7,7 +7,7 @@ part of the smalt family: smaltdb's CLAUDE.md has the family's shared working ru
 ## Brand: read smalt-brand first
 
 Before changing the site, the README or how the product is described, read smalt-brand's `BRAND.md` and
-`DECISIONS.md`. Copy the site theme (`docs/.vitepress/theme/{shiki.ts,smaltdb.css,smaltworks.ts,stage.ts}`) and the
+`DECISIONS.md`. Copy the site theme (`docs/.vitepress/theme/{shiki.ts,smaltdb.css,smaltworks.ts,stage.ts,playground.ts,agents.ts}`) and the
 badges unchanged from the family. smaltcy's brand is set (smalt-brand's DECISIONS.md, "smaltcy", 2026-11-14): a
 language, in the language layer's magenta (the hero's `suffix language`), said "smalt-sigh", with the **Graph** mark.
 The logo files in `docs/public/` come from smalt-brand's `logos/smaltcy/`, unchanged; a change starts there.
@@ -54,9 +54,17 @@ Playwright is installed globally in the cloud containers; don't run `playwright 
 - Plans say what, never how: no store names or traversal orders in the plan format. The match planner decides.
 - A new store passes `test/store-conformance.test.ts`, the Cypher suites (`describe.each` over stores) and the
   differential test.
-- Every ```` ```cypher ```` block in `docs/` is runnable on the site (`docs/.vitepress/theme/runnable.ts`) on a sample
-  dataset: the fence's `dataset=…`, else the page's front matter `dataset:`, else `social`; `noplay` keeps one plain.
-  `test/docs-examples.test.ts` runs each on that dataset and requires rows, and runs every playground example.
+- The docs follow smalt-brand's documentation standard (BRAND.md, "Documentation"): Quick start, Getting started,
+  User guide and Reference, in the nav and the sidebar.
+- Every ```` ```cypher ```` block in `docs/` runs where it stands, in the site kit's playground (`playground.ts`,
+  copied unchanged from smalt-brand) with smaltcy's runner (`docs/.vitepress/theme/cypher.ts`), on a sample dataset:
+  the fence's `dataset=…`, else `social`. Its setup is the examples above it on the same dataset that write; `noplay`
+  keeps one plain. The table under an example is its tested result: `test/docs-examples.test.ts` runs each as the
+  playground does and checks the table row for row (`UPDATE_DOCS=1 npx vitest run test/docs-examples.test.ts`
+  writes them), and runs every playground example. `<!-- docs:error CODE -->` marks one that must fail.
+- The build writes Markdown for agents beside the pages (`agents.ts`, also from the kit): `/llms.txt`, `/agents.md`
+  (opened by `docs/guide/agents.md`) and a twin of every page. Give a page a front matter `description:` when its first
+  sentence doesn't describe it.
 - A Cypher feature that isn't supported fails with an error, never a wrong answer; list it in
   `docs/reference/divergences.md`.
 - No runtime dependencies but smaltkit, the family's shared kit, pinned to a commit. Ask the owner before adding any

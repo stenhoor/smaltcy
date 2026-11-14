@@ -1,3 +1,7 @@
+---
+description: 'The scalar functions smaltcy''s Cypher reads: graph, lists, strings, conversion, maths and history.'
+---
+
 # Functions
 
 Function names are case-insensitive. A `null` argument gives `null` unless the function says otherwise.
@@ -54,3 +58,7 @@ For a graph that keeps history ([time travel](/guide/time-travel)); `null` other
 ```cypher
 RETURN toUpper('ada') AS name, size([1, 2, 3]) AS n, round(2.567, 2) AS r, range(0, 10, 5) AS steps
 ```
+
+| name | n | r | steps |
+| --- | --- | --- | --- |
+| ADA | 3 | 2.57 | [0,5,10] |

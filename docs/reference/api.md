@@ -1,3 +1,7 @@
+---
+description: 'The package''s exports, the result of a query, the error codes and the other entry points.'
+---
+
 # API
 
 ## `@smaltworks/smaltcy`

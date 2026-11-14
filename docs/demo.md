@@ -1,4 +1,5 @@
 ---
+description: 'A generated social network of 50 to 100,000 people, drawn whole on the GPU, with queries and a timeline.'
 layout: page
 title: Tech demo
 sidebar: false

@@ -1,7 +1,3 @@
----
-dataset: ontology
----
-
 # Time travel
 
 A graph can keep its history. Every committed write becomes a **version**, with its time, author and message, and any
@@ -10,10 +6,19 @@ version can be queried or drawn again. Drag a timeline and you see the graph cha
 The examples on this page run on the sample **ontology**: a data platform's systems, datasets, flows, teams and
 dashboards, changed 26 times over six months by four people. Press **Run** under any of them.
 
-```cypher
+```cypher dataset=ontology
 UNWIND commits() AS c
 RETURN c.version AS version, substring(c.at, 0, 10) AS day, c.author AS author, c.message AS message
 ```
+
+| version | day | author | message |
+| --- | --- | --- | --- |
+| 1 | 2026-05-04 | ana | Add the source systems |
+| 2 | 2026-05-05 | ana | Add the warehouse and the raw file store |
+| 3 | 2026-05-07 | ana | Add the teams |
+| 4 | 2026-05-08 | ana | Model the orders database |
+| 5 | 2026-05-10 | bo | Add click events |
+| … 21 more rows | | | |
 
 ## Keeping history
 
@@ -45,31 +50,56 @@ milliseconds since 1970, and either can be a parameter. Everything else works as
 
 The platform after its first two weeks:
 
-```cypher
+```cypher dataset=ontology
 AT VERSION 8
 MATCH (n)-[r]->(m)
 RETURN n, r, m
 ```
 
+| n | r | m |
+| --- | --- | --- |
+| (:Team {"name":"Payments"}) | [:OWNS] | (:Dataset {"name":"orders","rows":1200000}) |
+| (:Team {"name":"Payments"}) | [:OWNS] | (:Dataset {"name":"customers","rows":85000}) |
+| (:Team {"name":"Growth"}) | [:OWNS] | (:Dataset {"name":"click_events","rows":40000000}) |
+| (:Team {"name":"Data platform"}) | [:OWNS] | (:Flow {"name":"ingest_orders","schedule":"hourly","status":"active"}) |
+| (:Team {"name":"Data platform"}) | [:OWNS] | (:Flow {"name":"load_orders","schedule":"hourly","status":"active"}) |
+| … 13 more rows | | |
+
 The same moment, by date:
 
-```cypher
+```cypher dataset=ontology
 AT TIME '2026-05-16T12:00:00Z'
 MATCH (f:Flow)
 RETURN f.name AS flow, f.schedule AS schedule, f.status AS status
 ```
 
+| flow | schedule | status |
+| --- | --- | --- |
+| ingest_orders | hourly | active |
+| load_orders | hourly | active |
+| cdc_customers | streaming | active |
+
 `ingest_orders` was deprecated in July and later removed. It's still there in the past:
 
-```cypher
+```cypher dataset=ontology
 AT VERSION 18
 MATCH (f:Flow {name: 'ingest_orders'})-[r]-(x)
 RETURN f, r, x
 ```
 
-```cypher
+| f | r | x |
+| --- | --- | --- |
+| (:Flow {"name":"ingest_orders","schedule":"every 15 minutes","status":"deprecated"}) | [:READS] | (:Dataset {"name":"orders","rows":1900000}) |
+| (:Flow {"name":"ingest_orders","schedule":"every 15 minutes","status":"deprecated"}) | [:WRITES] | (:Dataset {"name":"raw_orders"}) |
+| (:Flow {"name":"ingest_orders","schedule":"every 15 minutes","status":"deprecated"}) | [:OWNS] | (:Team {"name":"Data platform"}) |
+
+```cypher dataset=ontology
 MATCH (f:Flow {name: 'ingest_orders'}) RETURN count(f) AS nowadays
 ```
+
+| nowadays |
+| --- |
+| 0 |
 
 A query on the past can't write: `AT VERSION 3 CREATE …` fails.
 
@@ -88,37 +118,71 @@ A commit map has `version`, `time` (milliseconds), `at` (ISO 8601), `author`, `m
 
 Who changed what, by author:
 
-```cypher
+```cypher dataset=ontology
 UNWIND commits() AS c
 RETURN c.author AS author, count(*) AS commits, sum(c.changes) AS changes
 ORDER BY commits DESC
 ```
 
+| author | commits | changes |
+| --- | --- | --- |
+| chen | 9 | 33 |
+| ana | 8 | 43 |
+| bo | 5 | 24 |
+| dara | 4 | 15 |
+
 Every change to the `orders` dataset:
 
-```cypher
+```cypher dataset=ontology
 MATCH (d:Dataset {name: 'orders'})
 UNWIND history(d) AS h
 RETURN h.version AS version, substring(h.at, 0, 10) AS day, h.author AS author, h.change AS change, h.key AS key, h.old AS old, h.new AS new
 ```
 
+| version | day | author | change | key | old | new |
+| --- | --- | --- | --- | --- | --- | --- |
+| 4 | 2026-05-08 | ana | created | null | null | null |
+| 14 | 2026-06-10 | chen | set | rows | 1200000 | 1900000 |
+| 26 | 2026-09-08 | chen | set | rows | 1900000 | 2600000 |
+
 When personal data was tagged, and on what:
 
-```cypher
+```cypher dataset=ontology
 MATCH (d:PII)
 UNWIND [h IN history(d) WHERE h.label = 'PII'] AS tagged
 RETURN d.name AS dataset, tagged.version AS version, tagged.author AS author
 ORDER BY version, dataset
 ```
 
+| dataset | version | author |
+| --- | --- | --- |
+| customers | 9 | dara |
+| dim_customers | 9 | dara |
+| charges | 16 | dara |
+| customer_features | 21 | ana |
+
 What fed the churn dashboard when it was built, and what feeds it now:
 
-```cypher
+```cypher dataset=ontology
 AT VERSION 22
 MATCH (:Dashboard {name: 'Churn risk'})-[:SHOWS]->(d)-[:READS|WRITES*1..8]-(x:Dataset)
 RETURN DISTINCT x.name AS upstream
 ORDER BY upstream
 ```
+
+| upstream |
+| --- |
+| charges |
+| click_events |
+| conversion_funnel |
+| customer_features |
+| customers |
+| dim_customers |
+| fact_charges |
+| fact_orders |
+| orders |
+| revenue_daily |
+| sessions |
 
 ## From TypeScript
 

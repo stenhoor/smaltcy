@@ -143,33 +143,42 @@ try {
   check((await slider.getAttribute('aria-valuenow')) === '27', 'a write adds version 27 and the timeline follows it');
   check(await waitDrawn(32), 'the new node is drawn');
 
-  // Runnable examples in the docs: Run shows a table and draws the graph.
+  // Examples in the docs run in place (the site kit's playground): Run shows a grid and draws the graph.
   await page.emulateMedia({ colorScheme: 'light' });
   await page.goto(`${site}guide/sample-data`);
-  const examples = page.locator('.cy-run');
+  const examples = page.locator('.sw-play');
   check((await examples.count()) >= 10, `the sample-data page has runnable examples (${await examples.count()})`);
   const first = examples.first();
-  await first.locator('[data-run="run"]').click();
-  await first.locator('.cy-run-table').waitFor({ timeout: 30000 });
+  check((await first.locator('.sw-play-result[data-tested] table').count()) === 1, 'an example shows its tested result at rest');
+  await first.locator('[data-play="run"]').click();
+  await first.locator('.sw-play-grid').waitFor({ timeout: 30000 });
   await first.locator('.cy-run-graph-bar span:not(:empty)').waitFor({ timeout: 15000 });
   check((await first.locator('.cy-run-graph-bar span').textContent()).includes('nodes'), `an example draws its graph (${await first.locator('.cy-run-graph-bar span').textContent()})`);
   check((await first.locator('.cy-run-graph .cy-run-note').count()) === 0, 'the example\'s graph view started');
   await page.waitForTimeout(1500);
   await first.screenshot({ path: join(shots, 'example-social.png') });
-  // An example on another dataset, edited.
-  const metro = page.locator('.cy-run[data-dataset="metro"]').nth(1);
+  // An example on another dataset: Run turns it into an editor where it stands.
+  const metro = page.locator('.sw-play[data-attrs*="metro"]').nth(1);
   await metro.scrollIntoViewIfNeeded();
-  await metro.locator('[data-run="edit"]').click();
-  await metro.locator('[data-run="run"]').click();
+  await metro.locator('[data-play="run"]').click();
   await metro.locator('.cy-run-graph-bar span:not(:empty)').waitFor({ timeout: 30000 });
-  check(/^\d+ rows? ·/.test(await metro.locator('.cy-run-status').textContent()), `a metro example runs (${await metro.locator('.cy-run-status').textContent()})`);
+  check(/^\d+ rows? ·/.test(await metro.locator('.sw-play-status').textContent()), `a metro example runs (${await metro.locator('.sw-play-status').textContent()})`);
   await page.waitForTimeout(1500);
   await metro.screenshot({ path: join(shots, 'example-metro.png') });
-  // Open in the playground: the example's query and dataset.
-  const href = await metro.locator('[data-run="open"]').getAttribute('href');
-  await page.goto(new URL(href, site).href);
-  await page.waitForFunction(() => /row/.test(document.querySelector('.pg-status')?.textContent ?? ''), null, { timeout: 30000 });
-  check((await page.inputValue('.pg-field select')) === 'metro' && (await page.inputValue('.pg-editor textarea')).includes('shortestPath'), 'Open in the playground brings the query and its dataset');
+  // Reset brings back the tested result, and frees the graph.
+  await metro.locator('[data-play="reset"]').click();
+  check((await metro.locator('.sw-play-result[data-tested] table').count()) === 1 && (await metro.locator('.cy-run-graph').count()) === 0, 'Reset brings back the tested result');
+  // Share: the code in the link's fragment opens the example with it.
+  // The link goes in the address bar once the clipboard has it (or has refused it): wait for the status.
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: new URL(site).origin });
+  await metro.locator('[data-play="share"]').click();
+  await page.waitForFunction(() => /^#play-\d+=/.test(location.hash), null, { timeout: 10000 }).catch(() => {});
+  const shared = page.url();
+  check(/#play-\d+=/.test(shared), `Share puts the code in the link (${shared})`);
+  await page.goto('about:blank');
+  await page.goto(shared);
+  const opened = await page.waitForFunction(() => /Shared code/.test(document.querySelector('.sw-play-live .sw-play-status')?.textContent ?? ''), null, { timeout: 30000 }).then(() => true, () => false);
+  check(opened, 'a shared link opens its example with the code');
 
   // The tech demo.
   // Quick mode opens the demo at 1,000 people (the software GPU draws 10,000 at about a frame a second); the full run

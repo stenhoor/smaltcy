@@ -3,7 +3,8 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { smaltLight, smaltDark } from './theme/shiki'
 import { smaltworksMenu, smaltworksFooter } from './theme/smaltworks'
-import { runnablePlugin } from './theme/runnable'
+import { playgroundPlugin } from './theme/playground'
+import { agentDocs, packageVersion } from './theme/agents'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const REPO = 'https://github.com/stenhoor/smaltcy'
@@ -17,6 +18,16 @@ export default defineConfig({
   cleanUrls: true,
   rewrites: { 'adr/README.md': 'adr/index.md' },
   lastUpdated: false,
+  // Markdown for AI agents beside the pages: a twin of each page, /llms.txt and /agents.md (BRAND.md, Documentation).
+  buildEnd: (config) => {
+    agentDocs(config, {
+      product: 'smaltcy',
+      version: packageVersion(path.resolve(here, '../../package.json')),
+      url: `https://stenhoor.github.io${BASE}`,
+      intro: 'guide/agents.md',
+      guide: ['reference/cypher', 'reference/functions', 'reference/divergences', 'reference/api'],
+    })
+  },
   head: [
     ['link', { rel: 'icon', type: 'image/svg+xml', href: `${BASE}favicon-32.svg` }],
     ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
@@ -36,8 +47,8 @@ export default defineConfig({
     theme: { light: smaltLight, dark: smaltDark },
     languageAlias: { cypher: 'sql' },
     config(md) {
-      // Every cypher example runs where it stands (theme/runnable.ts).
-      md.use(runnablePlugin)
+      // Every cypher example runs where it stands, on its sample dataset (BRAND.md, Documentation, rule 7; theme/cypher.ts).
+      md.use(playgroundPlugin, { languages: ['cypher'] })
       // Links that leave docs/ point at the file on GitHub.
       const fallback = md.renderer.rules.link_open ?? ((t, i, o, _e, s) => s.renderToken(t, i, o))
       md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
@@ -57,33 +68,63 @@ export default defineConfig({
   themeConfig: {
     logo: { light: '/lockup.svg', dark: '/lockup-on-dark.svg', alt: 'smaltcy' },
     siteTitle: false,
+    // The four sections of every smalt site (BRAND.md, Documentation, rule 1).
     nav: [
-      { text: 'Playground', link: '/playground' },
-      { text: 'Demo', link: '/demo' },
+      { text: 'Quick start', link: '/guide/quick-start' },
       { text: 'Guide', link: '/guide/getting-started' },
-      { text: 'Cypher', link: '/reference/cypher' },
-      { text: 'Engine', link: '/reference/plans' },
       {
-        text: 'Internals',
+        text: 'Reference',
         items: [
-          { text: 'Architecture', link: '/architecture' },
-          { text: 'Decisions', link: '/adr/' },
-          { text: 'Benchmarks', link: '/research/benchmarks' },
+          {
+            text: 'Language',
+            items: [
+              { text: 'Cypher', link: '/reference/cypher' },
+              { text: 'Functions', link: '/reference/functions' },
+              { text: 'Where it differs', link: '/reference/divergences' },
+            ],
+          },
+          {
+            text: 'API and engine',
+            items: [
+              { text: 'API', link: '/reference/api' },
+              { text: 'Plans', link: '/reference/plans' },
+              { text: 'Stores', link: '/reference/stores' },
+            ],
+          },
+          {
+            text: 'Internals',
+            items: [
+              { text: 'Architecture', link: '/architecture' },
+              { text: 'Decisions', link: '/adr/' },
+              { text: 'Benchmarks', link: '/research/benchmarks' },
+            ],
+          },
         ],
       },
+      { text: 'Playground', link: '/playground' },
       smaltworksMenu(),
     ],
     sidebar: [
       {
-        text: 'Guide',
+        text: 'Quick start',
+        items: [{ text: 'Quick start', link: '/guide/quick-start' }],
+      },
+      {
+        text: 'Getting started',
         items: [
-          { text: 'Getting started', link: '/guide/getting-started' },
-          { text: 'Using the pieces', link: '/guide/modules' },
-          { text: 'Time travel', link: '/guide/time-travel' },
+          { text: 'Installation', link: '/guide/getting-started' },
           { text: 'Examples', link: '/guide/examples' },
           { text: 'Sample data', link: '/guide/sample-data' },
-          { text: 'Tech demo: big graphs', link: '/demo' },
+          { text: 'For AI agents', link: '/guide/agents' },
+        ],
+      },
+      {
+        text: 'User guide',
+        items: [
+          { text: 'Using the pieces', link: '/guide/modules' },
+          { text: 'Time travel', link: '/guide/time-travel' },
           { text: 'Drawing graphs', link: '/guide/rendering' },
+          { text: 'Big graphs: the tech demo', link: '/demo' },
           { text: 'In a Web Worker', link: '/guide/worker' },
           { text: 'Saving and loading', link: '/guide/persistence' },
         ],
@@ -95,24 +136,20 @@ export default defineConfig({
           { text: 'Functions', link: '/reference/functions' },
           { text: 'Where it differs', link: '/reference/divergences' },
           { text: 'API', link: '/reference/api' },
-        ],
-      },
-      {
-        text: 'Engine',
-        items: [
           { text: 'Plans', link: '/reference/plans' },
           { text: 'Stores', link: '/reference/stores' },
-          { text: 'Architecture', link: '/architecture' },
-        ],
-      },
-      {
-        text: 'Internals',
-        collapsed: true,
-        items: [
-          { text: 'Decisions', link: '/adr/' },
-          { text: '0001 smaltcy', link: '/adr/0001-smaltcy' },
-          { text: '0002 Graph history', link: '/adr/0002-graph-history' },
-          { text: 'Benchmarks', link: '/research/benchmarks' },
+          {
+            text: 'Internals',
+            collapsed: true,
+            items: [
+              { text: 'Architecture', link: '/architecture' },
+              { text: 'Decisions', link: '/adr/' },
+              { text: '0001 smaltcy', link: '/adr/0001-smaltcy' },
+              { text: '0002 Graph history', link: '/adr/0002-graph-history' },
+              { text: '0003 Drawing in smaltkit', link: '/adr/0003-drawing-in-smaltkit' },
+              { text: 'Benchmarks', link: '/research/benchmarks' },
+            ],
+          },
         ],
       },
     ],

@@ -1,3 +1,7 @@
+---
+description: 'Where smaltcy''s Cypher differs from openCypher, and what it doesn''t read yet.'
+---
+
 # Where smaltcy differs
 
 smaltcy's Cypher follows openCypher where it reads a feature. These are the known differences.

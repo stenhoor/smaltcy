@@ -1,3 +1,7 @@
+---
+description: 'The Cypher smaltcy reads: clauses, patterns, expressions and aggregates.'
+---
+
 # Cypher
 
 smaltcy reads a subset of openCypher: the clauses and expressions most queries use. Anything outside it fails with
@@ -30,6 +34,10 @@ differs](./divergences) lists the known differences.
 MATCH (a:Person {name: 'Ada'})-[k:KNOWS]->(b)-[:LIVES_IN]->(c:City)
 RETURN a, k, b
 ```
+
+| a | k | b |
+| --- | --- | --- |
+| (:Person {"name":"Ada","born":1815}) | [:KNOWS {"since":1833}] | (:Person {"name":"Alan","born":1912}) |
 
 - Nodes: `(var:Label:Other {key: value})`; every part is optional, `()` is any node.
 - Relationships: `-[var:TYPE|OTHER {key: value}]->`, `<-[…]-`, or `-[…]-` for either direction. `-->` and `--` are
@@ -67,5 +75,13 @@ without an aggregate group the rows:
 MATCH (p:Person)-[:LIVES_IN]->(c:City)
 RETURN c.name AS city, count(*) AS people, collect(p.name) AS names
 ```
+
+| city | people | names |
+| --- | --- | --- |
+| London | 3 | ["Ada","Alan","Tim"] |
+| New York | 3 | ["Grace","Barbara","Frances"] |
+| Austin | 1 | ["Edsger"] |
+| Palo Alto | 3 | ["Donald","John","Ken"] |
+| Boston | 2 | ["Margaret","Radia"] |
 
 The [functions](./functions) page lists the scalar functions.

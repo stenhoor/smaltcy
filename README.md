@@ -19,7 +19,7 @@ graphs in 2D and 3D, with the force layout in compute shaders.
 ## Install
 
 ```sh
-npm install @smaltworks/smaltcy
+npm install --save-exact @smaltworks/smaltcy@0.1.0 # not on npm yet
 ```
 
 ```ts

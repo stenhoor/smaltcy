@@ -4,10 +4,10 @@ import { join, resolve } from 'node:path';
 import { expect, test } from 'vitest';
 
 /**
- * The TypeScript examples in docs/guide/modules.md are type-checked against the package's entry points, so the guide
+ * The TypeScript examples in the guide pages below are type-checked against the package's entry points, so the guide
  * to using the pieces can't drift from the code. Each block is a module of its own.
  */
-const PAGES = ['docs/guide/modules.md', 'docs/guide/time-travel.md'];
+const PAGES = ['docs/guide/modules.md', 'docs/guide/time-travel.md', 'docs/guide/quick-start.md', 'docs/guide/agents.md'];
 
 test('the modules guide type-checks', () => {
   const dir = resolve('.cache/docs-ts');
