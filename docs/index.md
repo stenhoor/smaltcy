@@ -1,9 +1,13 @@
 ---
 layout: home
 hero:
-  name: ' '
-  text: A graph database for the browser that speaks Cypher.
-  tagline: Small. Alternative. Connected.
+  name: 'sm<span class="alt">alt</span><span class="suffix language">cy</span>'
+  text: 'Small. Alternative.<br>Connected.'
+  tagline: A graph database for the browser that speaks Cypher.
+  image:
+    light: /graph-mark.svg
+    dark: /graph-mark-on-dark.svg
+    alt: smaltcy
   actions:
     - theme: brand
       text: Open the playground
@@ -28,8 +32,6 @@ features:
     details: Force layout in WebGPU compute shaders, drawn in 2D or 3D, with picking, search and labels on the GPU too.
 ---
 
-<div class="cy-home-mark"><Wordmark /></div>
-
 ```ts
 import { open } from '@smaltworks/smaltcy';
 
@@ -39,7 +41,3 @@ db.query('MATCH (a)-[:KNOWS]->(b) RETURN a.name AS a, b.name AS b');
 // [{ a: 'Ada', b: 'Alan' }]
 ```
 
-<style>
-.cy-home-mark { display: flex; justify-content: center; margin: -24px 0 32px; }
-.VPHome .VPHero .name { display: none; }
-</style>

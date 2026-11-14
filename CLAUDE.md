@@ -8,7 +8,9 @@ part of the smalt family: smaltdb's CLAUDE.md has the family's shared working ru
 
 Before changing the site, the README or how the product is described, read smalt-brand's `BRAND.md` and
 `DECISIONS.md`. Copy the site theme (`docs/.vitepress/theme/{shiki.ts,smaltdb.css,smaltworks.ts,stage.ts}`) and the
-badges unchanged from the family. smaltcy has no mark or product colour yet (ADR 0001, "Open"): don't invent one.
+badges unchanged from the family. smaltcy's brand is set (smalt-brand's DECISIONS.md, "smaltcy", 2026-11-14): a
+language, in the language layer's magenta (the hero's `suffix language`), said "smalt-sigh", with the **Graph** mark.
+The logo files in `docs/public/` come from smalt-brand's `logos/smaltcy/`, unchanged; a change starts there.
 
 ## Workflow
 

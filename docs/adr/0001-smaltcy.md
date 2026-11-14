@@ -43,9 +43,11 @@ smaltdb's pager on OPFS, as a store, so commits, the write-ahead log and recover
 
 - **Brand** (owner, 2026-11-11): tagline "Small. Alternative. Connected." and positioning "A graph database for the
   browser that speaks Cypher." The site uses a text wordmark and a placeholder icon until smalt-brand draws the mark
-  and picks a product colour.
+  and picks a product colour. **Settled 2026-11-14** (smalt-brand's DECISIONS.md, "smaltcy"; stenhoor/smalt-brand#96):
+  smaltcy is a language, in the language layer's magenta, said "smalt-sigh", with the Graph mark (three nodes at 0°,
+  45° and 90°, the returned node as the chip). The site uses its logo files.
 - **smaltworks.dev** (owner, 2026-11-11): the repository moves under `stenhoor` first; smaltcy is then added to the
-  website (its status and product page) by a smalt-brand pull request.
+  website (its status and product page) by a smalt-brand pull request. **Done 2026-11-14** (stenhoor/smalt-brand#96).
 - **The hybrid with smaltdb:** which store comes first (graph tables in smaltdb behind `GraphStore`, or lowering
   graph plans to relational plans), decided with smaltdb's ADR 0028.
 
