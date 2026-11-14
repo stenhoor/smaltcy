@@ -169,7 +169,10 @@ try {
   await metro.locator('[data-play="reset"]').click();
   check((await metro.locator('.sw-play-result[data-tested] table').count()) === 1 && (await metro.locator('.cy-run-graph').count()) === 0, 'Reset brings back the tested result');
   // Share: the code in the link's fragment opens the example with it.
+  // The link goes in the address bar once the clipboard has it (or has refused it): wait for the status.
+  await page.context().grantPermissions(['clipboard-read', 'clipboard-write'], { origin: new URL(site).origin });
   await metro.locator('[data-play="share"]').click();
+  await page.waitForFunction(() => /^#play-\d+=/.test(location.hash), null, { timeout: 10000 }).catch(() => {});
   const shared = page.url();
   check(/#play-\d+=/.test(shared), `Share puts the code in the link (${shared})`);
   await page.goto('about:blank');
