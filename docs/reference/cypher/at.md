@@ -88,4 +88,4 @@ ORDER BY label
 ## See also
 
 - [Time travel](/guide/time-travel): keeping history, diffs and the timeline.
-- [Functions](../functions): the history functions.
+- [Functions](../functions/): the history functions.

@@ -15,6 +15,7 @@ Numbers are JavaScript doubles. Whether a value is an integer or a float is know
 - A whole-number value read from a property acts as an integer, even if it was stored as `2.0`: `n.x / 2` with
   `n.x = 5.0` is `2`. Use `toFloat(n.x) / 2` to divide as floats.
 - Integers are exact up to 2⁵³.
+- `valueType()` names a number by its value: `valueType(7.0)` is `INTEGER`, though `toString(7.0)` is `'7.0'`.
 
 ## Not yet supported
 

@@ -19,13 +19,21 @@ description: 'The package''s exports, the result of a query, the error codes and
 A result:
 
 ```ts
+import type { GraphPlan, ResultValue } from '@smaltworks/smaltcy';
+import type { ExplainLine } from '@smaltworks/smaltcy/engine';
+
 interface CypherResult {
-  columns: string[];
-  rows: ResultValue[][];
-  counts: { nodesCreated; nodesDeleted; relationshipsCreated; relationshipsDeleted; propertiesSet; labelsAdded; labelsRemoved };
-  ms: number;          // time spent running the plan
-  plan: GraphPlan;     // what ran
-  explain?: ExplainLine[]; // for EXPLAIN
+  columns: readonly string[];
+  rows: readonly (readonly ResultValue[])[];
+  /** What the statement wrote. */
+  counts: {
+    nodesCreated: number; nodesDeleted: number; relationshipsCreated: number; relationshipsDeleted: number;
+    propertiesSet: number; labelsAdded: number; labelsRemoved: number;
+  };
+  ms: number; // time spent running the plan
+  plan: GraphPlan; // what ran
+  explain?: readonly ExplainLine[]; // for EXPLAIN
+  version?: number; // with history: the version it read, or the one a write made
 }
 ```
 
@@ -61,3 +69,33 @@ its own.
 | `@smaltworks/smaltcy/datasets` | The sample graphs: `social`, `family`, `metro`, `network`, `ontology`, and the real-world shapes `orgChart`, `packages`, `airline`, `powerGrid`, `gitHistory`, `supplyChain`, `microservices` |
 | `@smaltworks/smaltcy/worker` | The worker script |
 | `@smaltworks/smaltcy/worker-runtime` | `createHandler`, to build a worker of your own |
+
+## Working demo
+
+A complete program: a graph in the page, written, read, explained and saved. The comments show what it prints. Its
+TypeScript is type-checked against the package (`test/docs-ts.test.ts`), and `test/docs-api.test.ts` runs it.
+
+```ts
+import { open, SmaltcyError } from '@smaltworks/smaltcy';
+
+const db = open({ history: true });
+db.run(
+  `UNWIND $people AS p CREATE (:Person {name: p.name, born: p.born})`,
+  { people: [{ name: 'Ada', born: 1815 }, { name: 'Alan', born: 1912 }] },
+  { author: 'demo', message: 'Add people' },
+);
+const made = db.run("MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Alan'}) CREATE (a)-[:KNOWS]->(b)");
+console.log(made.counts.relationshipsCreated); // 1
+
+console.log(db.query('MATCH (a)-[:KNOWS]->(b) RETURN a.name AS a, b.name AS b')); // [{ a: 'Ada', b: 'Alan' }]
+console.log(db.version); // 2
+console.log(db.at(1).query('MATCH (n) RETURN count(n) AS n')); // [{ n: 2 }]
+
+try {
+  db.run("MATCH (p:Person {name: 'Ada'}) DELETE p");
+} catch (e) {
+  if (e instanceof SmaltcyError) console.log(e.code); // SMALTCY_CONSTRAINT
+}
+const json = db.toJSON(); // nodes, relationships and history, for load() later
+console.log(json.nodes.length); // 2
+```

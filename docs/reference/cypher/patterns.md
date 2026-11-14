@@ -19,7 +19,7 @@ relationship-pattern
 relationship-detail
 hops
 shortest-path
-properties
+pattern-properties
 ```
 
 ## Nodes
@@ -138,4 +138,4 @@ ORDER BY roads, route
 ## See also
 
 - [MATCH](./match), [CREATE](./create) and [MERGE](./merge), which read patterns.
-- [Functions](../functions): `nodes`, `relationships`, `length`, `startNode`, `endNode`.
+- [Functions](../functions/): `nodes`, `relationships`, `length`, `startNode`, `endNode`.

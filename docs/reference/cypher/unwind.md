@@ -74,5 +74,5 @@ ORDER BY item, quantity
 
 ## See also
 
-- [Functions](../functions): `range()`, `collect()` and the list functions.
+- [Functions](../functions/): `range()`, `collect()` and the list functions.
 - [CREATE](./create): writing a batch of rows.

@@ -148,4 +148,4 @@ LIMIT 2
 
 - [WITH](./with): the same projection, in the middle of a query.
 - [UNION](./union): the rows of several queries together.
-- [Functions](../functions): the aggregates and the rest.
+- [Functions](../functions/): the aggregates and the rest.

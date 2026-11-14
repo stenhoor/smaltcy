@@ -203,5 +203,5 @@ ORDER BY id
 
 ## See also
 
-- [Functions](../functions): every function, by kind.
+- [Functions](../functions/): every function, by kind.
 - [Patterns](./patterns): the patterns a comprehension or a condition takes.

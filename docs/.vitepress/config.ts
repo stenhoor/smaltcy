@@ -16,6 +16,17 @@ const BASE = process.env.SMALTCY_BASE ?? '/smaltcy/'
 // agent guide read it.
 const GRAMMAR = readFileSync(path.resolve(here, '../grammar.ebnf'), 'utf8')
 
+// A function group in the sidebar: its page, then a page per function, in the order of the group page's list
+// (`- [`name`](./page): summary`), so the sidebar and the group page cannot disagree. As smaltql's site does.
+function functionGroup(text: string, group: string) {
+  const md = readFileSync(path.resolve(here, `../reference/functions/${group}/index.md`), 'utf8')
+  const items = [...md.matchAll(/^- \[`(.+?)`\]\(\.\/([\w-]+)\): /gm)].map(([, label, page]) => ({
+    text: label,
+    link: `/reference/functions/${group}/${page}`,
+  }))
+  return { text, link: `/reference/functions/${group}/`, collapsed: true, items }
+}
+
 export default defineConfig({
   title: 'smaltcy',
   description: 'A graph database for the browser that speaks Cypher, written in TypeScript.',
@@ -31,7 +42,7 @@ export default defineConfig({
       url: `https://stenhoor.github.io${BASE}`,
       intro: 'guide/agents.md',
       grammar: GRAMMAR,
-      guide: ['reference/cypher/', 'reference/functions', 'reference/divergences', 'reference/api'],
+      guide: ['reference/cypher/', 'reference/functions/', 'reference/divergences', 'reference/api'],
     })
   },
   head: [
@@ -87,7 +98,7 @@ export default defineConfig({
             text: 'Language',
             items: [
               { text: 'Cypher', link: '/reference/cypher/' },
-              { text: 'Functions', link: '/reference/functions' },
+              { text: 'Functions', link: '/reference/functions/' },
               { text: 'Where it differs', link: '/reference/divergences' },
             ],
           },
@@ -162,7 +173,21 @@ export default defineConfig({
               { text: 'Expressions', link: '/reference/cypher/expressions' },
             ],
           },
-          { text: 'Functions', link: '/reference/functions' },
+          {
+            text: 'Functions',
+            collapsed: true,
+            items: [
+              { text: 'All functions', link: '/reference/functions/' },
+              functionGroup('Graph', 'graph'),
+              functionGroup('Lists', 'lists'),
+              functionGroup('Strings', 'strings'),
+              functionGroup('Conversion', 'conversion'),
+              functionGroup('Math', 'math'),
+              functionGroup('Aggregate', 'aggregate'),
+              functionGroup('History', 'history'),
+              functionGroup('Other', 'other'),
+            ],
+          },
           { text: 'Where it differs', link: '/reference/divergences' },
           { text: 'API', link: '/reference/api' },
           { text: 'Plans', link: '/reference/plans' },

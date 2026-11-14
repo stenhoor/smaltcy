@@ -70,16 +70,16 @@ shortest-path ::= ('shortestPath' | 'allShortestPaths') '(' node-pattern relatio
 
 pattern-element ::= node-pattern (relationship-pattern node-pattern)* | '(' pattern-element ')'
 
-node-pattern ::= '(' name? (':' name)* properties? ')'
+node-pattern ::= '(' name? (':' name)* pattern-properties? ')'
 
 relationship-pattern ::= '<-' relationship-detail? '-'
                        | '-' relationship-detail? ('->' | '-')
 
-relationship-detail ::= '[' name? (':' name ('|' ':'? name)*)? ('*' hops?)? properties? ']'
+relationship-detail ::= '[' name? (':' name ('|' ':'? name)*)? ('*' hops?)? pattern-properties? ']'
 
 hops ::= integer ('..' integer?)? | '..' integer?
 
-properties ::= map-literal | parameter
+pattern-properties ::= map-literal | parameter
 
 /* Expressions. How tightly the operators bind is in the Cypher reference's overview, not in the diagrams. */
 

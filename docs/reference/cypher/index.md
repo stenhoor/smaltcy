@@ -6,7 +6,7 @@ description: 'The Cypher smaltcy reads: statements, clauses, patterns, expressio
 
 smaltcy reads a subset of openCypher: the clauses and expressions most queries use. Anything outside it fails with
 `SMALTCY_SYNTAX` or `SMALTCY_SEMANTIC`, never with a wrong answer. [Where it differs](../divergences) lists the known
-differences, and the [functions](../functions) have their own reference.
+differences, and the [functions](../functions/) have their own reference.
 
 ## Statements
 
@@ -129,6 +129,6 @@ ORDER BY since
 ## See also
 
 - [Patterns](./patterns) and [expressions](./expressions).
-- [Functions](../functions): every function, by kind.
+- [Functions](../functions/): every function, by kind.
 - [Where it differs](../divergences) from openCypher.
 - The [playground](/playground): any query on any sample graph.
