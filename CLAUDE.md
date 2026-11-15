@@ -24,6 +24,17 @@ Settings → Pages → Source must stay **GitHub Actions**. With "Deploy from a 
 root on every push and replaces the site with a 404 (2026-11-12). A push that touches no docs or source doesn't
 redeploy; run the Docs workflow by hand to republish.
 
+Two more of the family's rules:
+
+- **Facts only.** Don't tell the owner something you haven't confirmed. A fact comes from the code, a command's
+  output, a document you read in this session, or GitHub itself; say which when it isn't obvious. Label everything
+  else as an assumption, in those words, with what would confirm it, and check before asserting when checking is
+  cheap. Correct a wrong fact where you wrote it, and say so.
+- **Watch your PRs to the merge.** A PR you open is yours until it is merged or closed: subscribe to its activity, fix
+  CI failures and answer reviews as they arrive, then do what the merge unblocks and stop watching. Watching is
+  event-driven: never poll, sleep or schedule checks for it. Merging stays with the owner.
+  (Both rules: smaltworks' [session rules](https://github.com/stenhoor/smaltworks/blob/main/context/session-rules.md).)
+
 ## Commands
 
 | Command | What it does |
