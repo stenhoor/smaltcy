@@ -9,6 +9,8 @@
  * - Every Cypher label is a label of the graph (its own table, `<graph>_l<k>`, stays empty) and an entry in the graph's
  *   label index, `<graph>_labels` (`node`, `label`), one row per node and label, in the order the node has them.
  * - One edge table per relationship type, `<graph>_t<k>` (`start`, `end`, `props`), with indexes on `start` and `end`.
+ *   A relationship's rowid is its smaltcy id when the graph to load gives them (`id`), so `id(r)` reads the same;
+ *   otherwise relationships are numbered from 0 in order, across the tables, and `id(r)` is refused.
  */
 import type { plan, PlanStatementInput } from 'smaltdb/engine';
 import { SmaltcyError } from '../errors.js';
@@ -29,6 +31,8 @@ export interface GraphTables {
   readonly labelTables: ReadonlyMap<string, string>;
   /** Each relationship type's edge table: columns `start`, `end`, `props`. */
   readonly types: ReadonlyMap<string, string>;
+  /** Whether a relationship's rowid is its smaltcy id (the graph was loaded with them): what `id(r)` needs. */
+  readonly relationshipIds: boolean;
 }
 
 /** A graph to load: GraphJSON's shape (`dumpGraph` in `@smaltworks/smaltcy/engine` gives one). */
@@ -39,6 +43,8 @@ export interface GraphData {
     readonly properties?: Readonly<Record<string, PropertyValue>>;
   }[];
   readonly relationships: readonly {
+    /** The relationship's id in smaltcy's store, kept as its rowid (`dumpGraph` leaves it out). */
+    readonly id?: number;
     readonly start: string | number;
     readonly end: string | number;
     readonly type: string;
@@ -51,7 +57,7 @@ const unsupported = (msg: string): never => {
 };
 
 /** The tables of a graph with these labels and types, named as `schemaStatements` makes them. */
-export function graphTables(labels: readonly string[], types: readonly string[], graph = 'graph'): GraphTables {
+export function graphTables(labels: readonly string[], types: readonly string[], graph = 'graph', relationshipIds = false): GraphTables {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(graph)) unsupported(`A graph's name is a plain identifier, not ${JSON.stringify(graph)}`);
   // smaltdb finds a graph's labels and types ignoring case (`addLabel`); Cypher's are case-sensitive.
   const once = (names: readonly string[], what: string) => {
@@ -72,7 +78,18 @@ export function graphTables(labels: readonly string[], types: readonly string[],
     labels: `${graph}_labels`,
     labelTables: new Map(ls.map((l, k) => [l, `${graph}_l${k}`])),
     types: new Map(ts.map((t, k) => [t, `${graph}_t${k}`])),
+    relationshipIds,
   };
+}
+
+/** Whether every relationship to load has an id a rowid can keep: a non-negative integer, given once. */
+function keepsRelationshipIds(data: GraphData): boolean {
+  const seen = new Set<number>();
+  for (const r of data.relationships) {
+    if (typeof r.id !== 'number' || !Number.isSafeInteger(r.id) || r.id < 0 || seen.has(r.id)) return false;
+    seen.add(r.id);
+  }
+  return true;
 }
 
 /** The tables of a graph to load: its labels and types, in the order they first appear. */
@@ -81,6 +98,7 @@ export function graphTablesFor(data: GraphData, graph = 'graph'): GraphTables {
     data.nodes.flatMap((n) => n.labels ?? []),
     data.relationships.map((r) => r.type),
     graph,
+    keepsRelationshipIds(data),
   );
 }
 
@@ -131,14 +149,16 @@ export function loadStatements(data: GraphData, t: GraphTables): PlanStatementIn
       labelNames.push(l);
     }
   });
-  const edges = new Map<string, { start: number[]; end: number[]; props: Record<string, PropertyValue>[] }>();
-  for (const r of data.relationships) {
+  const keepRels = keepsRelationshipIds(data);
+  const edges = new Map<string, { rowid: number[]; start: number[]; end: number[]; props: Record<string, PropertyValue>[] }>();
+  for (const [i, r] of data.relationships.entries()) {
     const s = ids.get(r.start);
     const e = ids.get(r.end);
     if (s === undefined || e === undefined) throw new SmaltcyError('SMALTCY_NOT_FOUND', `A ${r.type} relationship refers to a node that isn't in the graph (${s === undefined ? r.start : r.end})`);
     const table = t.types.get(r.type) ?? unsupported(`The relationship type ${r.type} is not one of the graph's`);
     let rows = edges.get(table);
-    if (!rows) edges.set(table, (rows = { start: [], end: [], props: [] }));
+    if (!rows) edges.set(table, (rows = { rowid: [], start: [], end: [], props: [] }));
+    rows.rowid.push(keepRels ? r.id! : i);
     rows.start.push(s);
     rows.end.push(e);
     rows.props.push(propertyMap(r.properties));
@@ -148,7 +168,7 @@ export function loadStatements(data: GraphData, t: GraphTables): PlanStatementIn
   const out: PlanStatementInput[] = [];
   if (nodeIds.length) out.push(append(t.nodes, values([nodeIds, props], ['int', 'map<text, any>']), [0, 1]));
   if (labelNodes.length) out.push(append(t.labels, values([labelNodes, labelNames], ['int', 'text']), [0, 1]));
-  for (const [table, rows] of edges) out.push(append(table, values([rows.start, rows.end, rows.props], ['int', 'int', 'map<text, any>']), [0, 1, 2]));
+  for (const [table, rows] of edges) out.push(append(table, values([rows.rowid, rows.start, rows.end, rows.props], ['int', 'int', 'int', 'map<text, any>']), [-1, 0, 1, 2]));
   return out;
 }
 
