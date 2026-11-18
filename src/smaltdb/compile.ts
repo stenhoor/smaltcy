@@ -5,8 +5,9 @@
  *
  * What it can't compile yet it refuses with an `Unsupported` error that names it, never a plan that would give a
  * different answer. Where only the values a query reads show that it can't keep Cypher's meaning (a list compared with
- * `<`, a string added to a list), the plan raises an error when it meets them: a smaltdb error whose message starts
- * with `smaltcy:`.
+ * `<`, a string added to a list), the plan raises an error when it meets them (smaltdb's `raise_error`), with
+ * `Unsupported`'s code and message. Cypher's own errors that only the values show (a type error, division by zero) are
+ * raised the same way, with the code and message smaltcy's engine gives.
  *
  * Plans are built as plain data: smaltdb is not a runtime dependency of smaltcy yet, so this module imports its types
  * only. A node in a row is two columns, its id and its `props` map; a relationship five (its type's name, its rowid in
@@ -15,7 +16,7 @@
  * type.
  */
 import type { plan, PlanColumn, PlanStatementInput } from 'smaltdb/engine';
-import { SmaltcyError } from '../errors.js';
+import { SmaltcyError, type ErrorCode } from '../errors.js';
 import type { Expr } from '../plan/expr.js';
 import type { AggCall, Direction, GraphPlan, Op, Pattern, PatternRel, Projection, SortKey } from '../plan/ops.js';
 import type { GraphTables } from './schema.js';
@@ -330,11 +331,16 @@ const FALSE = lit(false);
 const INFINITY: PlanExpr = { k: 'lit', value: Infinity, type: 'real' };
 
 /**
- * An error raised when a row reaches it: what a plan does with values whose Cypher meaning it can't keep yet. smaltdb
- * has no function that raises a message, so this is a strict conversion of the message to an integer, which fails
- * with it (SMALT_MISMATCH: `cannot convert text "smaltcy: …" to an integer`).
+ * An error raised when a row reaches it (smaltdb's `raise_error`, which a CASE branch not taken doesn't evaluate): a
+ * smaltcy error code and its message, text or an expression giving text.
  */
-const raise = (message: string): PlanExpr => call('cast_integer_strict', [lit(`smaltcy: ${message}`)], 'int');
+const raise = (code: ErrorCode, message: string | PlanExpr, type: PlanType = 'any'): PlanExpr =>
+  call('raise_error', [typeof message === 'string' ? lit(message) : message, lit(code)], type);
+/** What a plan does with values whose Cypher meaning it can't keep yet: `Unsupported`'s code and message, when a row meets them. */
+const refuseWhenMet = (feature: string, type: PlanType = 'any'): PlanExpr => raise('SMALTCY_UNSUPPORTED', new Unsupported(feature).message, type);
+/** Text joined from literal parts and text expressions: an error's message. */
+const message = (...parts: (string | PlanExpr)[]): PlanExpr =>
+  parts.map((p) => (typeof p === 'string' ? lit(p) : p)).reduce((a, b) => call('text_concat', [a, b], 'text'));
 
 // Cypher's kinds of values, and their order in ORDER BY (smaltcy's `orderCompare`): maps, nodes, relationships, lists,
 // paths, strings, booleans, numbers, NaN, then NULL.
@@ -382,6 +388,34 @@ function kindExpr(v: { e: PlanExpr; t: PlanType }): PlanExpr {
     ],
     lit(K_OTHER),
     'int',
+  );
+}
+
+/**
+ * The name of a value's type as smaltcy's errors give it (`typeName`): NULL, BOOLEAN, INTEGER (a number with a whole
+ * value), FLOAT, STRING, LIST or MAP; smaltdb's own type for other values.
+ */
+function typeNameExpr(v: { e: PlanExpr; t: PlanType }): PlanExpr {
+  const k = staticKind(v.t);
+  const named = new Map([[K_STRING, 'STRING'], [K_BOOL, 'BOOLEAN'], [K_LIST, 'LIST'], [K_MAP, 'MAP'], [K_NULL, 'NULL']]);
+  const name = k === undefined ? undefined : named.get(k);
+  if (name !== undefined) return caseWhen([[isNull(v.e), lit('NULL')]], lit(name), 'text');
+  // A number's (or any value's) type as smaltdb reads it: a real with a whole value reads as an int, as smaltcy's
+  // JavaScript numbers are integers then.
+  const type = call('any_type', [v.e], 'text');
+  const starts = (prefix: string) => call('starts_with', [type, lit(prefix)], 'bool');
+  return caseWhen(
+    [
+      [isNull(v.e), lit('NULL')],
+      [eq(type, lit('int')), lit('INTEGER')],
+      [eq(type, lit('real')), lit('FLOAT')],
+      [eq(type, lit('text')), lit('STRING')],
+      [eq(type, lit('bool')), lit('BOOLEAN')],
+      [starts('list<'), lit('LIST')],
+      [starts('map<'), lit('MAP')],
+    ],
+    type,
+    'text',
   );
 }
 
@@ -929,7 +963,7 @@ export class Compiler {
     const k = staticKind(v.t);
     if (k === K_NUMBER || k === K_NULL) return v.e;
     if (k !== undefined) return unsupported(`${what} of a ${v.t}`);
-    return caseWhen([[isNull(v.e), NULL], [eq(kindExpr(v), lit(K_NUMBER)), v.e]], raise(`${what} takes numbers`), 'any');
+    return caseWhen([[isNull(v.e), NULL], [eq(kindExpr(v), lit(K_NUMBER)), v.e]], raise('SMALTCY_TYPE', message(`${what} can't take a `, typeNameExpr(v))), 'any');
   }
 
   /**
@@ -975,7 +1009,7 @@ export class Compiler {
     return caseWhen(
       [
         [eq(k, lit(K_NULL)), NULL],
-        [call('in_list', [k, lit(K_LIST), lit(K_MAP), lit(K_OTHER)], 'bool'), raise('ordering lists and maps')],
+        [call('in_list', [k, lit(K_LIST), lit(K_MAP), lit(K_OTHER)], 'bool'), refuseWhenMet('ordering lists and maps', 'int')],
       ],
       k,
       'int',
@@ -1045,7 +1079,10 @@ export class Compiler {
     const k = staticKind(v.t);
     if (k === K_BOOL || k === K_NULL) return v.e;
     if (k !== undefined) return unsupported(`${what} given a ${v.t}`);
-    return caseWhen([[isNull(v.e), NULL], [eq(kindExpr(v), lit(K_BOOL)), call('any_bool', [v.e], 'bool')]], raise(`${what} must be a boolean`), 'bool');
+    // smaltcy's engine names WHERE and CASE conditions; AND, OR, XOR, NOT and the predicates of list comprehensions and
+    // quantifiers are 'A predicate' there.
+    const named = what === 'WHERE' || what === 'A CASE condition' ? what : 'A predicate';
+    return caseWhen([[isNull(v.e), NULL], [eq(kindExpr(v), lit(K_BOOL)), call('any_bool', [v.e], 'bool')]], raise('SMALTCY_TYPE', message(`${named} must be a boolean, not `, typeNameExpr(v)), 'bool'), 'bool');
   }
 
   expr(x: Expr, frame: Frame): Val {
@@ -1143,7 +1180,7 @@ export class Compiler {
         if (kind !== 'value' && !x.map) return unsupported('a list comprehension giving nodes or relationships');
         let out: Val = { k: 'value', e: list, t: `list<${elem}>` };
         if (x.where) {
-          const pred = this.inElement(x.slot, elem, () => this.predicate(x.where!, frame, 'WHERE'), kind);
+          const pred = this.inElement(x.slot, elem, () => this.predicate(x.where!, frame, "a list comprehension's WHERE"), kind);
           out = { k: 'value', e: { k: 'each', mode: 'filter', list: out.e, body: pred, type: out.t }, t: out.t };
         }
         if (x.map) {
@@ -1220,7 +1257,7 @@ export class Compiler {
     if (k === K_NULL) return { list: { k: 'lit', value: null, type: 'list<any>' }, elem: 'any' };
     if (k !== undefined) return unsupported(`${what} over a ${v.t}`);
     // Known only when it runs: a list under any, NULL, or Cypher's type error.
-    return { list: caseWhen([[isNull(v.e), NULL], [eq(kindExpr(v), lit(K_LIST)), call('any_list', [v.e], 'list<any>')]], call('list_of', [raise(`${what} takes a list`)], 'list<any>'), 'list<any>'), elem: 'any' };
+    return { list: caseWhen([[isNull(v.e), NULL], [eq(kindExpr(v), lit(K_LIST)), call('any_list', [v.e], 'list<any>')]], raise('SMALTCY_TYPE', message("Can't iterate over a ", typeNameExpr(v)), 'list<any>'), 'list<any>'), elem: 'any' };
   }
 
   /** Compiles `f` with `slot` reading the element of the innermost `each`. */
@@ -1485,7 +1522,7 @@ export class Compiler {
       [
         [or(isNull(a.e), isNull(b.e)), NULL],
         [not(eq(kindA, kindB)), across],
-        [call('in_list', [kindA, lit(K_LIST), lit(K_MAP)], 'bool'), raise(`${what} of lists and maps`)],
+        [call('in_list', [kindA, lit(K_LIST), lit(K_MAP)], 'bool'), refuseWhenMet(`${what} of lists and maps`, 'bool')],
         ...kinds.map((k) => [eq(kindA, lit(k)), same(a, b, k)] as const),
       ],
       NULL,
@@ -1516,7 +1553,7 @@ export class Compiler {
         return this.arithmetic(fn, values() as { e: PlanExpr; t: PlanType }[]);
       case 'neg': {
         const [a] = values() as { e: PlanExpr; t: PlanType }[];
-        return value(call('neg', [this.number(a!, '-')], isNumberType(a!.t) ? a!.t : 'any'), isNumberType(a!.t) ? a!.t : 'any');
+        return value(call('neg', [this.number(a!, 'negate()')], isNumberType(a!.t) ? a!.t : 'any'), isNumberType(a!.t) ? a!.t : 'any');
       }
       case 'in': {
         // A list written in the query: x IN [a, b] is x = a OR x = b, with Cypher's NULLs.
@@ -1588,6 +1625,7 @@ export class Compiler {
         const k = staticKind(a!.t);
         if (k === K_STRING) return value(call('length', [a!.e], 'int'), 'int');
         if (k === K_LIST) return value(call('list_len', [a!.e], 'int'), 'int');
+        if (k === K_MAP) return value(call('map_len', [a!.e], 'int'), 'int');
         if (k === K_NULL) return value(NULL, 'null');
         if (k === undefined) {
           return value(
@@ -1596,8 +1634,9 @@ export class Compiler {
                 [isNull(a!.e), NULL],
                 [eq(kindExpr(a!), lit(K_STRING)), call('length', [a!.e], 'int')],
                 [eq(kindExpr(a!), lit(K_LIST)), call('list_len', [call('any_list', [a!.e], 'list<any>')], 'int')],
+                [eq(kindExpr(a!), lit(K_MAP)), call('map_len', [call('any_map', [a!.e], 'map<text, any>')], 'int')],
               ],
-              raise('size() takes a string or a list'),
+              raise('SMALTCY_TYPE', message("size() can't take a ", typeNameExpr(a!)), 'int'),
               'int',
             ),
             'int',
@@ -1668,7 +1707,7 @@ export class Compiler {
     const k = staticKind(v.t);
     if (k === K_NUMBER || k === K_NULL) return v.e;
     if (k !== undefined) return unsupported(`${what} of a ${v.t}`);
-    return caseWhen([[isNull(v.e), NULL], [eq(kindExpr(v), lit(K_NUMBER)), v.e]], raise(`${what} takes numbers`), 'any');
+    return caseWhen([[isNull(v.e), NULL], [eq(kindExpr(v), lit(K_NUMBER)), v.e]], raise('SMALTCY_TYPE', message(`${what} can't take a `, typeNameExpr(v))), 'any');
   }
 
   /** A value that must be a string. */
@@ -1676,7 +1715,7 @@ export class Compiler {
     const k = staticKind(v.t);
     if (k === K_STRING || k === K_NULL) return v.e;
     if (k !== undefined) return unsupported(`${what} of a ${v.t}`);
-    return caseWhen([[isNull(v.e), NULL], [eq(kindExpr(v), lit(K_STRING)), v.e]], raise(`${what} takes strings`), 'any');
+    return caseWhen([[isNull(v.e), NULL], [eq(kindExpr(v), lit(K_STRING)), v.e]], raise('SMALTCY_TYPE', message(`${what} can't take a `, typeNameExpr(v))), 'any');
   }
 
   /**
@@ -1696,7 +1735,7 @@ export class Compiler {
         known ? (a!.t === 'int' && b!.t === 'int' ? TRUE : a!.t === 'real' || b!.t === 'real' ? FALSE : intTest(p, q)) : intTest(p, q);
       const intTest = (p: PlanExpr, q: PlanExpr) => and(eq(call('any_type', [p], 'text'), lit('int')), eq(call('any_type', [q], 'text'), lit('int')));
       const zeroCheck = (op: string): PlanExpr =>
-        caseWhen([[and(bothInt(x, y), eq(y, lit(0))), raise('division by zero')], [bothInt(x, y), call(op, [x, y], 'int')]], fn === 'mod' ? raise('% of floats') : call('div_float', [x, y], 'real'), t === 'int' ? 'int' : t);
+        caseWhen([[and(bothInt(x, y), eq(y, lit(0))), raise('SMALTCY_TYPE', 'Division by zero', 'int')], [bothInt(x, y), call(op, [x, y], 'int')]], fn === 'mod' ? refuseWhenMet('% of floats') : call('div_float', [x, y], 'real'), t === 'int' ? 'int' : t);
       switch (fn) {
         case 'add': return call('add_checked', [x, y], t);
         case 'sub': return call('sub_checked', [x, y], t);
@@ -1716,6 +1755,15 @@ export class Compiler {
       [and(eq(kindA, lit(K_NUMBER)), eq(kindB, lit(K_NUMBER))), numeric(a!.e, b!.e)],
     ];
     if (fn === 'add') whens.push([and(eq(kindA, lit(K_STRING)), eq(kindB, lit(K_STRING))), call('text_concat', [a!.e, b!.e], 'text')]);
-    return { k: 'value', e: caseWhen(whens, raise(`${fn} of these values`), 'any'), t: 'any' };
+    if (fn === 'add') {
+      // What smaltcy's + gives that the compiler doesn't yet: a list and a value, a string and a number or a boolean.
+      const numOrBool = (k: PlanExpr) => call('in_list', [k, lit(K_NUMBER), lit(K_BOOL)], 'bool');
+      const list = lit(K_LIST);
+      const string = lit(K_STRING);
+      whens.push([or(eq(kindA, list), eq(kindB, list), and(eq(kindA, string), numOrBool(kindB)), and(numOrBool(kindA), eq(kindB, string))), refuseWhenMet('+ of a list, or of a string and a number or a boolean')]);
+    }
+    // smaltcy's type error for the rest, as its engine words it.
+    const verb = ({ add: 'add', sub: 'subtract', mul: 'multiply', div: 'divide', div_float: 'divide', mod: 'take the modulo of' } as Record<string, string>)[fn]!;
+    return { k: 'value', e: caseWhen(whens, raise('SMALTCY_TYPE', message(`Can't ${verb} `, typeNameExpr(a!), ' and ', typeNameExpr(b!))), 'any'), t: 'any' };
   }
 }

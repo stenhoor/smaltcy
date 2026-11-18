@@ -66,19 +66,10 @@ const unsupported = (msg: string): never => {
 /** The tables of a graph with these labels and types, named as `schemaStatements` makes them. */
 export function graphTables(labels: readonly string[], types: readonly string[], graph = 'graph', relationshipIds = false): GraphTables {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(graph)) unsupported(`A graph's name is a plain identifier, not ${JSON.stringify(graph)}`);
-  // smaltdb finds a graph's labels and types ignoring case (`addLabel`); Cypher's are case-sensitive.
-  const once = (names: readonly string[], what: string) => {
-    const seen = new Map<string, string>();
-    for (const n of names) {
-      const other = seen.get(n.toLowerCase());
-      if (other !== undefined && other !== n) unsupported(`The ${what}s ${other} and ${n} differ only in case, which a smaltdb property graph can't hold`);
-      seen.set(n.toLowerCase(), n);
-    }
-    return [...new Set(names)];
-  };
-  const ls = once(labels, 'label');
-  const ts = once(types, 'relationship type');
-  if (ls.some((l) => l.toLowerCase() === NODE_LABEL)) unsupported(`The label ${NODE_LABEL} is reserved`);
+  // smaltdb's property graphs keep labels and types apart by case, as Cypher does (`Person` and `person` are two).
+  const ls = [...new Set(labels)];
+  const ts = [...new Set(types)];
+  if (ls.includes(NODE_LABEL)) unsupported(`The label ${NODE_LABEL} is reserved`);
   return {
     graph,
     nodes: `${graph}_node`,

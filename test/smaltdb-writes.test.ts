@@ -83,6 +83,9 @@ class Pair {
     if (theirsError instanceof Unsupported) throw theirsError;
     if (mineError !== undefined) {
       expect(theirsError, `${cypher}: fails on smaltcy (${String(mineError)}), not on smaltdb`).toBeDefined();
+      // The same error: smaltcy's code and message, whether the runner or the plan (smaltdb's raise_error) raised it.
+      const { code, message } = mineError as { code: string; message: string };
+      expect({ code: (theirsError as { code: string }).code, message: (theirsError as Error).message }, cypher).toEqual({ code, message });
       expect(stateIn(this.db, this.tables), `${cypher}: rolled back`).toEqual(before);
     } else {
       if (theirsError !== undefined) throw theirsError;
@@ -192,6 +195,32 @@ const SEQUENCES: readonly [string, 'empty' | 'social', readonly string[]][] = [
     "MATCH (n:Note) DETACH DELETE n",
     'MATCH (n:Note) RETURN count(*) AS c',
   ]],
+  ['labels and types that differ only in case from the graph’s: two of each', 'social', [
+    "CREATE (:person {name: 'lower'}), (:PERSON {name: 'upper'})",
+    "MATCH (p:Person {name: 'Ada'}), (q:person) CREATE (p)-[:knows {w: 1}]->(q), (q)-[:Knows {w: 2}]->(p), (p)-[:KNOWS {w: 3}]->(p)",
+    'MATCH (n:Person) RETURN n.name AS n ORDER BY n',
+    'MATCH (n:person) RETURN n.name AS n, labels(n) AS l',
+    'MATCH (n:PERSON) RETURN n.name AS n, labels(n) AS l',
+    'MATCH (a)-[r:knows]->(b) RETURN a.name AS a, type(r) AS t, b.name AS b',
+    'MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS a, r.w AS w, b.name AS b ORDER BY a, b',
+    'MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS c ORDER BY t',
+    "MATCH (n:Person {name: 'Grace'}) SET n:person, n:PERSON RETURN labels(n) AS l",
+    "MATCH (n:person {name: 'Grace'}) REMOVE n:Person RETURN labels(n) AS l",
+    'MATCH (n:person) RETURN n.name AS n ORDER BY n',
+    "MERGE (a:person {name: 'lower'})-[r:KNOWS]->(b:Person {name: 'Ada'}) RETURN type(r) AS t",
+    "MERGE (a:Person {name: 'lower'}) RETURN labels(a) AS l",
+    'MATCH ()-[r:knows]->() DELETE r',
+    'MATCH (n:PERSON) DETACH DELETE n',
+    'MATCH (n) RETURN n.name AS n, labels(n) AS l ORDER BY n',
+  ]],
+  ['a new graph with labels and types spelled two ways', 'empty', [
+    'CREATE (a:A {k: 1})-[:R]->(b:a {k: 2})-[:r]->(c:A:a {k: 3})',
+    'MATCH (x:A)-[:R]->(y:a) RETURN x.k AS x, y.k AS y',
+    'MATCH (x:a)-[:r]->(y:A) RETURN x.k AS x, y.k AS y',
+    'MATCH (x:a)-[:R]->(y) RETURN x.k AS x',
+    'MATCH (n:A:a) SET n:`Smaltcy:Node` RETURN labels(n) AS l',
+    'MATCH (n:`Smaltcy:Node`) RETURN n.k AS k',
+  ]],
 ];
 
 const PARAMS = { props: { name: 'P', n: 1, ok: true, tags: ['a', 'b'] }, flags: [true, false, true], when: 1.5, more: { n: 2, ok: null, x: false } };
@@ -231,8 +260,6 @@ const AFTER_DELETE = 'labels(), properties(), type(), startNode(), endNode(), no
 /** Writes smaltdb can't hold as smaltcy does, refused before anything is written: the list can only shrink. */
 const UNSUPPORTED: readonly [string, string, string][] = [
   ['the reserved label', 'CREATE (:`smaltcy:node`)', `the label smaltcy:node, which is reserved`],
-  ['a label that differs from the graph’s only in case', 'CREATE (:person)', 'the label person beside Person (a smaltdb property graph finds them ignoring case)'],
-  ['a type that differs from the graph’s only in case', "MATCH (p:Person {name: 'Ada'}) CREATE (p)-[:knows]->(p)", 'the relationship type knows beside KNOWS (a smaltdb property graph finds them ignoring case)'],
   ['MERGE with a parameter map', 'MERGE (n:Person $props)', 'a pattern property map given as a parameter'],
   ['type() after DELETE', "MATCH (:Person {name: 'Grace'})-[r:LIVES_IN]->() DELETE r RETURN type(r) AS t", 'AFTER_DELETE'],
   ['labels() after DELETE', "MATCH (n:Person {name: 'Edsger'}) DETACH DELETE n WITH n RETURN labels(n) AS l", 'AFTER_DELETE'],
