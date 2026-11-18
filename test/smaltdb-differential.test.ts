@@ -19,9 +19,6 @@ import { READ_CASES, READ_PARAMS } from './helpers/read-cases.js';
  * and so does a case off it that gives other rows.
  */
 const UNSUPPORTED = new Map<string, string>([
-  ['pattern predicate', 'EXISTS and pattern predicates'],
-  ['exists subquery', 'EXISTS and pattern predicates'],
-  ['pattern comprehension', 'pattern comprehensions'],
   ['labels and keys', 'keys() (a smaltdb map keeps its keys sorted)'],
 ]);
 
@@ -68,7 +65,7 @@ describe('the read cases on smaltdb', () => {
   });
 
   test('how many run', () => {
-    expect(READ_CASES.length - UNSUPPORTED.size).toBe(55);
+    expect(READ_CASES.length - UNSUPPORTED.size).toBe(58);
     for (const name of UNSUPPORTED.keys()) expect(READ_CASES.some(([n]) => n === name), name).toBe(true);
   });
 });
@@ -209,6 +206,60 @@ describe('relationships: both engines give the same rows', () => {
   });
 });
 
+/** EXISTS, pattern predicates and pattern comprehensions: nested plans, correlated with the row they are run from. */
+describe('nested plans: both engines give the same rows', () => {
+  const g = open();
+  g.run(RELS);
+  const { db, tables } = both(g);
+  test.each([
+    ['EXISTS on a node', 'MATCH (x) WHERE EXISTS { MATCH (x)-[:S]->() } RETURN x.k AS x ORDER BY x'],
+    ['a negated pattern predicate', 'MATCH (x) WHERE NOT (x)-->() RETURN x.k AS x ORDER BY x'],
+    ['a pattern predicate between bound nodes', 'MATCH (x), (y) WHERE x.k < y.k AND (x)-[:R]-(y) RETURN x.k AS x, y.k AS y ORDER BY x, y'],
+    ['a pattern predicate with labels and properties', "MATCH (x) WHERE (x)-[{w: 2}]->(:N:M {k: 'c'}) RETURN x.k AS x"],
+    ['EXISTS with a WHERE that reads an outer relationship', 'MATCH (x)-[r]->(y) WHERE EXISTS { MATCH (y)-[s]->(z) WHERE s.w > r.w } RETURN r.w AS w ORDER BY w'],
+    ['NOT EXISTS, correlated on both ends of a relationship', 'MATCH (x)-[r:R]->(y) WHERE NOT EXISTS { MATCH (y)-[:R]->(x) } RETURN r.w AS w ORDER BY w'],
+    ['EXISTS and a pattern predicate as values', 'MATCH (x) RETURN x.k AS x, EXISTS { MATCH (x)<-[:S]-() } AS e, (x)-[:R]->(x) AS loop ORDER BY x'],
+    ['EXISTS with a variable-length relationship', 'MATCH (x) WHERE EXISTS { MATCH (x)-[:R*2]->(x) } RETURN x.k AS x ORDER BY x'],
+    ['EXISTS inside EXISTS', 'MATCH (x) WHERE EXISTS { MATCH (x)-->(y) WHERE EXISTS { MATCH (y)-[:S]->(y) } } RETURN x.k AS x ORDER BY x'],
+    ['EXISTS in an OPTIONAL MATCH', 'MATCH (x:N) OPTIONAL MATCH (x)-[r]->(y) WHERE (y)-[:S]->() RETURN x.k AS x, r.w AS w ORDER BY x, w'],
+    ['EXISTS of a NULL node', "OPTIONAL MATCH (x {k: 'none'}) RETURN EXISTS { MATCH (x)-->() } AS e, [(x)-->(y) | y.k] AS ys"],
+    ['EXISTS after WITH', 'MATCH (x) WITH x.k AS k, x WHERE (x)-[:S]-() RETURN k ORDER BY k'],
+    ['a pattern comprehension in WHERE', 'MATCH (x) WHERE size([(x)-->(y) | y]) > 1 RETURN x.k AS x ORDER BY x'],
+    ['a pattern comprehension in ORDER BY', 'MATCH (x) RETURN x.k AS k ORDER BY size([(x)-->() | 1]) DESC, k'],
+    ['a pattern comprehension in an aggregate', 'MATCH (x) RETURN sum(size([(x)-->() | 1])) AS n, collect(EXISTS { MATCH (x)-[:S]->() }) AS es'],
+  ])('%s', (_name, cypher) => {
+    expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
+  });
+
+  // A pattern comprehension's list is in the order its pattern matches, which Cypher leaves open as it does a MATCH's:
+  // smaltdb's goes by type, then by relationship; smaltcy's store by relationship id. The same elements, in any order.
+  // (Elements compared by their JSON with keys sorted: a smaltdb map keeps its keys sorted.)
+  const canon = (x: unknown): string =>
+    JSON.stringify(x, (_k, v: unknown) => (v !== null && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.entries(v).sort(([p], [q]) => (p < q ? -1 : 1))) : v));
+  const sortedLists = (rows: Record<string, unknown>[]) =>
+    rows.map((r) => Object.fromEntries(Object.entries(r).map(([k, v]) => [k, Array.isArray(v) ? v.map(canon).sort() : v])));
+  test.each([
+    ['a pattern comprehension', 'MATCH (x) RETURN x.k AS x, [(x)-[r]->(y) | r.w] AS ws ORDER BY x'],
+    ['a pattern comprehension with WHERE', 'MATCH (x) RETURN x.k AS x, [(x)-[r]->(y) WHERE r.w > 2 | y.k] AS ys ORDER BY x'],
+    ['a pattern comprehension reading an outer relationship', 'MATCH (x)-[r]->(y) RETURN r.w AS w, [(y)-[q]->(z) WHERE q.w > r.w | q.w] AS later ORDER BY w'],
+    ['a pattern comprehension giving nodes', 'MATCH (x:N) RETURN x.k AS x, [(x)<-[:R]-(y) | y] AS ys ORDER BY x'],
+    ['a pattern comprehension giving lists and NULLs', "MATCH (x {k: 'c'}) RETURN [(x)-->(y) | labels(y)] AS ls, [(x)-->(y) | y.nope] AS ns"],
+    ['a pattern comprehension of a chain', "MATCH (x {k: 'a'}) RETURN [(x)-[:R]->(y)-[:R]->(z) | z.k] AS zs"],
+    ['a pattern comprehension in either direction', 'MATCH (x) RETURN x.k AS x, [(x)-[r]-(y) | r.w] AS ws ORDER BY x'],
+    ['a pattern comprehension of a variable-length relationship', 'MATCH (x) RETURN x.k AS x, [(x)-[:R*1..2]->(y) | y.k] AS ys ORDER BY x'],
+  ])('%s (its lists in any order)', (_name, cypher) => {
+    const rows = g.query(cypher) as Record<string, unknown>[];
+    expect(rows.some((r) => Object.values(r).some((v) => Array.isArray(v) && v.length > 1))).toBe(true);
+    expect(sortedLists(onSmaltdb(db, tables, cypher))).toEqual(sortedLists(rows));
+  });
+
+  test('refused: nested plans inside list comprehensions, and pattern comprehensions giving relationships', () => {
+    // smaltdb's nested plans don't read an `each`'s elements.
+    expect(() => onSmaltdb(db, tables, "MATCH (x) RETURN [k IN ['a', 'b'] | size([(x)-->(y) WHERE y.k = k | 1])] AS n")).toThrow(Unsupported);
+    expect(() => onSmaltdb(db, tables, 'MATCH (x) RETURN [(x)-[r]->() | r] AS rs')).toThrow(Unsupported);
+  });
+});
+
 describe('the graph in smaltdb', () => {
   test('nodes, labels in order, and relationships by type', () => {
     const { db, tables } = both(social());
@@ -226,6 +277,14 @@ describe('the graph in smaltdb', () => {
     const h = open();
     h.run('CREATE (:`smaltcy:node`)');
     expect(() => graphTablesFor(dumpGraph(h.store))).toThrow(/reserved/);
+  });
+
+  test('a graph without relationships: no edge tables, no rows', () => {
+    const { g, db, tables } = both((() => { const h = open(); h.run('CREATE (:A {k: 1})'); return h; })());
+    expect(tables.types.size).toBe(0);
+    for (const cypher of ['MATCH p = (x)-[*0..1]->(y) RETURN p', 'MATCH (x)-->(y) RETURN count(*) AS n', 'MATCH (x) RETURN [(x)--(y) | y.k] AS ys, (x)--() AS e']) {
+      expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
+    }
   });
 
   test('parameters are typed by their values', () => {

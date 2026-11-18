@@ -60,6 +60,13 @@ one MATCH are refused.
 - **OPTIONAL MATCH** numbers its input's rows (a window's `row_number`), matches, and left-joins the input back by
   number, so a row with no match (or none passing the WHERE, which is part of the match) passes once with the new
   slots NULL.
+- **EXISTS and pattern predicates** (a pattern in `WHERE`) are smaltdb `exists` subqueries, and **pattern
+  comprehensions** scalar subqueries of an `implode` (NULLs kept, `[]` for none; nodes as a list of their ids, as
+  `collect()` gives them). The nested plan is compiled as a match of its own (its uniqueness, its WHERE), from one row:
+  the enclosing row's columns read one subquery out (`col` with `depth` 1), so it is correlated with that row's nodes,
+  relationships and values. smaltdb's nested plans don't read an `each`'s elements, so EXISTS and pattern
+  comprehensions inside a list comprehension or a quantifier are refused, as are pattern comprehensions giving
+  relationships or paths.
 - **In results**, nodes, relationships, paths and lists of them are maps of their data, as smaltcy's engine gives them
   (`kind`, `id`, `labels` or `type`, `start` and `end`, `properties`; a path's `nodes` and `relationships`).
   `collect()` of nodes is a list of their ids.
@@ -86,12 +93,13 @@ the message to an integer, an error whose text starts with `smaltcy:`.
 graph, and lists those the compiler refuses; the list can only shrink. Two more sets run queries on both engines and
 compare their rows: over properties of every kind, and over relationships on a graph with self-loops, parallel
 relationships of two types and a node with none (uniqueness, both directions, OPTIONAL MATCH with WHERE, type
-alternatives, variable length, paths).
+alternatives, variable length, paths). A third runs EXISTS, pattern predicates and pattern comprehensions on that
+graph: correlated on nodes and relationships, negated, nested, in OPTIONAL MATCH, with WHERE, in ORDER BY and
+aggregates.
 
 ## Consequences
 
-- Reads compile now (55 of the 59 read cases). EXISTS and pattern predicates, pattern comprehensions, `keys()` (below)
-  and writes are later slices.
+- Reads compile now (58 of the 59 read cases). `keys()` (below) and writes are later slices.
 - An OPTIONAL MATCH puts its input's plan in the smaltdb plan twice, so a query's plan doubles with each one; smaltdb
   runs that input twice. Every operation the compiler makes keeps an order, so both give the same rows in the same
   order.
@@ -110,8 +118,11 @@ alternatives, variable length, paths).
     smaltcy's keep the order they were set; the values are the same.
   - smaltcy's own engine doesn't count a variable-length relationship's hops as used, so a hop it expands after one in
     the same MATCH can bind one of them again; the compiler keeps Cypher's uniqueness (tested).
+  - A pattern comprehension's list is in the order its pattern matches, which Cypher leaves open, as it does a
+    MATCH's: smaltdb's goes by relationship type, then by relationship, smaltcy's store by relationship id. The
+    elements are the same; the tests compare them in any order where the two can differ.
   - smaltdb's planner decides the order conditions are evaluated in; where a condition raises (a non-boolean in
     `WHERE`), a query could raise on smaltdb where smaltcy stops early. The cases tried agree; nothing guarantees it.
-- smaltdb at the pinned commit fails on a sort key that is an expression over a project or filter (its planner's
-  `rebind`), so the compiler projects sort keys into columns first; and on `values` with no rows unless they are given
-  as `columns`, which the compiler does.
+- Two workarounds for smaltdb's planner (a sort key that is an expression over a project or filter, and `values` with
+  no rows) went once smaltdb fixed both (stenhoor/smaltdb#262): the compiler gives sort keys as expressions and an
+  empty edge source as `values` with `rows: []`.

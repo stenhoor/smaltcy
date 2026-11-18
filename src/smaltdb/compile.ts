@@ -341,6 +341,8 @@ class Compiler {
   readonly paramNames: string[] = [];
   /** The list elements in scope (`[x IN list …]`, `any(x IN list …)`), innermost last: what their slots read. */
   private readonly elements: { readonly slot: number; readonly type: PlanType; readonly kind: ElementKind }[] = [];
+  /** The rows nested plans are run from (EXISTS, pattern comprehensions), innermost last: what `argument` reads. */
+  private readonly outer: Frame[] = [];
 
   constructor(
     private readonly t: GraphTables,
@@ -351,9 +353,14 @@ class Compiler {
 
   op(op: Op): Rel {
     switch (op.op) {
-      case 'argument':
-        if (op.slots.length) unsupported('nested plans (EXISTS, pattern comprehensions)');
-        return { plan: { op: 'values', rows: [[]], types: [] }, frame: { types: [], slots: new Map() } };
+      case 'argument': {
+        if (!op.slots.length) return { plan: { op: 'values', rows: [[]], types: [] }, frame: { types: [], slots: new Map() } };
+        // A nested plan's leaf: one row, the enclosing row's columns read one subquery out, so its slots are where
+        // they were.
+        const outer = this.outer.at(-1) ?? unsupported('a nested plan outside an expression');
+        if (op.slots.some((s) => !outer.slots.has(s))) unsupported('a nested plan reading variables its row does not hold');
+        return { plan: { op: 'values', rows: [outer.types.map((t, i) => colRef(i, t, 1))], types: [...outer.types] }, frame: outer };
+      }
       case 'eager':
         return this.op(op.input);
       case 'match':
@@ -372,15 +379,8 @@ class Compiler {
         return { plan: { op: 'distinct', input: r.plan, collations: r.frame.types.map(() => 'binary'), on, keep: 'first', ordered: 'first' }, frame: r.frame };
       }
       case 'sort': {
-        // The keys are computed into columns first, and dropped after: smaltdb's planner (at the pinned commit) fails
-        // on a sort over a project or filter whose key is an expression rather than a column (in `rebind`).
         const r = this.op(op.input);
-        const keys = op.keys.flatMap((k) => this.sortKeys(k, r.frame));
-        const cols = r.frame.types.map((t, i) => colRef(i, t));
-        const width = cols.length;
-        const input: PlanOp = { op: 'project', input: r.plan, exprs: [...cols, ...keys.map((k) => k.expr)] };
-        const sorted: PlanOp = { op: 'sort', input, keys: keys.map((k, i) => ({ ...k, expr: colRef(width + i, 'any') })) };
-        return { plan: { op: 'project', input: sorted, exprs: cols }, frame: r.frame };
+        return { plan: { op: 'sort', input: r.plan, keys: op.keys.flatMap((k) => this.sortKeys(k, r.frame)) }, frame: r.frame };
       }
       case 'limit': {
         const r = this.op(op.input);
@@ -666,7 +666,7 @@ class Compiler {
       exprs: [lit(i), lit(type, 'text'), colRef(0, 'int'), colRef(1, 'int'), colRef(2, 'int'), colRef(3, PROPS)],
     }));
     const types: PlanType[] = ['int', 'text', 'int', 'int', 'int', PROPS];
-    const edges: PlanOp = parts.length ? parts.reduce((a, b) => ({ op: 'setop', kind: 'unionAll', inputs: [a, b], collations })) : { op: 'values', rows: [], types, columns: types.map(() => []) };
+    const edges: PlanOp = parts.length ? parts.reduce((a, b) => ({ op: 'setop', kind: 'unionAll', inputs: [a, b], collations })) : { op: 'values', rows: [], types };
     const f = (i: number) => call('struct_field', [colRef(0, HOP), lit(i)], 'int');
     const joined: PlanOp = { op: 'join', kind: 'inner', inputs: [this.hopRows(hops), edges], on: and(eq(f(0), rightRef(0, 'int')), eq(f(1), rightRef(2, 'int'))), ordered: true };
     return { op: 'project', input: joined, exprs: [colRef(0, HOP), colRef(2, 'text'), colRef(3, 'int'), colRef(4, 'int'), colRef(5, 'int'), colRef(6, PROPS)] };
@@ -698,8 +698,7 @@ class Compiler {
       return { op: 'project', input: dir === 'both' && reverse ? { op: 'filter', input: scan, pred: not(eq(start, end)) } : scan, exprs };
     };
     const parts = dir === 'both' ? [...names.map((t) => branch(t, false)), ...names.map((t) => branch(t, true))] : names.map((t) => branch(t, dir === 'in'));
-    // No rows, given as empty columns: smaltdb's planner (at the pinned commit) fails on `values` with no `rows` otherwise.
-    if (!parts.length) return { op: 'values', rows: [], types: EDGE_TYPES, columns: EDGE_TYPES.map(() => []) };
+    if (!parts.length) return { op: 'values', rows: [], types: EDGE_TYPES };
     const collations = EDGE_TYPES.map(() => 'binary' as const);
     return parts.reduce((a, b) => ({ op: 'setop', kind: 'unionAll', inputs: [a, b], collations }));
   }
@@ -1085,9 +1084,52 @@ class Compiler {
       }
       case 'quantifier':
         return value(this.quantifier(x, frame), 'bool');
-      case 'exists': return unsupported('EXISTS and pattern predicates');
-      case 'collectSub': return unsupported('pattern comprehensions');
+      case 'exists':
+        // EXISTS { … } and a pattern as a predicate: whether the nested plan has a row (true or false, never NULL).
+        return value(this.nested(x.plan, frame, (r) => ({ k: 'subquery', mode: 'exists', type: 'bool', collation: 'binary', plan: r.plan })), 'bool');
+      case 'collectSub':
+        return this.patternComprehension(x, frame);
     }
+  }
+
+  /**
+   * A nested plan (EXISTS, a pattern comprehension) as a correlated subquery of the row `frame` describes: its
+   * `argument` leaf is that row's columns, read one subquery out (`outer`).
+   */
+  private nested<T>(op: Op, frame: Frame, f: (r: Rel) => T): T {
+    // smaltdb's nested plans don't read an `each`'s elements.
+    if (this.elements.length) unsupported('EXISTS and pattern comprehensions inside list comprehensions and quantifiers');
+    this.outer.push(frame);
+    try {
+      return f(this.op(op));
+    } finally {
+      this.outer.pop();
+    }
+  }
+
+  /**
+   * `[(a)-->(b) WHERE … | map]`: `map` of each row of the nested plan, in its order, NULLs kept (an `implode` over a
+   * correlated subquery); `[]` when it has none. Nodes are a list of their ids, as `collect()` gives them.
+   */
+  private patternComprehension(x: Extract<Expr, { k: 'collectSub' }>, frame: Frame): Val {
+    return this.nested(x.plan, frame, (r): Val => {
+      const m = this.expr(x.map, r.frame);
+      let item: PlanExpr;
+      let t: PlanType;
+      if (m.k === 'node') {
+        item = m.id;
+        t = IDS;
+      } else if (m.k !== 'value') {
+        return unsupported(`a pattern comprehension giving ${entity(m)}`);
+      } else {
+        if (staticKind(m.t) === K_OTHER) unsupported(`a pattern comprehension giving a ${m.t}`);
+        item = m.e;
+        t = `list<${m.t === 'null' ? 'any' : m.t}>`;
+      }
+      const agg: PlanOp = { op: 'aggregate', input: r.plan, keys: [], aggs: [{ fn: 'implode', args: [item], star: false, distinct: false, collation: 'binary', type: t }], carry: [] };
+      const list = call('coalesce', [{ k: 'subquery', mode: 'scalar', plan: agg, type: t, collation: 'binary' }, call('list_of', [], t)], t);
+      return m.k === 'node' ? { k: 'nodes', ids: list } : { k: 'value', e: list, t };
+    });
   }
 
   /** A list to iterate over, and its elements' type: a list, or NULL. */
