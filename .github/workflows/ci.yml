@@ -29,6 +29,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # smaltdb, pinned in packed.json, for the compiler to its plans and its differential test.
+      - run: node scripts/fetch-packed.mjs
       - run: npm run typecheck
       - run: npm test
       - run: npm run build

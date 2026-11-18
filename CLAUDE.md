@@ -39,7 +39,7 @@ Two more of the family's rules:
 
 | Command | What it does |
 | --- | --- |
-| `npm ci` | Installs dependencies |
+| `npm ci && npm run deps` | Installs dependencies, then the pinned smaltdb build in `packed.json` (see below). First, and again after every `npm ci` or `npm install` |
 | `npm run check` | Typecheck, then the tests (vitest). Before every commit |
 | `npm run test:browser` | The playground, tech demo and runnable docs in headless Chromium with WebGPU (SwiftShader), a few minutes. What CI runs |
 | `npm run test:quick` | `check`, then the browser tests with `--quick` (smaller graphs, fewer steps), about a minute. While working on the playground or the demo |
@@ -48,6 +48,21 @@ Two more of the family's rules:
 | `npm run build` | `dist/` and type declarations |
 
 Playwright is installed globally in the cloud containers; don't run `playwright install`.
+
+## smaltdb, before its first publish
+
+The compiler to smaltdb plans (`src/smaltdb`, [ADR 0004](docs/adr/0004-cypher-on-smaltdb.md); smaltdb's ADR 0033, step 8)
+is tested against smaltdb, whose 0.9.0 is not on npm yet. `packed.json` pins it to a commit; `scripts/fetch-packed.mjs`
+(identical in every repository that uses it, smaltql's included: don't edit it here) builds that commit, packs it and
+installs the tarball with `npm install --no-save`, so it never reaches `package.json` or the lockfile. To try an unmerged
+smaltdb change, run `node scripts/fetch-packed.mjs --local smaltdb=../smaltdb`. When 0.9.0 is published, the script
+and `packed.json` are deleted and the pin becomes a dependency.
+
+`src/smaltdb` imports smaltdb's types only (`import type … from 'smaltdb/engine'`) and builds its plans as data, so
+smaltdb is not a runtime dependency; it isn't an entry point yet, and the build leaves it out. Tests run smaltdb from
+the source in its packed build (`smaltdb-src/…`, aliased in `vitest.config.ts`). `test/smaltdb-differential.test.ts`
+runs the Cypher read cases on both engines: a case the compiler can't compile yet is listed there, and refused with
+`Unsupported`, never answered differently.
 
 ## Layers and rules
 

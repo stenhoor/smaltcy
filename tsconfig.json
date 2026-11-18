@@ -23,7 +23,9 @@
       "@smaltworks/smaltcy/history": ["./src/history/index.ts"],
       "@smaltworks/smaltcy/timeline": ["./src/timeline/index.ts"],
       "@smaltworks/smaltcy/client": ["./src/client/index.ts"],
-      "@smaltworks/smaltcy/worker-runtime": ["./src/worker/runtime.ts"]
+      "@smaltworks/smaltcy/worker-runtime": ["./src/worker/runtime.ts"],
+      "smaltdb/engine": ["./node_modules/smaltdb/src/engine/index.ts"],
+      "smaltdb-src/*": ["./node_modules/smaltdb/src/*"]
     }
   },
   "include": ["src", "test", "bench", "scripts/*.ts", "docs/.vitepress/env.d.ts"]
