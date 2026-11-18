@@ -7,8 +7,8 @@ import { describe, expect, test } from 'vitest';
  * smaltcy is built from pieces meant to be used on their own (docs/guide/modules.md). This file keeps them apart:
  * - LAYERS says which directories of src/ each directory may import from (type-only imports have their own list);
  * - ENTRIES bundles each package entry point on its own and checks what it really pulls in.
- * The one package src/ imports is the family's shared kit: render and timeline re-export its graph view and timeline
- * (PACKAGES).
+ * The one package src/ imports at run time is the family's shared kit: render and timeline re-export its graph view and
+ * timeline (PACKAGES). The smaltdb compiler imports smaltdb's types, which build nothing into a bundle.
  */
 
 const LAYERS: Record<string, { runtime: string[]; types?: string[] }> = {
@@ -26,6 +26,9 @@ const LAYERS: Record<string, { runtime: string[]; types?: string[] }> = {
   worker: { runtime: ['index', 'datasets', 'store', 'engine', 'errors', 'values'], types: ['plan'] },
   client: { runtime: ['worker', 'errors', 'values'], types: ['store'] },
   index: { runtime: ['cypher', 'engine', 'store', 'history', 'plan', 'worker', 'errors', 'values'] },
+  // The compiler to smaltdb plans (docs/adr/0004-cypher-on-smaltdb.md): internal, no entry point yet. It reads graph
+  // plans and builds smaltdb's as data, importing smaltdb's types only (PACKAGES).
+  smaltdb: { runtime: ['errors'], types: ['plan', 'values'] },
 };
 
 function files(dir: string): string[] {
@@ -36,7 +39,7 @@ function files(dir: string): string[] {
 }
 
 /** Packages each layer may import (by name, not path), and none other may. */
-const PACKAGES: Record<string, string[]> = { render: ['smaltkit/graph'], timeline: ['smaltkit/timeline'] };
+const PACKAGES: Record<string, string[]> = { render: ['smaltkit/graph'], timeline: ['smaltkit/timeline'], smaltdb: ['smaltdb/engine'] };
 
 /**
  * The top directory of src/ a file is in ('index', 'values' and 'errors' for the files at the top); for the shared

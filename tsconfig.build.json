@@ -8,5 +8,7 @@
     "rootDir": "src",
     "paths": {}
   },
-  "include": ["src"]
+  "include": ["src"],
+  // The compiler to smaltdb plans is not an entry point yet, and its types come from smaltdb (packed.json).
+  "exclude": ["src/smaltdb"]
 }

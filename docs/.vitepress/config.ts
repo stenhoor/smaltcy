@@ -201,6 +201,7 @@ export default defineConfig({
               { text: '0001 smaltcy', link: '/adr/0001-smaltcy' },
               { text: '0002 Graph history', link: '/adr/0002-graph-history' },
               { text: '0003 Drawing in smaltkit', link: '/adr/0003-drawing-in-smaltkit' },
+              { text: '0004 Cypher on smaltdb', link: '/adr/0004-cypher-on-smaltdb' },
               { text: 'Benchmarks', link: '/research/benchmarks' },
             ],
           },
