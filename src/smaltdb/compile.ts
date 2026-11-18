@@ -130,7 +130,7 @@ interface NodesBinding {
   readonly k: 'nodes';
   readonly ids: number;
 }
-type Binding = ValueBinding | NodeBinding | RelBinding | RelsBinding | PathBinding | NodesBinding;
+export type Binding = ValueBinding | NodeBinding | RelBinding | RelsBinding | PathBinding | NodesBinding;
 
 /** A binding with its columns moved by `f`. */
 function moveBinding(b: Binding, f: (col: number) => number): Binding {
@@ -145,12 +145,12 @@ function moveBinding(b: Binding, f: (col: number) => number): Binding {
 }
 
 /** The columns of a plan's rows, and the slots they hold. */
-interface Frame {
+export interface Frame {
   readonly types: readonly PlanType[];
   readonly slots: ReadonlyMap<number, Binding>;
 }
 
-interface Rel {
+export interface Rel {
   readonly plan: PlanOp;
   readonly frame: Frame;
 }
@@ -161,7 +161,7 @@ type RelVal = { readonly k: 'rel'; readonly type: PlanExpr; readonly rowid: Plan
 type RelsVal = { readonly k: 'rels'; readonly hops: PlanExpr };
 type PathVal = { readonly k: 'path'; readonly start: PlanExpr; readonly hops: PlanExpr };
 type NodesVal = { readonly k: 'nodes'; readonly ids: PlanExpr };
-type Val = { readonly k: 'value'; readonly e: PlanExpr; readonly t: PlanType } | NodeVal | RelVal | RelsVal | PathVal | NodesVal;
+export type Val = { readonly k: 'value'; readonly e: PlanExpr; readonly t: PlanType } | NodeVal | RelVal | RelsVal | PathVal | NodesVal;
 
 /** A map of these entries, as a result gives a node, relationship or path. */
 const resultMapOf = (entries: readonly (readonly [string, PlanExpr])[]): PlanExpr => call('map_of', entries.flatMap(([k, e]) => [lit(k), e]), PROPS);
@@ -185,18 +185,18 @@ const entity = (v: Exclude<Val, { k: 'value' }>) =>
  * A path's hops, as smaltdb's `paths` gives them (`PATH_TYPE`): per hop, its type's position in the graph's types
  * (`GraphTables.types`' order), its rowid, and the nodes it went from and to, in the pattern's direction.
  */
-const HOP: PlanType = 'struct<edge int, rowid int, from int, to int>';
-const HOPS: PlanType = `list<${HOP}>`;
+export const HOP: PlanType = 'struct<edge int, rowid int, from int, to int>';
+export const HOPS: PlanType = `list<${HOP}>`;
 /** A relationship as a list element: `RelBinding`'s columns. */
 const REL: PlanType = `struct<type text, rowid int, start int, end int, props map<text, any>>`;
 /** A node as a list element. */
 const NODE: PlanType = 'struct<id int, props map<text, any>>';
-const IDS: PlanType = 'list<int>';
+export const IDS: PlanType = 'list<int>';
 
 /** What a list comprehension's element is: a value, or a node or relationship read from a `NODE` or `REL` struct. */
 type ElementKind = 'value' | 'node' | 'rel';
 
-const PROPS: PlanType = 'map<text, any>';
+export const PROPS: PlanType = 'map<text, any>';
 
 /** Every slot an expression mentions (a list comprehension's own too: more than it reads, never less). */
 function slotsIn(x: unknown, out: number[] = []): number[] {
@@ -223,7 +223,7 @@ const E_TO = 6;
 
 // Expression builders: plain data, as smaltdb's `plan` builders make them.
 
-const colRef = (index: number, type: PlanType, depth = 0): PlanExpr => ({ k: 'col', input: 0, index, depth, type, collation: 'binary' });
+export const colRef = (index: number, type: PlanType, depth = 0): PlanExpr => ({ k: 'col', input: 0, index, depth, type, collation: 'binary' });
 /** A column of a join's right input. */
 const rightRef = (index: number, type: PlanType): PlanExpr => ({ k: 'col', input: 1, index, depth: 0, type, collation: 'binary' });
 /** A column of the enclosing row, one subquery in. */
@@ -241,7 +241,7 @@ function deepen(e: PlanExpr): PlanExpr {
   };
   return walk(e) as PlanExpr;
 }
-function lit(value: unknown, type?: PlanType): PlanExpr {
+export function lit(value: unknown, type?: PlanType): PlanExpr {
   if (typeof value === 'boolean') return { k: 'lit', value: value ? 1 : 0, type: 'bool' };
   const t = type ?? (value === null ? 'null' : typeof value === 'number' ? (Number.isSafeInteger(value) ? 'int' : 'real') : typeof value === 'string' ? 'text' : unsupported(`a literal ${JSON.stringify(value)}`));
   return { k: 'lit', value: value as never, type: t };
@@ -251,15 +251,15 @@ function literal(v: unknown): Val {
   const e = lit(v);
   return { k: 'value', e, t: (e as { type: PlanType }).type };
 }
-const call = (fn: string, args: readonly PlanExpr[], type: PlanType): PlanExpr => ({ k: 'call', fn, args, type });
-const and = (...args: PlanExpr[]): PlanExpr => (args.length === 1 ? args[0]! : { k: 'and', args });
-const or = (...args: PlanExpr[]): PlanExpr => (args.length === 1 ? args[0]! : { k: 'or', args });
+export const call = (fn: string, args: readonly PlanExpr[], type: PlanType): PlanExpr => ({ k: 'call', fn, args, type });
+export const and = (...args: PlanExpr[]): PlanExpr => (args.length === 1 ? args[0]! : { k: 'and', args });
+export const or = (...args: PlanExpr[]): PlanExpr => (args.length === 1 ? args[0]! : { k: 'or', args });
 const not = (arg: PlanExpr): PlanExpr => ({ k: 'not', arg });
-const isNull = (arg: PlanExpr): PlanExpr => ({ k: 'isNull', arg, not: false });
+export const isNull = (arg: PlanExpr): PlanExpr => ({ k: 'isNull', arg, not: false });
 const isNotNull = (arg: PlanExpr): PlanExpr => ({ k: 'isNull', arg, not: true });
-const caseWhen = (whens: readonly (readonly [PlanExpr, PlanExpr])[], otherwise: PlanExpr, type: PlanType): PlanExpr => ({ k: 'case', whens: whens.map(([when, then]) => ({ when, then })), else: otherwise, type });
-const eq = (a: PlanExpr, b: PlanExpr) => call('cmp_eq', [a, b], 'bool');
-const NULL = lit(null);
+export const caseWhen = (whens: readonly (readonly [PlanExpr, PlanExpr])[], otherwise: PlanExpr, type: PlanType): PlanExpr => ({ k: 'case', whens: whens.map(([when, then]) => ({ when, then })), else: otherwise, type });
+export const eq = (a: PlanExpr, b: PlanExpr) => call('cmp_eq', [a, b], 'bool');
+export const NULL = lit(null);
 const TRUE = lit(true);
 const FALSE = lit(false);
 const INFINITY: PlanExpr = { k: 'lit', value: Infinity, type: 'real' };
@@ -337,8 +337,11 @@ function commonType(types: readonly PlanType[]): PlanType | undefined {
   return undefined;
 }
 
-class Compiler {
+/** Compiles graph plans and expressions over a graph's tables (`compileQuery`; the write runner in write.ts). */
+export class Compiler {
   readonly paramNames: string[] = [];
+  /** Operations whose rows are given (write.ts: rows it holds, as a `values` plan), compiled as those. */
+  readonly given = new Map<Op, Rel>();
   /** The list elements in scope (`[x IN list …]`, `any(x IN list …)`), innermost last: what their slots read. */
   private readonly elements: { readonly slot: number; readonly type: PlanType; readonly kind: ElementKind }[] = [];
   /** The rows nested plans are run from (EXISTS, pattern comprehensions), innermost last: what `argument` reads. */
@@ -352,6 +355,8 @@ class Compiler {
   // Operations.
 
   op(op: Op): Rel {
+    const given = this.given.get(op);
+    if (given) return given;
     switch (op.op) {
       case 'argument': {
         if (!op.slots.length) return { plan: { op: 'values', rows: [[]], types: [] }, frame: { types: [], slots: new Map() } };
@@ -392,7 +397,8 @@ class Compiler {
       case 'union':
         return this.union(op);
       case 'create': case 'merge': case 'set': case 'remove': case 'delete':
-        return unsupported(`writes (${op.op.toUpperCase()})`);
+        // Writes run row by row (write.ts), not as one query.
+        return unsupported(`writes (${op.op.toUpperCase()}) in a query`);
     }
   }
 
@@ -1554,6 +1560,16 @@ class Compiler {
         if (fn === 'last') return value(call('list_get', [a!.e, lit(-1)], elem), elem);
         if (fn === 'tail') return value(call('list_slice', [a!.e, lit(1)], a!.t), a!.t);
         return value(call('list_reverse', [a!.e], a!.t), a!.t);
+      }
+      case 'range': {
+        // smaltdb's `range` table function, imploded; smaltcy's range() of a NULL is NULL, and of no integers [].
+        const vs = values() as { e: PlanExpr; t: PlanType }[];
+        if (vs.length < 2 || vs.length > 3) return unsupported(`range() with ${vs.length} arguments`);
+        if (vs.some((v) => v.t !== 'int' && v.t !== 'null')) return unsupported('range() of values that may not be integers');
+        const src: PlanOp = { op: 'source', kind: 'function', name: 'range', args: vs.map((v) => deepen(v.e)), types: ['int'] };
+        const agg: PlanOp = { op: 'aggregate', input: src, keys: [], aggs: [{ fn: 'implode', args: [colRef(0, 'int')], star: false, distinct: false, collation: 'binary', type: IDS }], carry: [] };
+        const list = call('coalesce', [{ k: 'subquery', mode: 'scalar', plan: agg, type: IDS, collation: 'binary' }, call('list_of', [], IDS)], IDS);
+        return value(caseWhen([[or(...vs.map((v) => isNull(v.e))), NULL]], list, IDS), IDS);
       }
       default:
         return unsupported(`the function ${fn}()`);
