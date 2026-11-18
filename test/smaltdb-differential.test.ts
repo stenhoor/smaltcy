@@ -66,9 +66,10 @@ describe("Cypher's meaning, where smaltdb's differs: both engines give the same 
   test.each([
     ['values of every kind come back as they went in', 'MATCH (n:T) RETURN n.k AS k, n.v AS v ORDER BY k'],
     ['comparisons across kinds: false for =, NULL for <', "MATCH (n:T) RETURN n.k AS k, n.v = 1 AS eq1, n.v = true AS eqt, n.v < 2 AS lt2, n.v >= 'a' AS gea ORDER BY k"],
-    ['ORDER BY: strings, booleans, numbers, then NULL', "MATCH (n:T) WHERE n.k <> 'list' RETURN n.k AS k ORDER BY n.v, k"],
-    ['ORDER BY DESC: NULL first', "MATCH (n:T) WHERE n.k <> 'list' RETURN n.k AS k ORDER BY n.v DESC, k"],
-    ['min and max across kinds', "MATCH (n:T) WHERE n.k <> 'list' RETURN min(n.v) AS lo, max(n.v) AS hi"],
+    ['ORDER BY: lists, strings, booleans, numbers, then NULL', 'MATCH (n:T) RETURN n.k AS k ORDER BY n.v, k'],
+    ['ORDER BY DESC: NULL first', 'MATCH (n:T) RETURN n.k AS k ORDER BY n.v DESC, k'],
+    ['min and max across kinds', 'MATCH (n:T) RETURN min(n.v) AS lo, max(n.v) AS hi'],
+    ['min and max of numbers and strings', "MATCH (n:T) WHERE n.k <> 'list' RETURN min(n.v) AS lo, max(n.v) AS hi"],
     ['aggregates of numbers', "MATCH (n:T) WHERE n.k IN ['int', 'float', 'zero', 'ten'] RETURN min(n.v) AS lo, max(n.v) AS hi, sum(n.v) AS s, avg(n.v) AS a"],
     ['collect leaves NULLs out', 'MATCH (n:T) RETURN collect(n.v) AS vs'],
     ['count DISTINCT keeps true apart from 1', 'MATCH (n:T) RETURN count(DISTINCT n.v) AS c'],
@@ -129,14 +130,106 @@ describe("Cypher's meaning, where smaltdb's differs: both engines give the same 
     expect(error(() => onSmaltdb(db, tables, cypher))).toEqual(mine);
   });
 
-  // Values whose Cypher meaning the compiler can't keep yet: refused when a row meets them, with Unsupported's code and
-  // message, where smaltcy gives a value.
+  test('size of a map, as smaltcy gives it', () => {
+    const cypher = 'RETURN size({a: 1, b: 2}) AS s';
+    expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
+  });
+});
+
+/**
+ * Lists and maps compared and ordered element by element, `+` of strings, numbers, booleans and lists, and `%` of
+ * floats: computed by the compiler with smaltcy's meaning (ADR 0004).
+ */
+const VALUES = `CREATE (:V {k: 'int', v: 1}), (:V {k: 'float', v: 1.5}), (:V {k: 'neg', v: -7.5}), (:V {k: 'zero', v: 0}),
+  (:V {k: 'big', v: 1e21}), (:V {k: 'huge', v: 123456789012345680000}), (:V {k: 'str', v: 'a'}), (:V {k: 'true', v: true}),
+  (:V {k: 'none'}), (:V {k: 'list', v: [1, 2]}), (:V {k: 'list2', v: [1, 3]}), (:V {k: 'list3', v: [1]}),
+  (:V {k: 'empty', v: []}), (:V {k: 'floats', v: [1.0, 2.5]}), (:V {k: 'strs', v: ['a', 'b']}), (:V {k: 'bools', v: [true, false]})`;
+
+describe('lists, maps, + and %: both engines give the same rows', () => {
+  const g = open();
+  g.run(VALUES);
+  const { db, tables } = both(g);
   test.each([
-    ['lists in ORDER BY (smaltdb orders them by their bytes)', 'MATCH (n:T) RETURN n.v ORDER BY n.v', 'ordering lists and maps'],
-    ['lists compared with <', "MATCH (n:T) WHERE n.k = 'list' RETURN n.v < n.v AS l", 'ordering of lists and maps'],
-    ['the modulo of a float', "MATCH (n:T) WHERE n.k = 'float' RETURN n.v % 1 AS m", '% of floats'],
-    ['+ of a list and a value', "MATCH (n:T) WHERE n.k = 'list' RETURN n.v + 1 AS p", '+ of a list, or of a string and a number or a boolean'],
-    ['+ of a string and a number', "MATCH (n:T) WHERE n.k = 'str' RETURN n.v + 1 AS p", '+ of a list, or of a string and a number or a boolean'],
+    // = and <> of lists and maps: element by element, with Cypher's NULLs.
+    ['= of lists', 'RETURN [1, null] = [1, null] AS a, [1, 2] = [1, 3] AS b, [1] = [1, 2] AS c, [1, 2] = [1.0, 2] AS d, [] = [] AS e, [[1, 2], [3]] = [[1, 2], [3]] AS f, [[1, null]] = [[1, 2]] AS g, [1, \'a\'] = [1, \'b\'] AS h, [null, 1] = [null, 2] AS i, [1] <> [2] AS j, [true] = [1] AS k, [0.0 / 0] = [0.0 / 0] AS l, [1] = 1 AS m, [1] = null AS n'],
+    ['= of maps', 'RETURN {a: 1, b: 2} = {b: 2, a: 1} AS a, {a: 1} = {a: 1, b: 2} AS b, {a: 1} = {b: 1} AS c, {a: null} = {a: null} AS d, {a: [1, 2]} = {a: [1, 2.0]} AS e, {a: 1} = [1] AS f, {a: 1, b: null} = {a: 2, b: null} AS g, {} = {} AS h, {a: {b: [1]}} <> {a: {b: [2]}} AS i'],
+    ['= of properties of every kind', 'MATCH (n:V), (m:V) WHERE n.k < m.k RETURN n.k AS a, m.k AS b, n.v = m.v AS e, n.v <> m.v AS ne ORDER BY a, b'],
+    ['= in IN, CASE and list comprehensions', "MATCH (n:V) RETURN n.k AS k, n.v IN [[1, 2], [1]] AS i, CASE n.v WHEN [] THEN 'empty' WHEN [1, 2] THEN 'pair' ELSE 'other' END AS c, [x IN [[1], [1, 2]] WHERE x = n.v] AS l ORDER BY k"],
+    // < of lists: the first difference decides, else the shorter first; NULL where elements don't compare; maps NULL.
+    ['< of lists', "RETURN [1, 2] < [1, 3] AS a, [1, 2] < [1] AS b, [1] < [1, 2] AS c, [] < [1] AS d, [null] < [] AS e, [] < [null] AS f, [1, null] < [2, null] AS g, [null, 1] < [null, 2] AS h, [1, 'a'] < [1, 2] AS i, [[1, 2]] < [[1, 3]] AS j, [true] < [false] AS k, ['a'] >= ['b'] AS l, [0.0 / 0] < [1] AS m, [1, 2] <= [1, 2] AS n, [1, {a: 1}] < [2, {a: 1}] AS o, [1] < 'a' AS p"],
+    ['< of maps is NULL', 'RETURN {a: 1} < {a: 2} AS a, {a: 1} >= {a: 1} AS b, [{a: 1}] < [{a: 2}] AS c'],
+    ['< of properties of every kind', 'MATCH (n:V), (m:V) WHERE n.k < m.k RETURN n.k AS a, m.k AS b, n.v < m.v AS l, n.v >= m.v AS ge ORDER BY a, b'],
+    ['< in a list comprehension, reading its elements', 'RETURN [x IN [[1, 2], [3]] | [y IN x WHERE [y] < x]] AS a, [x IN [[1, 2], [3]] | [y IN [[1], [3]] WHERE y <= [x[0]]]] AS b'],
+    // ORDER BY, min and max: Cypher's order of kinds, lists element by element.
+    ['ORDER BY lists, nested and mixed', "UNWIND [[1, 2], [1], [], [1, null], [null], [1, 'a'], ['a'], [true], [[1]], [[1, 2]], [[]], [0.0 / 0], [1.5], [2], [1, 2, 3], null, 1, 'a', [[[[1]]]], [[[[0]]]]] AS x RETURN x ORDER BY x"],
+    ['ORDER BY lists DESC', "UNWIND [[1, 2], [1], [], [1, null], [null], [1, 'a'], ['a'], [true], [[1]], [[1, 2]], [[]], [0.0 / 0], [1.5], [2], [1, 2, 3], null, 1, 'a'] AS x RETURN x ORDER BY x DESC"],
+    ['ORDER BY properties', 'MATCH (n:V) RETURN n.k AS k ORDER BY n.v, k'],
+    ['ORDER BY a list of a static type', "MATCH (n:V) WHERE n.k STARTS WITH 'list' RETURN n.k AS k ORDER BY [size(n.v), 0 - size(n.v)] DESC, [n.k] DESC"],
+    ['min and max of lists', "UNWIND [[1, 2], [1], [], [2, 0], [1, null]] AS x WITH x, [x, 'a'] AS y RETURN min(x) AS lo, max(x) AS hi, min(y) AS ly, max(y) AS hy"],
+    ['min and max of properties', 'MATCH (n:V) RETURN min(n.v) AS lo, max(n.v) AS hi'],
+    // + of lists: joined, a value appended or prepended (NULL too).
+    ['+ of lists and values', "RETURN [1, 2] + [3] AS a, [1] + 2 AS b, 0 + [1] AS c, [1] + null AS d, null + [1] AS e, [] + [] AS f, [1] + ['a'] AS g, [true] + [1] AS h, [[1]] + [[2]] AS i, [1] + [[2]] AS j, ['a'] + true AS k, 'a' + [1] AS l, [1] + {a: 1} AS m, [[1, [2, [3, [4, [5]]]]]] + [[6]] AS n"],
+    ['+ of properties and lists', "MATCH (n:V) RETURN n.k AS k, n.v + [9] AS a, [9] + n.v AS b, null + n.v AS d, n.v + null AS e ORDER BY k"],
+    ['+ of lists from properties', "MATCH (n:V) WHERE n.k IN ['list', 'empty', 'floats', 'strs', 'bools'] RETURN n.k AS k, n.v + n.v AS c ORDER BY k"],
+    ['UNWIND of + of lists', 'UNWIND [1, 2] + [3] AS x RETURN x'],
+    // + of a string and a number or a boolean: JavaScript's String().
+    ['+ of a string and a number or a boolean', "RETURN 'a' + 1 AS a, 'a' + 1.5 AS b, 'a' + 1.0 AS c, 'a' + true AS d, false + 'b' AS e, 'a' + 1e21 AS f, 'a' + 123456789012345680000 AS g, 'a' + (0.0 / 0) AS h, 'a' + (1.0 / 0) AS i, 'a' + (-1.0 / 0) AS j, 'a' + 1e-7 AS k, 'a' + 0.1 AS l, 'a' + (1.0 / 3) AS m, 'a' + -0.0 AS n, 'a' + 9007199254740993 AS o, 'a' + 1.7976931348623157e308 AS p, 'a' + -2.5e25 AS q, 2 + 'b' AS r, 'a' + null AS s, null + 'a' AS t, 'a' + 5e-324 AS u, 'a' + 1e16 AS v"],
+    ['+ of strings and properties', "MATCH (n:V) WHERE NOT n.k IN ['list', 'list2', 'list3', 'empty', 'floats', 'strs', 'bools'] RETURN n.k AS k, 'x' + n.v AS a, n.v + 'x' AS b ORDER BY k"],
+    // % of floats: JavaScript's, the sign of the dividend; NaN by zero, but for two whole numbers.
+    ['% of floats', 'RETURN 5.5 % 2 AS a, -5.5 % 2 AS b, 5.5 % -2 AS c, -5.5 % -2 AS d, 5.5 % 0 AS e, (0.0 / 0) % 2 AS f, 5 % (1.0 / 0) AS g, (1.0 / 0) % 2 AS h, 7 % 2.5 AS i, 1e300 % 7 AS j, -4.5 % 4.5 AS k, 7 % 3 AS l, -7 % 3 AS m, null % 2.5 AS n, 2.5 % null AS o, 2.5 % -0.0 AS p'],
+    ['% of properties', "MATCH (n:V) WHERE n.k IN ['int', 'float', 'zero', 'neg', 'big', 'huge'] RETURN n.k AS k, n.v % 3 AS a, 10 % (n.v + 0.5) AS b, n.v % 1.5 AS c, n.v % -0.5 AS d, n.v % 7.5 AS e ORDER BY k"],
+  ])('%s', (_name, cypher) => {
+    expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
+  });
+
+  // Errors, the same on both engines.
+  test.each([
+    ['% by zero of whole numbers', "MATCH (n:V) WHERE n.k = 'int' RETURN n.v % 0 AS m"],
+    ['% by zero of a float with a whole value', "MATCH (n:V) WHERE n.k = 'float' RETURN (n.v * 2) % 0 AS m"],
+    ['+ of a list and a map: still a type error elsewhere', "MATCH (n:V) WHERE n.k = 'true' RETURN n.v + {a: 1} AS p"],
+  ])('both engines raise the same error: %s', (_name, cypher) => {
+    const error = (run: () => unknown) => {
+      try {
+        run();
+      } catch (e) {
+        return { code: (e as { code: string }).code, message: (e as Error).message };
+      }
+      return undefined;
+    };
+    const mine = error(() => g.query(cypher));
+    expect(mine?.code).toBe('SMALTCY_TYPE');
+    expect(error(() => onSmaltdb(db, tables, cypher))).toEqual(mine);
+  });
+
+  test('% of floats by zero is NaN', () => {
+    const cypher = "MATCH (n:V) WHERE n.k IN ['float', 'neg'] RETURN n.v % 0 AS m";
+    expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
+  });
+
+  test("+ of a string and a number: String()'s digits, for numbers of every size", () => {
+    // Doubles from 1e-300 to 1e300, whole numbers beyond 2^53, and numbers with up to 17 significant digits.
+    let seed = 7;
+    const random = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+    const xs: number[] = [2 ** 53, 2 ** 53 + 2, 1e21, 1e21 - 65536, 2 ** 1023, Number.MAX_VALUE, 1.5e16, 5e-324];
+    for (let i = 0; i < 300; i++) {
+      let x = random() * 10 * 10 ** (Math.floor(random() * 600) - 300);
+      if (i % 3 === 0) x = Math.round(random() * 2 ** 53) * 2 ** Math.floor(random() * 200);
+      if (i % 5 === 0) x = Number((random() * 10).toPrecision(1 + Math.floor(random() * 17))) * 10 ** Math.floor(random() * 40);
+      xs.push(i % 2 ? -x : x);
+    }
+    const cypher = "RETURN '' + $x AS s";
+    for (const x of xs) expect(onSmaltdb(db, tables, cypher, { x }), String(x)).toEqual(g.query(cypher, { x }));
+  });
+
+  // What the compiler refuses when a row reaches it, where smaltcy gives a value: lists and maps nested deeper than it
+  // compares them, and maps in ORDER BY, which smaltcy orders by a text of their entries.
+  test.each([
+    ['= of lists nested five deep', 'RETURN [[[[[1]]]]] = [[[[[1]]]]] AS a', 'lists and maps nested more than 4 deep'],
+    ['< of lists nested five deep', 'RETURN [[[[[1]]]]] < [[[[[2]]]]] AS a', 'lists and maps nested more than 4 deep'],
+    ['ORDER BY lists nested five deep', 'UNWIND [[[[[1]]]], [[[[[2]]]]]] AS x RETURN x ORDER BY x', 'lists and maps nested more than 4 deep'],
+    ['ORDER BY maps', 'UNWIND [{a: 1}, {a: 2}] AS m RETURN m ORDER BY m', 'ordering maps'],
+    ['ORDER BY lists of maps', 'UNWIND [[{a: 1}], [{a: 2}]] AS m RETURN m ORDER BY m', 'ordering maps'],
+    ['max of maps', 'UNWIND [{a: 1}, {a: 2}] AS m RETURN max(m) AS m', 'ordering maps'],
   ])('refused when met: %s', (_name, cypher, feature) => {
     expect(() => g.query(cypher)).not.toThrow();
     let error: unknown;
@@ -148,8 +241,8 @@ describe("Cypher's meaning, where smaltdb's differs: both engines give the same 
     expect({ code: (error as { code: string }).code, message: (error as Error).message }).toEqual({ code: 'SMALTCY_UNSUPPORTED', message: new Unsupported(feature).message });
   });
 
-  test('size of a map, as smaltcy gives it', () => {
-    const cypher = 'RETURN size({a: 1, b: 2}) AS s';
+  test('lists nested four deep compare', () => {
+    const cypher = 'RETURN [[[[1]]]] = [[[[1]]]] AS a, [[[[1]]]] < [[[[1, 2]]]] AS b, [[[[1, null]]]] = [[[[1, null]]]] AS c';
     expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
   });
 });
@@ -203,21 +296,22 @@ describe('relationships: both engines give the same rows', () => {
     expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
   });
 
-  // Without ORDER BY (the compiler refuses ordering by a list): the same rows, in any order.
-  const sorted = (rows: unknown[]) => rows.map((r) => JSON.stringify(r)).sort();
+  // Ordered by lists too (Cypher's order of lists, element by element).
   test.each([
-    ['variable length: trails', "MATCH (x {k: 'a'})-[rs:R*]->(y) RETURN y.k AS y, [r IN rs | r.w] AS ws"],
-    ['variable length, either direction: a self-loop once', "MATCH (x {k: 'a'})-[rs*1..2]-(y) RETURN y.k AS y, [r IN rs | r.w] AS ws"],
-    ['variable length from the far end', "MATCH (x)-[rs:R*2]->(y {k: 'b'}) RETURN x.k AS x, [r IN rs | r.w] AS ws"],
-    ['variable length and a fixed hop: no relationship twice', "MATCH (x {k: 'a'})-[r:R]->(y)-[rs:R*1..2]->(z) RETURN r.w AS w, [q IN rs | q.w] AS ws"],
-    ['a named path', "MATCH p = (x {k: 'c'})-[:R]->(y)-[:R]->(z) RETURN length(p) AS len, [n IN nodes(p) | n.k] AS ks, [r IN relationships(p) | type(r)] AS ts"],
-    ['all shortest paths, either direction', "MATCH (x {k: 'a'}), (y {k: 'c'}), p = allShortestPaths((x)-[*]-(y)) RETURN length(p) AS len, [r IN relationships(p) | r.w] AS ws"],
-  ])('%s (in any order)', (_name, cypher) => {
+    ['variable length: trails', "MATCH (x {k: 'a'})-[rs:R*]->(y) RETURN y.k AS y, [r IN rs | r.w] AS ws ORDER BY y, ws"],
+    ['variable length, either direction: a self-loop once', "MATCH (x {k: 'a'})-[rs*1..2]-(y) RETURN y.k AS y, [r IN rs | r.w] AS ws ORDER BY y, ws"],
+    ['variable length from the far end', "MATCH (x)-[rs:R*2]->(y {k: 'b'}) RETURN x.k AS x, [r IN rs | r.w] AS ws ORDER BY x, ws"],
+    ['variable length and a fixed hop: no relationship twice', "MATCH (x {k: 'a'})-[r:R]->(y)-[rs:R*1..2]->(z) RETURN r.w AS w, [q IN rs | q.w] AS ws ORDER BY w, ws"],
+    ['a named path', "MATCH p = (x {k: 'c'})-[:R]->(y)-[:R]->(z) RETURN length(p) AS len, [n IN nodes(p) | n.k] AS ks, [r IN relationships(p) | type(r)] AS ts ORDER BY ks, ts"],
+    ['all shortest paths, either direction', "MATCH (x {k: 'a'}), (y {k: 'c'}), p = allShortestPaths((x)-[*]-(y)) RETURN length(p) AS len, [r IN relationships(p) | r.w] AS ws ORDER BY ws DESC"],
+  ])('%s, ordered by a list', (_name, cypher) => {
     const rows = g.query(cypher);
     expect(rows.length).toBeGreaterThan(0);
-    expect(sorted(onSmaltdb(db, tables, cypher))).toEqual(sorted(rows));
+    expect(onSmaltdb(db, tables, cypher)).toEqual(rows);
   });
 
+  // The same rows, in any order.
+  const sorted = (rows: unknown[]) => rows.map((r) => JSON.stringify(r)).sort();
   test("a variable-length relationship's hops are not bound again by a later hop (Cypher's uniqueness)", () => {
     const cypher = "MATCH (x {k: 'a'})-[rs:R*1..2]-(y)-[r:R]-(z) RETURN [q IN rs | q.w] AS ws, r.w AS w";
     const rows = g.query(cypher) as { ws: number[]; w: number }[];

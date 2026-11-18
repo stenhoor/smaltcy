@@ -1,11 +1,12 @@
 /**
  * smaltcy's graph plans compiled to smaltdb plans (ADR 0004; smaltdb ADR 0033, step 8), beside smaltcy's own engine.
  * The compiler keeps Cypher's meaning where smaltdb's differs (smaltdb ADR 0033, decision 13): comparisons across
- * kinds, booleans apart from integers, checking division, NULLs last in ORDER BY, Cypher's order of kinds.
+ * kinds, booleans apart from integers, checking division, NULLs last in ORDER BY, Cypher's order of kinds, lists and
+ * maps compared element by element, `+` of strings and numbers as JavaScript writes them, `%` of floats.
  *
  * What it can't compile yet it refuses with an `Unsupported` error that names it, never a plan that would give a
- * different answer. Where only the values a query reads show that it can't keep Cypher's meaning (a list compared with
- * `<`, a string added to a list), the plan raises an error when it meets them (smaltdb's `raise_error`), with
+ * different answer. Where only the values a query reads show that it can't keep Cypher's meaning (lists nested deeper
+ * than `NESTING`, maps in ORDER BY), the plan raises an error when it meets them (smaltdb's `raise_error`), with
  * `Unsupported`'s code and message. Cypher's own errors that only the values show (a type error, division by zero) are
  * raised the same way, with the code and message smaltcy's engine gives.
  *
@@ -323,7 +324,8 @@ export const or = (...args: PlanExpr[]): PlanExpr => (args.length === 1 ? args[0
 const not = (arg: PlanExpr): PlanExpr => ({ k: 'not', arg });
 export const isNull = (arg: PlanExpr): PlanExpr => ({ k: 'isNull', arg, not: false });
 const isNotNull = (arg: PlanExpr): PlanExpr => ({ k: 'isNull', arg, not: true });
-export const caseWhen = (whens: readonly (readonly [PlanExpr, PlanExpr])[], otherwise: PlanExpr, type: PlanType): PlanExpr => ({ k: 'case', whens: whens.map(([when, then]) => ({ when, then })), else: otherwise, type });
+export const caseWhen = (whens: readonly (readonly [PlanExpr, PlanExpr])[], otherwise: PlanExpr, type: PlanType): PlanExpr =>
+  whens.length ? { k: 'case', whens: whens.map(([when, then]) => ({ when, then })), else: otherwise, type } : otherwise;
 export const eq = (a: PlanExpr, b: PlanExpr) => call('cmp_eq', [a, b], 'bool');
 export const NULL = lit(null);
 const TRUE = lit(true);
@@ -434,6 +436,413 @@ function commonType(types: readonly PlanType[]): PlanType | undefined {
   // Under `any`, ints, reals and text keep what they are; a static bool or a list would become an integer or a blob.
   if (ts.every((t) => isNumberType(t) || t === 'text' || t === 'any')) return 'any';
   return undefined;
+}
+
+// Lists and maps compared and ordered element by element with Cypher's meaning, `+` and `%` as smaltcy's engine
+// computes them (ADR 0004). smaltdb compares a list or a map by its bytes, so the compiler goes through their elements
+// with `each`, one level of nesting at a time.
+
+/**
+ * How deep lists and maps nest where the compiler reads their elements (`=`, `<`, ORDER BY, min and max): a list of
+ * lists of lists of lists. Each level is its own part of the plan; a value nested deeper raises `Unsupported` when a
+ * row reaches it, never a different answer.
+ */
+export const NESTING = 4;
+
+/** A value and its static type. */
+type Typed = { readonly e: PlanExpr; readonly t: PlanType };
+
+const tooDeep = (type: PlanType): PlanExpr => refuseWhenMet(`lists and maps nested more than ${NESTING} deep`, type);
+const otherKind = (type: PlanType): PlanExpr => refuseWhenMet('comparing or ordering values of other types', type);
+
+/** NULL typed `any`: beside it, `list_of` keeps its other arguments' types (smaltdb ADR 0039). */
+const NULL_ANY: PlanExpr = { k: 'lit', value: null, type: 'any' };
+const NAN: PlanExpr = { k: 'lit', value: NaN, type: 'real' };
+const NEG_INFINITY: PlanExpr = { k: 'lit', value: -Infinity, type: 'real' };
+
+/** The element type of a list type. */
+const elemType = (t: PlanType): PlanType => (t.startsWith('list<') ? (t.slice(5, -1) as PlanType) : 'any');
+/** Whether a value of static type `t` may be of kind `k`. */
+const may = (v: Typed, k: number) => {
+  const s = staticKind(v.t);
+  return s === undefined || s === k;
+};
+/** A value in an `any` place: a boolean, a list or a map keeps its kind there (a typed value), as Cypher's do. */
+function asAny(v: Typed): PlanExpr {
+  if (v.t !== 'bool' && !v.t.startsWith('list<') && !v.t.startsWith('map<') && !v.t.startsWith('struct<')) return v.e;
+  return call('list_get', [call('list_of', [v.e, NULL_ANY], 'list<any>'), lit(0)], 'any');
+}
+
+/** A list, as a static list type or one read from `any`. */
+const asList = (v: Typed): Typed => (staticKind(v.t) === K_LIST ? v : { e: call('any_list', [v.e], 'list<any>'), t: 'list<any>' });
+/** A map, as a static map type or one read from `any`. */
+const asMap = (v: Typed): Typed => (staticKind(v.t) === K_MAP ? v : { e: call('any_map', [v.e], PROPS), t: PROPS });
+const mapValueType = (t: PlanType): PlanType => t.slice(10, -1) as PlanType;
+/** A list's element at a position. */
+const at = (list: Typed, pos: PlanExpr): Typed => ({ e: call('list_get', [list.e, pos], elemType(list.t)), t: elemType(list.t) });
+const len = (list: Typed): PlanExpr => call('list_len', [list.e], 'int');
+
+/** -1, 0 or 1 as `a` is less than, equal to or greater than `b` (neither NULL). */
+const sign3 = (a: PlanExpr, b: PlanExpr): PlanExpr => caseWhen([[call('cmp_lt', [a, b], 'bool'), lit(-1)], [call('cmp_gt', [a, b], 'bool'), lit(1)]], lit(0), 'int');
+/** A boolean as 0 or 1. */
+const boolInt = (v: Typed): PlanExpr => caseWhen([[asBoolValue(v), lit(1)]], lit(0), 'int');
+
+// The builders below make `each` expressions whose element, position and aggregates their bodies read as variables;
+// `bindVars` turns those into smaltdb's `element` and `eachAgg`, with the depths the nesting gives them.
+
+let lastVar = 0;
+const variable = (id: number, part: 'value' | 'position' | 'agg', type: PlanType, index = 0): PlanExpr => ({ k: 'var', id, part, type, index }) as unknown as PlanExpr;
+
+/** `each` over a list: `body` reads its element and position. */
+function eachOf(list: Typed, mode: 'map' | 'filter', type: PlanType, body: (el: Typed, pos: PlanExpr) => PlanExpr): PlanExpr {
+  const id = ++lastVar;
+  const t = elemType(list.t);
+  return { k: 'each', mode, list: list.e, body: body({ e: variable(id, 'value', t), t }, variable(id, 'position', 'int')), type, bind: id } as unknown as PlanExpr;
+}
+
+/** `each` with aggregates over a list's elements: `body` reads their results. */
+function eachAggOf(list: Typed, aggs: (el: Typed) => plan.AggCall[], body: (agg: (i: number) => PlanExpr) => PlanExpr, type: PlanType): PlanExpr {
+  const id = ++lastVar;
+  const t = elemType(list.t);
+  return { k: 'each', mode: 'agg', list: list.e, aggs: aggs({ e: variable(id, 'value', t), t }), body: body((i) => variable(id, 'agg', 'int', i)), type, bind: id } as unknown as PlanExpr;
+}
+
+/** An expression read where it is cheap to read again: a column, literal, parameter or element. */
+const cheap = (e: PlanExpr) => ['col', 'lit', 'param', 'var', 'element'].includes(e.k);
+
+/** `body` of a value computed once (an `each` over a list of it), or the value itself when it is cheap to read again. */
+function letIn(v: Typed, type: PlanType, body: (x: Typed) => PlanExpr): PlanExpr {
+  if (cheap(v.e)) return body(v);
+  const lt: PlanType = `list<${v.t === 'null' ? 'any' : v.t}>`;
+  return call('list_get', [eachOf({ e: call('list_of', [v.e], lt), t: lt }, 'map', `list<${type}>`, (x) => body(x)), lit(0)], type);
+}
+
+/**
+ * The builders' variables as smaltdb's `element` and `eachAgg`: a variable's depth is the number of `each` between it
+ * and the one that binds it. An `element` or `eachAgg` made elsewhere (a list comprehension's) counts only the `each`s
+ * made elsewhere, so the builders' are added to its depth.
+ */
+function bindVars(e: PlanExpr): PlanExpr {
+  const walk = (x: unknown, stack: readonly (number | null)[]): unknown => {
+    if (Array.isArray(x)) return x.map((y) => walk(y, stack));
+    if (x === null || typeof x !== 'object') return x;
+    const o = x as Record<string, unknown>;
+    if (o.k === 'var') {
+      const i = stack.lastIndexOf(o.id as number);
+      if (i < 0) throw new SmaltcyError('SMALTCY_PLAN', 'a variable outside its each');
+      const depth = stack.length - 1 - i;
+      return o.part === 'agg' ? { k: 'eachAgg', index: o.index, depth, type: o.type } : { k: 'element', part: o.part, depth, type: o.type };
+    }
+    if (o.k === 'element' || o.k === 'eachAgg') {
+      let skip = o.depth as number;
+      let j = stack.length - 1;
+      for (; j >= 0; j--) {
+        if (stack[j] !== null) continue;
+        if (skip === 0) break;
+        skip--;
+      }
+      return { ...o, depth: j >= 0 ? stack.length - 1 - j : stack.length + skip };
+    }
+    if (o.k === 'each') {
+      const { bind, ...rest } = o;
+      const inner = [...stack, typeof bind === 'number' ? bind : null];
+      return { ...rest, list: walk(o.list, stack), body: walk(o.body, inner), ...(o.aggs ? { aggs: walk(o.aggs, inner) } : {}) };
+    }
+    return Object.fromEntries(Object.entries(o).map(([k, v]) => [k, walk(v, stack)]));
+  };
+  return walk(e, []) as PlanExpr;
+}
+
+const countWhere = (filter: PlanExpr): plan.AggCall => ({ fn: 'count', args: [], star: true, distinct: false, filter, collation: 'binary', type: 'int' });
+
+/** Cypher's AND over a list of booleans: false if one is false, else NULL if one is NULL, else true. */
+function allTrue(results: PlanExpr): PlanExpr {
+  return eachAggOf(
+    { e: results, t: 'list<bool>' },
+    (r) => [countWhere(eq(r.e, FALSE)), countWhere(isNull(r.e))],
+    (n) => caseWhen([[call('cmp_gt', [n(0), lit(0)], 'bool'), FALSE], [call('cmp_gt', [n(1), lit(0)], 'bool'), NULL]], TRUE, 'bool'),
+    'bool',
+  );
+}
+
+/**
+ * `body` of a value's kind (`kindExpr`: K_NULL for NULL), computed once: a literal where the static type tells it
+ * (the value may still be NULL).
+ */
+function withKind(v: Typed, type: PlanType, body: (k: PlanExpr) => PlanExpr): PlanExpr {
+  const s = staticKind(v.t);
+  if (s === K_NULL) return body(lit(K_NULL));
+  if (s !== undefined) return body(caseWhen([[isNull(v.e), lit(K_NULL)]], lit(s), 'int'));
+  return letIn({ e: kindExpr(v), t: 'int' }, type, (k) => body(k.e));
+}
+
+/**
+ * Cypher's `=` (smaltcy's `equals`): NULL with a NULL, false across kinds, numbers by value (NaN equals nothing), lists
+ * element by element and maps by their keys, then their values (false at a difference, else NULL at a NULL). Lists and
+ * maps nest `d` more levels.
+ */
+function valueEquals(x: Typed, y: Typed, d: number): PlanExpr {
+  if (staticKind(x.t) === K_NULL || staticKind(y.t) === K_NULL) return NULL;
+  const both = (k: number) => may(x, k) && may(y, k);
+  return withKind(x, 'bool', (kx) =>
+    withKind(y, 'bool', (ky) => {
+      const whens: [PlanExpr, PlanExpr][] = [[or(eq(kx, lit(K_NULL)), eq(ky, lit(K_NULL))), NULL], [not(eq(kx, ky)), FALSE]];
+      if (both(K_NUMBER)) whens.push([eq(kx, lit(K_NUMBER)), mayBeNaN(x.t) || mayBeNaN(y.t) ? and(eq(x.e, y.e), not(isNaNExpr(x.e))) : eq(x.e, y.e)]);
+      if (both(K_STRING)) whens.push([eq(kx, lit(K_STRING)), eq(x.e, y.e)]);
+      if (both(K_BOOL)) whens.push([eq(kx, lit(K_BOOL)), eq(asBoolValue(x), asBoolValue(y))]);
+      if (both(K_LIST) || both(K_MAP)) whens.push([call('in_list', [kx, lit(K_LIST), lit(K_MAP)], 'bool'), d === 0 ? tooDeep('bool') : nestedEquals(x, y, kx, d - 1)]);
+      return caseWhen(whens, NULL, 'bool');
+    }),
+  );
+}
+
+/**
+ * `=` of two lists or two maps (neither NULL, of the same kind, `kx`): a map's values are compared in key order once
+ * the keys are the same.
+ */
+function nestedEquals(x: Typed, y: Typed, kx: PlanExpr, d: number): PlanExpr {
+  const lists = may(x, K_LIST) && may(y, K_LIST);
+  const maps = may(x, K_MAP) && may(y, K_MAP);
+  const isMap = !lists ? TRUE : !maps ? FALSE : eq(kx, lit(K_MAP));
+  const values = (v: Typed): Typed => {
+    const m = asMap(v);
+    const t: PlanType = `list<${mapValueType(m.t)}>`;
+    return { e: call('map_values', [m.e], t), t };
+  };
+  const seq = (v: Typed): Typed => (!maps ? asList(v) : !lists ? values(v) : { e: caseWhen([[isMap, values(v).e]], asList(v).e, 'list<any>'), t: 'list<any>' });
+  const keys = (v: Typed) => call('map_keys', [asMap(v).e], 'list<text>');
+  const sameKeys = !maps ? TRUE : !lists ? eq(keys(x), keys(y)) : caseWhen([[isMap, eq(keys(x), keys(y))]], TRUE, 'bool');
+  return letIn(seq(x), 'bool', (a) =>
+    letIn(seq(y), 'bool', (b) =>
+      caseWhen(
+        [[not(sameKeys), FALSE], [not(eq(len(a), len(b))), FALSE]],
+        allTrue(eachOf(a, 'map', 'list<bool>', (el, pos) => letIn(at(b, pos), 'bool', (other) => valueEquals(el, other, d)))),
+        'bool',
+      ),
+    ),
+  );
+}
+
+/**
+ * Cypher's `<` and the others as -1, 0 or 1 (smaltcy's `compare`): NULL with a NULL, across kinds, for NaN and for
+ * maps; lists element by element, the first difference deciding (NULL where two elements don't compare), else the
+ * shorter first. Lists nest `d` more levels.
+ */
+function valueCompare(x: Typed, y: Typed, d: number): PlanExpr {
+  if (staticKind(x.t) === K_NULL || staticKind(y.t) === K_NULL) return NULL;
+  const both = (k: number) => may(x, k) && may(y, k);
+  return withKind(x, 'int', (kx) =>
+    withKind(y, 'int', (ky) => {
+      const whens: [PlanExpr, PlanExpr][] = [[or(eq(kx, lit(K_NULL)), not(eq(kx, ky))), NULL]];
+      if (both(K_NUMBER)) whens.push([eq(kx, lit(K_NUMBER)), mayBeNaN(x.t) || mayBeNaN(y.t) ? caseWhen([[or(isNaNExpr(x.e), isNaNExpr(y.e)), NULL]], sign3(x.e, y.e), 'int') : sign3(x.e, y.e)]);
+      if (both(K_STRING)) whens.push([eq(kx, lit(K_STRING)), sign3(x.e, y.e)]);
+      if (both(K_BOOL)) whens.push([eq(kx, lit(K_BOOL)), sign3(asBoolValue(x), asBoolValue(y))]);
+      if (both(K_LIST)) whens.push([eq(kx, lit(K_LIST)), d === 0 ? tooDeep('int') : listCompare(asList(x), asList(y), d - 1)]);
+      return caseWhen(whens, NULL, 'int');
+    }),
+  );
+}
+
+/** `valueCompare` of two lists (neither NULL). */
+function listCompare(a: Typed, b: Typed, d: number): PlanExpr {
+  return letIn(a, 'int', (x) =>
+    letIn(b, 'int', (y) => {
+      const n = caseWhen([[call('cmp_lt', [len(x), len(y)], 'bool'), len(x)]], len(y), 'int');
+      // Each element's comparison, NULL as 2; the first that isn't 0 decides.
+      const each = eachOf({ e: call('list_slice', [x.e, lit(0), n], x.t), t: x.t }, 'map', 'list<int>', (el, pos) => call('coalesce', [letIn(at(y, pos), 'int', (other) => valueCompare(el, other, d)), lit(2)], 'int'));
+      const first = call('list_get', [eachOf({ e: each, t: 'list<int>' }, 'filter', 'list<int>', (c) => not(eq(c.e, lit(0)))), lit(0)], 'int');
+      return letIn({ e: first, t: 'int' }, 'int', (f) => caseWhen([[isNull(f.e), sign3(len(x), len(y))], [eq(f.e, lit(2)), NULL]], f.e, 'int'));
+    }),
+  );
+}
+
+/**
+ * ORDER BY's keys for a value that may be a list (smaltcy's `orderCompare`): its kind's place in Cypher's order (NULL
+ * for NULL), then a number, string or boolean as it is, then a list as `listKey`. Maps (ordered by smaltcy's
+ * `groupKey` text) raise when met.
+ */
+function orderKeys(v: Typed): PlanExpr[] {
+  const keys = (k: PlanExpr): PlanExpr[] => {
+    const whens: [PlanExpr, PlanExpr][] = [[eq(k, lit(K_NULL)), NULL]];
+    if (may(v, K_NUMBER)) whens.push([and(eq(k, lit(K_NUMBER)), isNaNExpr(v.e)), lit(K_NAN)]);
+    if (may(v, K_MAP)) whens.push([eq(k, lit(K_MAP)), orderingMaps('int')]);
+    if (staticKind(v.t) === undefined) whens.push([eq(k, lit(K_OTHER)), otherKind('int')]);
+    const out = [caseWhen(whens, k, 'int')];
+    if (staticKind(v.t) === undefined) out.push(caseWhen([[call('in_list', [k, lit(K_NUMBER), lit(K_STRING)], 'bool'), v.e], [eq(k, lit(K_BOOL)), boolInt(v)]], NULL, 'any'));
+    if (may(v, K_LIST)) out.push(caseWhen([[eq(k, lit(K_LIST)), listKey(asList(v), NESTING - 1)]], NULL, orderListType(NESTING - 1)));
+    return out;
+  };
+  // Each key is its own expression: the kind is computed in each.
+  const n = keys(lit(0)).length;
+  return Array.from({ length: n }, (_, i) => bindVars(withKind(v, i === 0 ? 'int' : i === n - 1 && may(v, K_LIST) ? orderListType(NESTING - 1) : 'any', (k) => keys(k)[i]!)));
+}
+
+const orderingMaps = (type: PlanType): PlanExpr => refuseWhenMet('ordering maps', type);
+
+/** The struct a list's element is in `listKey`, whose nested lists nest `d` more levels. */
+const orderStruct = (d: number): PlanType => (d > 0 ? `struct<c int, n any, s text, l ${orderListType(d - 1)}>` : 'struct<c int, n any, s text>');
+const orderListType = (d: number): PlanType => `list<${orderStruct(d)}>`;
+
+/**
+ * A list as smaltdb orders it in Cypher's order: per element, its kind's place (`c`: lists, strings, booleans,
+ * numbers, NaN, NULL), then its value: a number or boolean (`n`), a string (`s`), a nested list's own key (`l`).
+ * smaltdb compares lists element by element, the shorter first, and structs field by field, as Cypher orders lists.
+ */
+function listKey(list: Typed, d: number): PlanExpr {
+  return eachOf(list, 'map', orderListType(d), (x) =>
+    withKind(x, orderStruct(d), (k) => {
+      const cls: [PlanExpr, PlanExpr][] = [];
+      if (may(x, K_NUMBER)) cls.push([and(eq(k, lit(K_NUMBER)), isNaNExpr(x.e)), lit(K_NAN)]);
+      if (may(x, K_MAP)) cls.push([eq(k, lit(K_MAP)), orderingMaps('int')]);
+      if (staticKind(x.t) === undefined) cls.push([eq(k, lit(K_OTHER)), otherKind('int')]);
+      if (d === 0 && may(x, K_LIST)) cls.push([eq(k, lit(K_LIST)), tooDeep('int')]);
+      const n: [PlanExpr, PlanExpr][] = [];
+      if (may(x, K_NUMBER)) n.push([eq(k, lit(K_NUMBER)), x.e]);
+      if (may(x, K_BOOL)) n.push([eq(k, lit(K_BOOL)), boolInt(x)]);
+      const fields = [caseWhen(cls, k, 'int'), caseWhen(n, NULL, 'any'), may(x, K_STRING) ? caseWhen([[eq(k, lit(K_STRING)), x.e]], NULL, 'text') : NULL];
+      if (d > 0) fields.push(may(x, K_LIST) ? caseWhen([[eq(k, lit(K_LIST)), listKey(asList(x), d - 1)]], NULL, orderListType(d - 1)) : NULL);
+      return call('struct_of', fields, orderStruct(d));
+    }),
+  );
+}
+
+const ZEROS = lit('0'.repeat(330));
+const zeros = (n: PlanExpr): PlanExpr => call('substr', [ZEROS, lit(1), n], 'text');
+const concat = (...parts: (string | PlanExpr)[]): PlanExpr => message(...parts);
+const textOf = (e: PlanExpr): PlanExpr => call('cast_text', [e], 'text');
+
+/**
+ * A number as JavaScript's `String(n)` writes it (smaltcy's `+` of a string and a number): the shortest digits that
+ * read back as the number, in plain notation below 10^21 and in exponent notation from there; `NaN`, `Infinity`.
+ */
+function numberText(x: Typed): PlanExpr {
+  const json = (v: Typed): PlanExpr => {
+    // smaltdb's JSON of a list writes a number as `String(n)`, a whole number beyond 2^53 with all its digits.
+    const t: PlanType = `list<${v.t === 'num' || v.t === 'null' ? 'any' : v.t}>`;
+    return letIn({ e: textOf(call('list_of', [v.e], t)), t: 'text' }, 'text', (j) => call('substr', [j.e, lit(2), call('sub', [call('length', [j.e], 'int'), lit(2)], 'int')], 'text'));
+  };
+  return caseWhen(
+    [
+      [isNull(x.e), NULL],
+      [isNaNExpr(x.e), lit('NaN')],
+      [eq(x.e, INFINITY), lit('Infinity')],
+      [eq(x.e, NEG_INFINITY), lit('-Infinity')],
+      [call('cmp_lt', [call('abs', [x.e], x.t), lit(2 ** 53, 'real')], 'bool'), json(x)],
+    ],
+    letIn({ e: call('cast_real', [x.e], 'real'), t: 'real' }, 'text', (y) => {
+      const sign = caseWhen([[call('cmp_lt', [y.e, lit(0)], 'bool'), lit('-')]], lit(''), 'text');
+      return concat(sign, letIn({ e: call('abs', [y.e], 'real'), t: 'real' }, 'text', (z) => letIn({ e: json(z), t: 'text' }, 'text', (digits) => shortestText(z.e, digits.e))));
+    }),
+    'text',
+  );
+}
+
+/**
+ * `String(z)` of a whole number `z` from 2^53 (all its digits given): ECMAScript's Number::toString picks the fewest
+ * digits `s` such that s × 10^k reads back as `z`, the nearest of those, the even one on a tie. The candidates with `p`
+ * digits are `digits`' first `p` and one more; 17 always read back.
+ */
+function shortestText(z: PlanExpr, digits: PlanExpr): PlanExpr {
+  // The candidates are text: smaltdb gives an integer beyond 2^53 that a double holds exactly as a double.
+  const L = call('length', [digits], 'int');
+  const T = (p: PlanExpr) => call('substr', [digits, lit(1), p], 'text');
+  const U = (p: PlanExpr) => textOf(call('add', [call('cast_integer', [T(p)], 'int'), lit(1)], 'int'));
+  const k = (p: PlanExpr) => call('sub', [L, p], 'int');
+  const reads = (C: PlanExpr, p: PlanExpr) => eq(call('cast_real_strict', [concat(C, 'e', textOf(k(p)))], 'real'), z);
+  const ps: Typed = { e: call('list_of', Array.from({ length: 17 }, (_, i) => lit(i + 1)), 'list<int>'), t: 'list<int>' };
+  const fewest = call('list_get', [eachOf(ps, 'filter', 'list<int>', (p) => and(call('cmp_le', [p.e, L], 'bool'), or(reads(T(p.e), p.e), reads(U(p.e), p.e)))), lit(0)], 'int');
+  return letIn({ e: fewest, t: 'int' }, 'text', ({ e: p }) => {
+    const rest = call('substr', [digits, call('add', [p, lit(1)], 'int')], 'text');
+    const half = concat('5', zeros(call('sub', [k(p), lit(1)], 'int')));
+    const even = call('in_list', [call('substr', [T(p), p, lit(1)], 'text'), lit('0'), lit('2'), lit('4'), lit('6'), lit('8')], 'bool');
+    const tie = caseWhen([[eq(k(p), lit(0)), T(p)], [call('cmp_lt', [rest, half], 'bool'), T(p)], [call('cmp_gt', [rest, half], 'bool'), U(p)], [even, T(p)]], U(p), 'text');
+    const C = caseWhen([[and(reads(T(p), p), reads(U(p), p)), tie], [reads(T(p), p), T(p)]], U(p), 'text');
+    return letIn({ e: C, t: 'text' }, 'text', (c) => written(c.e, k(p)));
+  });
+}
+
+/** C × 10^k as `String()` writes it, C's digits given. */
+function written(ct: PlanExpr, k: PlanExpr): PlanExpr {
+  const cs = call('rtrim', [ct, lit('0')], 'text');
+  const m = call('length', [cs], 'int');
+  const E = call('add', [call('length', [ct], 'int'), call('sub', [k, lit(1)], 'int')], 'int');
+  const plain = concat(cs, zeros(call('sub', [call('add', [E, lit(1)], 'int'), m], 'int')));
+  const exp = concat(call('substr', [cs, lit(1), lit(1)], 'text'), caseWhen([[call('cmp_gt', [m, lit(1)], 'bool'), concat('.', call('substr', [cs, lit(2)], 'text'))]], lit(''), 'text'), 'e+', textOf(E));
+  return caseWhen([[call('cmp_lt', [E, lit(21)], 'bool'), plain]], exp, 'text');
+}
+
+/** A number or a boolean as smaltcy's `+` writes it beside a string (`String()`). */
+function valueText(v: Typed): PlanExpr {
+  const boolText = caseWhen([[isNull(v.e), NULL], [asBoolValue(v), lit('true')]], lit('false'), 'text');
+  const k = staticKind(v.t);
+  if (k === K_BOOL) return boolText;
+  if (k === K_NUMBER) return numberText(v);
+  return caseWhen([[eq(kindExpr(v), lit(K_BOOL)), boolText]], numberText(v), 'text');
+}
+
+/** A list of its elements in `any` places, where booleans and nested values keep their kind. */
+function anyList(list: Typed): Typed {
+  const el = elemType(list.t);
+  if (el === 'any' || el === 'int' || el === 'real' || el === 'num' || el === 'text') return { e: list.e, t: 'list<any>' };
+  return { e: eachOf(list, 'map', 'list<any>', (x) => asAny(x)), t: 'list<any>' };
+}
+
+/** Two lists one after the other. */
+function concatLists(a: Typed, b: Typed): Typed {
+  if (elemType(a.t) === elemType(b.t)) return { e: call('list_concat', [a.e, b.e], a.t), t: a.t };
+  return { e: call('list_concat', [anyList(a).e, anyList(b).e], 'list<any>'), t: 'list<any>' };
+}
+
+/** A list of one value. */
+const listOfOne = (v: Typed): Typed => {
+  const t: PlanType = `list<${v.t === 'null' ? 'any' : v.t}>`;
+  return { e: call('list_of', [v.e], t), t };
+};
+
+/** Branches giving lists, under one list type: theirs, or `list<any>`. */
+function oneListType(whens: readonly (readonly [PlanExpr, Typed])[], otherwise: Typed): Typed {
+  const types = new Set([...whens.map(([, v]) => v.t), otherwise.t].filter((t) => t !== 'null'));
+  const t: PlanType = types.size === 1 ? [...types][0]! : 'list<any>';
+  const fit = (v: Typed) => (v.t === t || v.t === 'null' ? v.e : anyList(v).e);
+  return { e: caseWhen(whens.map(([c, v]) => [c, fit(v)] as const), fit(otherwise), t), t };
+}
+
+/**
+ * smaltcy's `+` where a static type says one side is a list: two lists one after the other, a list and a value the
+ * value appended, a value and a list it prepended; NULL where a side is NULL and isn't a list, as smaltcy's `add`.
+ */
+function addLists(a: Typed, b: Typed): Typed {
+  const NULLS: Typed = { e: NULL, t: 'null' };
+  const ka = staticKind(a.t);
+  const kb = staticKind(b.t);
+  if (ka === K_LIST && kb === K_LIST) {
+    return oneListType(
+      [
+        [and(isNull(a.e), isNull(b.e)), NULLS],
+        [isNull(a.e), concatLists(listOfOne({ e: NULL, t: 'null' }), b)],
+        [isNull(b.e), concatLists(a, listOfOne({ e: NULL, t: 'null' }))],
+      ],
+      concatLists(a, b),
+    );
+  }
+  if (ka === K_LIST) return oneListType([[isNull(a.e), NULLS]], concatLists(a, listOfOne(b)));
+  return oneListType([[isNull(b.e), NULLS]], concatLists(listOfOne(a), b));
+}
+
+/** smaltcy's `%` of numbers that may be floats: JavaScript's, the sign of the dividend's; by zero NaN, or for two whole numbers its error. */
+function floatModulo(x: PlanExpr, y: PlanExpr, t: PlanType): PlanExpr {
+  const whole = (v: PlanExpr) => eq(call('any_type', [v], 'text'), lit('int'));
+  // mod_floor of two numbers of the same sign is JavaScript's %: the divisor takes the dividend's sign (-0's too).
+  const negative = or(call('cmp_lt', [x, lit(0)], 'bool'), call('cmp_lt', [call('div_float', [lit(1), x], 'real'), lit(0)], 'bool'));
+  const divisor = call('abs', [call('cast_real', [y], 'real')], 'real');
+  return caseWhen(
+    [
+      [or(isNull(x), isNull(y)), NULL],
+      [eq(y, lit(0)), caseWhen([[and(whole(x), whole(y)), raise('SMALTCY_TYPE', 'Division by zero', 'real')]], NAN, 'real')],
+    ],
+    call('mod_floor', [call('cast_real', [x], 'real'), caseWhen([[negative, call('neg', [divisor], 'real')]], divisor, 'real')], 'real'),
+    t === 'int' ? 'real' : t,
+  );
 }
 
 /** Compiles graph plans and expressions over a graph's tables (`compileQuery`; the write runner in write.ts). */
@@ -937,10 +1346,12 @@ export class Compiler {
       case 'min': case 'max': {
         const k = staticKind(v.t);
         if (k === K_NUMBER || k === K_STRING || k === K_BOOL) return { call: agg(a.fn, [v.e], v.t), type: v.t };
-        if (k !== undefined) return unsupported(`${a.fn}() of a ${v.t}`);
-        // Mixed kinds: Cypher's order of kinds first (strings, booleans, numbers), then the value; NULLs skipped.
-        const kind = caseWhen([[and(eq(kindExpr(v), lit(K_NUMBER)), isNaNExpr(v.e)), lit(K_NAN)]], this.orderKind(v), 'int');
-        return { call: agg(a.fn === 'min' ? 'first' : 'last', [v.e, kind, v.e], 'any'), type: 'any' };
+        if (k === K_OTHER) return unsupported(`${a.fn}() of a ${v.t}`);
+        // Cypher's order (ORDER BY's keys): its kind's place first (NULL for NULL, so NULLs are skipped), then the value.
+        const [kind, ...values] = orderKeys(v);
+        const value = values.length === 1 ? values[0]! : call('list_of', values, 'list<any>');
+        const t: PlanType = k === undefined ? 'any' : v.t;
+        return { call: agg(a.fn === 'min' ? 'first' : 'last', [v.e, kind!, value], t), type: t };
       }
       case 'collect': {
         // Cypher's collect leaves NULLs out; smaltdb's implode keeps them. No rows: an empty list.
@@ -988,7 +1399,7 @@ export class Compiler {
     return [b.col];
   }
 
-  /** ORDER BY in Cypher's order: kinds in order (strings, booleans, numbers, NaN, then NULL), then values. */
+  /** ORDER BY in Cypher's order: kinds in order (maps, lists, strings, booleans, numbers, NaN, then NULL), then values. */
   private sortKeys(k: SortKey, frame: Frame): plan.SortKey[] {
     const v = this.expr(k.expr, frame);
     // Cypher's NULLs come last ascending and first descending: the order reversed.
@@ -998,22 +1409,8 @@ export class Compiler {
     const kind = staticKind(v.t);
     if (kind === K_NUMBER) return mayBeNaN(v.t) ? [key(caseWhen([[isNull(v.e), NULL], [isNaNExpr(v.e), lit(1)]], lit(0), 'int')), key(v.e)] : [key(v.e)];
     if (kind === K_STRING || kind === K_BOOL || kind === K_NULL) return [key(v.e)];
-    if (kind !== undefined) return unsupported(`ORDER BY a ${v.t}`);
-    const order = caseWhen([[and(eq(kindExpr(v), lit(K_NUMBER)), isNaNExpr(v.e)), lit(K_NAN)]], this.orderKind(v), 'int');
-    return [key(order), key(v.e)];
-  }
-
-  /** The kind's place in Cypher's order, NULL for NULL; lists and maps raise (smaltdb orders them by their bytes). */
-  private orderKind(v: { e: PlanExpr; t: PlanType }): PlanExpr {
-    const k = kindExpr(v);
-    return caseWhen(
-      [
-        [eq(k, lit(K_NULL)), NULL],
-        [call('in_list', [k, lit(K_LIST), lit(K_MAP), lit(K_OTHER)], 'bool'), refuseWhenMet('ordering lists and maps', 'int')],
-      ],
-      k,
-      'int',
-    );
+    if (kind === K_OTHER) return unsupported(`ORDER BY a ${v.t}`);
+    return orderKeys(v).map(key);
   }
 
   /** SKIP and LIMIT: a non-negative whole number, a literal or a parameter. */
@@ -1469,61 +1866,72 @@ export class Compiler {
 
   // Cypher's comparisons.
 
-  /** `a = b`: NULL when either is NULL, false across kinds, numbers by value (NaN equals nothing). */
+  /** `a = b`: NULL when either is NULL, false across kinds, numbers by value (NaN equals nothing), lists and maps by their elements. */
   private equals(a: Val, b: Val): PlanExpr {
     if (a.k !== 'value' || b.k !== 'value') {
       if (a.k === 'node' && b.k === 'node') return eq(a.id, b.id);
       if (a.k === 'rel' && b.k === 'rel') return and(eq(a.type, b.type), eq(a.rowid, b.rowid));
       return unsupported('comparing a node or relationship with another kind of value');
     }
-    return this.compareBy(a, b, 'equality', (x, y, kind) => {
+    const e = this.compareBy(a, b, (x, y, kind) => {
       if (kind === K_NUMBER) return mayBeNaN(x.t) || mayBeNaN(y.t) ? and(eq(x.e, y.e), not(isNaNExpr(x.e))) : eq(x.e, y.e);
       if (kind === K_BOOL) return eq(asBoolValue(x), asBoolValue(y));
       return eq(x.e, y.e);
-    }, FALSE);
+    }, FALSE, (x, y) => valueEquals(x, y, NESTING));
+    return bindVars(e);
   }
 
-  /** `<` and the others: NULL across kinds and for NaN; strings by code unit order is smaltdb's UTF-8 byte order. */
+  /**
+   * `<` and the others: NULL across kinds, for NaN and for maps; strings by code unit order is smaltdb's UTF-8 byte
+   * order; lists element by element.
+   */
   private ordering(fn: string, a: Val, b: Val): PlanExpr {
     if (a.k !== 'value' || b.k !== 'value') return unsupported('ordering comparisons of nodes and relationships');
-    return this.compareBy(a, b, 'ordering', (x, y, kind) => {
+    const e = this.compareBy(a, b, (x, y, kind) => {
       const c = (p: PlanExpr, q: PlanExpr) => call(fn, [p, q], 'bool');
       if (kind === K_NUMBER) return mayBeNaN(x.t) || mayBeNaN(y.t) ? caseWhen([[or(isNaNExpr(x.e), isNaNExpr(y.e)), NULL]], c(x.e, y.e), 'bool') : c(x.e, y.e);
       if (kind === K_BOOL) return c(asBoolValue(x), asBoolValue(y));
       return c(x.e, y.e);
-    }, NULL);
+    }, NULL, (x, y) => {
+      if (!(may(x, K_LIST) && may(y, K_LIST))) return NULL;
+      const lists = call(fn, [listCompare(asList(x), asList(y), NESTING - 1), lit(0)], 'bool');
+      return staticKind(x.t) === K_LIST || staticKind(y.t) === K_LIST ? lists : caseWhen([[eq(kindExpr(x), lit(K_LIST)), lists]], NULL, 'bool');
+    });
+    return bindVars(e);
   }
 
   /**
-   * A comparison of two values by their kinds: `same` for two numbers, strings or booleans, `across` for values of
-   * different kinds. Lists and maps, which smaltdb compares by their bytes, raise.
+   * A comparison of two values by their kinds: `same` for two numbers, strings or booleans, `nested` for two lists or
+   * two maps, `across` for values of different kinds.
    */
   private compareBy(
     a: { e: PlanExpr; t: PlanType },
     b: { e: PlanExpr; t: PlanType },
-    what: string,
     same: (a: { e: PlanExpr; t: PlanType }, b: { e: PlanExpr; t: PlanType }, kind: number) => PlanExpr,
     across: PlanExpr,
+    nested: (a: { e: PlanExpr; t: PlanType }, b: { e: PlanExpr; t: PlanType }) => PlanExpr,
   ): PlanExpr {
     const ka = staticKind(a.t);
     const kb = staticKind(b.t);
     const comparable = (k: number) => k === K_NUMBER || k === K_STRING || k === K_BOOL;
-    for (const k of [ka, kb]) if (k === K_LIST || k === K_MAP) unsupported(`${what} of lists and maps`);
+    const container = (k: number) => k === K_LIST || k === K_MAP;
     if (ka === K_NULL || kb === K_NULL) return NULL;
     if (ka !== undefined && kb !== undefined) {
       if (ka === kb && comparable(ka)) return same(a, b, ka);
+      if (ka === kb && container(ka)) return caseWhen([[or(isNull(a.e), isNull(b.e)), NULL]], nested(a, b), 'bool');
       return caseWhen([[or(isNull(a.e), isNull(b.e)), NULL]], ka === kb ? NULL : across, 'bool');
     }
     // A kind is known only when the value is: compare by kind at run time.
     const kindA = ka !== undefined ? lit(ka) : kindExpr(a);
     const kindB = kb !== undefined ? lit(kb) : kindExpr(b);
     const kinds = [K_NUMBER, K_STRING, K_BOOL].filter((k) => (ka === undefined || ka === k) && (kb === undefined || kb === k));
+    const containers = [K_LIST, K_MAP].some((k) => (ka === undefined || ka === k) && (kb === undefined || kb === k));
     return caseWhen(
       [
         [or(isNull(a.e), isNull(b.e)), NULL],
         [not(eq(kindA, kindB)), across],
-        [call('in_list', [kindA, lit(K_LIST), lit(K_MAP)], 'bool'), refuseWhenMet(`${what} of lists and maps`, 'bool')],
         ...kinds.map((k) => [eq(kindA, lit(k)), same(a, b, k)] as const),
+        ...(containers ? [[call('in_list', [kindA, lit(K_LIST), lit(K_MAP)], 'bool'), nested(a, b)] as const] : []),
       ],
       NULL,
       'bool',
@@ -1720,14 +2128,22 @@ export class Compiler {
 
   /**
    * Arithmetic with Cypher's meaning: integers stay integers (64-bit: overflow is an error, smaltdb's checked
-   * operations), division of two integers truncates and by zero is an error, `+` joins two strings.
+   * operations), division of two integers truncates and by zero is an error, `%` of floats is JavaScript's; `+` joins
+   * two strings, a string and a number or a boolean (as `String()` writes them), and lists (a list and a value: the
+   * value appended or prepended).
    */
   private arithmetic(fn: string, [a, b]: { e: PlanExpr; t: PlanType }[]): Val {
     const ka = staticKind(a!.t);
     const kb = staticKind(b!.t);
-    if (ka === K_NULL || kb === K_NULL) return { k: 'value', e: NULL, t: 'null' };
-    if (fn === 'add' && ka === K_STRING && kb === K_STRING) return { k: 'value', e: call('text_concat', [a!.e, b!.e], 'text'), t: 'text' };
     const known = ka !== undefined && kb !== undefined;
+    const value = (v: { e: PlanExpr; t: PlanType }): Val => ({ k: 'value', e: bindVars(v.e), t: v.t });
+    const numOrBool = (k: number | undefined) => k === K_NUMBER || k === K_BOOL;
+    if (fn === 'add' && known && (ka === K_LIST || kb === K_LIST)) return value(addLists(a!, b!));
+    if ((ka === K_NULL || kb === K_NULL) && !(fn === 'add' && (may(a!, K_LIST) || may(b!, K_LIST)))) return { k: 'value', e: NULL, t: 'null' };
+    if (fn === 'add' && ka === K_STRING && kb === K_STRING) return { k: 'value', e: call('text_concat', [a!.e, b!.e], 'text'), t: 'text' };
+    if (fn === 'add' && ((ka === K_STRING && numOrBool(kb)) || (numOrBool(ka) && kb === K_STRING))) {
+      return value({ e: call('text_concat', [ka === K_STRING ? a!.e : valueText(a!), kb === K_STRING ? b!.e : valueText(b!)], 'text'), t: 'text' });
+    }
     if (known && (ka !== K_NUMBER || kb !== K_NUMBER)) return unsupported(`${fn} of a ${a!.t} and a ${b!.t}`);
     const t: PlanType = known ? (a!.t === b!.t ? a!.t : 'num') : 'any';
     const numeric = (x: PlanExpr, y: PlanExpr): PlanExpr => {
@@ -1735,35 +2151,45 @@ export class Compiler {
         known ? (a!.t === 'int' && b!.t === 'int' ? TRUE : a!.t === 'real' || b!.t === 'real' ? FALSE : intTest(p, q)) : intTest(p, q);
       const intTest = (p: PlanExpr, q: PlanExpr) => and(eq(call('any_type', [p], 'text'), lit('int')), eq(call('any_type', [q], 'text'), lit('int')));
       const zeroCheck = (op: string): PlanExpr =>
-        caseWhen([[and(bothInt(x, y), eq(y, lit(0))), raise('SMALTCY_TYPE', 'Division by zero', 'int')], [bothInt(x, y), call(op, [x, y], 'int')]], fn === 'mod' ? refuseWhenMet('% of floats') : call('div_float', [x, y], 'real'), t === 'int' ? 'int' : t);
+        caseWhen([[and(bothInt(x, y), eq(y, lit(0))), raise('SMALTCY_TYPE', 'Division by zero', 'int')], [bothInt(x, y), call(op, [x, y], 'int')]], call('div_float', [x, y], 'real'), t === 'int' ? 'int' : t);
       switch (fn) {
         case 'add': return call('add_checked', [x, y], t);
         case 'sub': return call('sub_checked', [x, y], t);
         case 'mul': return call('mul_checked', [x, y], t);
         case 'div_float': return call('div_float', [x, y], 'real');
         case 'div': return zeroCheck('div_trunc');
-        default: return zeroCheck('mod_trunc');
+        // Two integers: smaltdb's remainder (64-bit). Otherwise JavaScript's, which smaltcy's numbers take.
+        default: return known && a!.t === 'int' && b!.t === 'int' ? zeroCheck('mod_trunc') : floatModulo(x, y, t);
       }
     };
     const rt: PlanType = fn === 'div_float' ? 'real' : t;
     if (known) return { k: 'value', e: numeric(a!.e, b!.e), t: rt };
-    // Known only at run time: numbers, or for + two strings; NULL gives NULL.
+    // Known only at run time: numbers, for + strings and lists too; NULL gives NULL.
     const kindA = ka !== undefined ? lit(ka) : kindExpr(a!);
     const kindB = kb !== undefined ? lit(kb) : kindExpr(b!);
-    const whens: [PlanExpr, PlanExpr][] = [
-      [or(isNull(a!.e), isNull(b!.e)), NULL],
-      [and(eq(kindA, lit(K_NUMBER)), eq(kindB, lit(K_NUMBER))), numeric(a!.e, b!.e)],
-    ];
-    if (fn === 'add') whens.push([and(eq(kindA, lit(K_STRING)), eq(kindB, lit(K_STRING))), call('text_concat', [a!.e, b!.e], 'text')]);
+    const whens: [PlanExpr, PlanExpr][] = [];
     if (fn === 'add') {
-      // What smaltcy's + gives that the compiler doesn't yet: a list and a value, a string and a number or a boolean.
-      const numOrBool = (k: PlanExpr) => call('in_list', [k, lit(K_NUMBER), lit(K_BOOL)], 'bool');
+      // smaltcy's add: a list first (two lists joined, a value appended), then a value prepended to a list; NULL is
+      // a value there.
       const list = lit(K_LIST);
+      if (may(a!, K_LIST)) {
+        const la = asList(a!);
+        const joined = !may(b!, K_LIST) ? concatLists(la, listOfOne(b!)) : oneListType([[eq(kindB, list), concatLists(la, asList(b!))]], concatLists(la, listOfOne(b!)));
+        whens.push([eq(kindA, list), asAny(joined)]);
+      }
+      if (may(b!, K_LIST)) whens.push([eq(kindB, list), asAny(concatLists(listOfOne(a!), asList(b!)))]);
+    }
+    whens.push([or(isNull(a!.e), isNull(b!.e)), NULL]);
+    if (may(a!, K_NUMBER) && may(b!, K_NUMBER)) whens.push([and(eq(kindA, lit(K_NUMBER)), eq(kindB, lit(K_NUMBER))), numeric(a!.e, b!.e)]);
+    if (fn === 'add') {
       const string = lit(K_STRING);
-      whens.push([or(eq(kindA, list), eq(kindB, list), and(eq(kindA, string), numOrBool(kindB)), and(numOrBool(kindA), eq(kindB, string))), refuseWhenMet('+ of a list, or of a string and a number or a boolean')]);
+      const nb = (k: PlanExpr) => call('in_list', [k, lit(K_NUMBER), lit(K_BOOL)], 'bool');
+      if (may(a!, K_STRING) && may(b!, K_STRING)) whens.push([and(eq(kindA, string), eq(kindB, string)), call('text_concat', [a!.e, b!.e], 'text')]);
+      if (may(a!, K_STRING) && (may(b!, K_NUMBER) || may(b!, K_BOOL))) whens.push([and(eq(kindA, string), nb(kindB)), call('text_concat', [a!.e, valueText(b!)], 'text')]);
+      if ((may(a!, K_NUMBER) || may(a!, K_BOOL)) && may(b!, K_STRING)) whens.push([and(nb(kindA), eq(kindB, string)), call('text_concat', [valueText(a!), b!.e], 'text')]);
     }
     // smaltcy's type error for the rest, as its engine words it.
     const verb = ({ add: 'add', sub: 'subtract', mul: 'multiply', div: 'divide', div_float: 'divide', mod: 'take the modulo of' } as Record<string, string>)[fn]!;
-    return { k: 'value', e: caseWhen(whens, raise('SMALTCY_TYPE', message(`Can't ${verb} `, typeNameExpr(a!), ' and ', typeNameExpr(b!))), 'any'), t: 'any' };
+    return value({ e: caseWhen(whens, raise('SMALTCY_TYPE', message(`Can't ${verb} `, typeNameExpr(a!), ' and ', typeNameExpr(b!))), 'any'), t: 'any' });
   }
 }
