@@ -158,18 +158,42 @@ It keeps Cypher's meaning:
 
 - **Comparisons by kind:** `=` is NULL with a NULL and false across kinds (`true = 1` is false), `<` is NULL across
   kinds and for NaN; where a type is `any`, the kind is found when the query runs (`any_type`).
+- **Lists and maps** are compared element by element, as smaltcy's `equals` and `compare` do, where smaltdb compares
+  their bytes: `=` of two lists is false for different lengths or a false element, else NULL for a NULL element
+  (`[1, null] = [1, null]` is NULL), else true; of two maps, false for different keys, else their values in key order
+  as a list's. `<` of two lists goes to the first pair of elements that differ (NULL where they don't compare: NULL,
+  NaN, other kinds, maps), else the shorter is less; `<` of maps is NULL. The compiler goes through the elements with
+  smaltdb's `each` (`list_len`, `list_get`, `list_slice`, `map_keys`, `map_values`; `any_list` and `any_map` for values
+  under `any`), each element's kind found as a value's is. Its `each` expressions bind their elements as variables,
+  given smaltdb's depths (`element`, `eachAgg`) once the expression is built, so they nest inside a list
+  comprehension's; a value used more than once is computed once (an `each` over a list of it). **Nesting is bounded:**
+  each level is its own part of the plan, so lists and maps are compared, and lists ordered, four levels deep
+  (`NESTING`: a list of lists of lists of lists); a value nested deeper raises `Unsupported` when a row reaches it.
 - **Booleans:** a predicate must be a boolean or NULL; anything else is Cypher's type error. Comparisons and logic are
   declared `bool`, so results give `true` and `false`.
 - **Arithmetic:** 64-bit integers with checked operations (`add_checked` …); integer division truncates and division by
-  zero is an error; `+` joins two strings.
-- **ORDER BY:** Cypher's order of kinds (strings, booleans, numbers, NaN), NULLs last ascending and first descending.
+  zero is an error; `+` joins two strings. `+` of a string and a number or a boolean writes them as smaltcy's `add`
+  does, with JavaScript's `String()`: `true`, `1` for `1.0`, `NaN`, `Infinity`, `1e+21`, the shortest digits that read
+  back as the number. smaltdb's JSON of a list writes a number below 2^53 that way; for whole numbers from 2^53 the
+  compiler picks those digits itself, as ECMAScript's Number::toString does (the fewest of the number's digits, or those
+  digits plus one in the last place, that read back as it, `cast_real_strict`), in plain notation below 10^21, else in
+  exponent notation. `+` of two lists joins them (`list_concat`), of a list and a value appends or prepends the value
+  (NULL too: `[1] + null` is `[1, null]`), booleans and nested lists keeping their kind in a `list<any>`. `%` of two
+  integers is smaltdb's 64-bit remainder; of anything else JavaScript's, as smaltcy's numbers are: `mod_floor` of the
+  dividend and the divisor given the dividend's sign (`-0`'s too), which is JavaScript's `%` when both have the same
+  sign; by zero NaN, or for two whole numbers smaltcy's error.
+- **ORDER BY:** Cypher's order of kinds (maps, lists, strings, booleans, numbers, NaN), NULLs last ascending and first
+  descending. A list is ordered by a key smaltdb orders as Cypher orders lists: a list of one struct per element, its
+  kind's place, then its number or boolean, its string, or its own nested list's key (smaltdb compares lists element by
+  element, the shorter first, and structs field by field). Maps, which smaltcy orders by a text of their entries
+  (`groupKey`), raise `Unsupported` when a row reaches them, in a list too.
 - **Aggregates:** `sum` of nothing is 0, `collect` leaves NULLs out, `min` and `max` across kinds follow Cypher's
   order, groups come in the order of their first row.
 - **Quantifiers and list comprehensions** with Cypher's NULLs, over smaltdb's `each`.
 
 What it can't compile yet it refuses with `Unsupported`, which names the feature. What it can compile but whose meaning
-only the values show it can't keep (comparing two lists, ordering a list, `+` of a list, or of a string and a number,
-`%` of floats) raises an error when a row reaches it, never a different answer: smaltdb's `raise_error(message, code)`
+only the values show it can't keep (lists and maps nested more than four deep where they are compared or ordered, maps
+in ORDER BY, `min` and `max`) raises an error when a row reaches it, never a different answer: smaltdb's `raise_error(message, code)`
 (stenhoor/smaltdb#264), which raises only where a row reaches it, with `Unsupported`'s code (`SMALTCY_UNSUPPORTED`) and
 message. Cypher's own errors that only the values show raise the same way with smaltcy's code and message, as its
 engine words them: a predicate that isn't a boolean (`WHERE must be a boolean, not INTEGER`), arithmetic of other kinds
@@ -189,7 +213,10 @@ written), and over relationships on a graph with self-loops, parallel
 relationships of two types and a node with none (uniqueness, both directions, OPTIONAL MATCH with WHERE, type
 alternatives, variable length, paths). A third runs EXISTS, pattern predicates and pattern comprehensions on that
 graph: correlated on nodes and relationships, negated, nested, in OPTIONAL MATCH, with WHERE, in ORDER BY and
-aggregates. `test/smaltdb-history.test.ts` writes the histories of `test/history.test.ts` (random writes from a seed,
+aggregates. A fourth compares lists and maps (`=`, `<>`, `<`, IN, CASE, in list comprehensions, ORDER BY, `min` and
+`max`, nested, empty, with NULLs and mixed kinds, maps with other keys), `+` of lists, strings, numbers and booleans
+(and `String()` of 300 numbers from 1e-300 to 1e300) and `%` of floats (negative operands, zero, NaN and infinities),
+and the values it refuses when met. `test/smaltdb-history.test.ts` writes the histories of `test/history.test.ts` (random writes from a seed,
 some in transactions of two statements, some failing; the social graph changing over four versions;
 `test/helpers/history-cases.ts`) on both engines, checks that smaltdb commits exactly when smaltcy makes a version,
 with its author and message, then reads every version with `AT VERSION` (nodes, relationships, a pattern) and each
@@ -224,11 +251,19 @@ after an index exists and checks smaltdb's catalog.
   runs that input twice. Every operation the compiler makes keeps an order, so both give the same rows in the same
   order.
 - `allShortestPaths` enumerates acyclic paths before ranking them, which can grow fast on a dense graph.
+- Comparing and ordering values whose kind only the value shows (`any`, as properties are) compiles every kind they
+  may be, lists and maps four levels down included, so those plans are larger: about 64 KB of plan JSON for `MATCH
+  (n:T) RETURN n.v = n.v`, 17 KB before lists were compared (ORDER BY `n.v`: 29 KB, 9 KB before). Grouping, DISTINCT
+  and `collect()` of values a static type says are lists or maps are still refused (`Unsupported`): smaltdb groups
+  them by their bytes.
 - **Known differences, recorded rather than hidden:**
   - A smaltdb map keeps its keys sorted, so `keys(n)` can't give them in the order they were set: it is refused.
   - smaltdb compares text by its UTF-8 bytes, smaltcy by UTF-16 code units: the order of characters above U+FFFF
     against U+E000 to U+FFFF differs. Not guarded.
   - Integers are 64-bit on smaltdb: an overflow is an error, where smaltcy's numbers become inexact floats.
+  - `%` of two integers whose remainder is 0 with a negative dividend (`-4 % 2`) is `-0` in smaltcy (JavaScript's
+    `%`) and `0` on smaltdb, whose integers have no `-0`; Cypher has no `-0`. Floats give `-0` on both.
+  - Strings in lists and maps compare as strings do: by UTF-8 bytes on smaltdb (above).
   - The errors above have smaltcy's codes and messages, and so do the runner's own checks (deleting a node with
     relationships, a relationship to NULL, values that can't be properties); the tests compare them. Errors smaltdb
     raises itself (an integer overflow, a limit) have smaltdb's codes and messages. Where several rows would fail, the
