@@ -18,8 +18,9 @@
  * - **History.** On a graph that keeps history, each commit that changes it is a version, numbered by its smaltdb
  *   commit id; a write that changes nothing (a property set to the value it has) writes nothing, so it makes none.
  * - **New labels and types** are added to the graph (`alterPropertyGraph` `addLabel` / `addType`) when a write first
- *   uses them. The reserved label `smaltcy:node` is refused, as are labels and types that differ from the graph's
- *   only in case (smaltdb finds them ignoring case).
+ *   uses them. The reserved label `smaltcy:node` is refused. Labels and types are case-sensitive in smaltdb as in
+ *   Cypher, and the tables made for them are numbered (`<graph>_l<k>`, `<graph>_t<k>`), so `Person` and `person` are
+ *   two labels with a table each.
  * - **New ids** are chosen here: a node's is one more than the largest node id, a relationship's rowid one more than
  *   the largest rowid of any edge table, so a relationship's rowid stays unique across types (its id). With history,
  *   the largest in the graph's past versions counts too, so an id is never given again while a version holds it. A
@@ -816,8 +817,7 @@ class Runner {
   private label(l: string): string {
     const known = this.labelTables.get(l);
     if (known) return known;
-    if (l.toLowerCase() === NODE_LABEL) return refuse(`the label ${NODE_LABEL}, which is reserved`);
-    this.sameButCase(l, this.labelTables, 'label');
+    if (l === NODE_LABEL) return refuse(`the label ${NODE_LABEL}, which is reserved`);
     const table = `${this.t0.graph}_l${this.labelTables.size}`;
     this.db.queryPlan({ kind: 'schema', op: { op: 'alterPropertyGraph', name: this.t0.graph, action: { kind: 'addLabel', label: l, table } } } as PlanStatementInput);
     this.labelTables.set(l, table);
@@ -828,18 +828,10 @@ class Runner {
   private type(t: string): string {
     const known = this.types.get(t);
     if (known) return known;
-    this.sameButCase(t, this.types, 'relationship type');
     const table = `${this.t0.graph}_t${this.types.size}`;
     this.db.queryPlan({ kind: 'schema', op: { op: 'alterPropertyGraph', name: this.t0.graph, action: { kind: 'addType', type: t, table } } } as PlanStatementInput);
     this.types.set(t, table);
     return table;
-  }
-
-  /** smaltdb finds a graph's labels and types ignoring case; Cypher's are case-sensitive. */
-  private sameButCase(name: string, names: ReadonlyMap<string, string>, what: string): void {
-    for (const other of names.keys()) {
-      if (other.toLowerCase() === name.toLowerCase()) refuse(`the ${what} ${name} beside ${other} (a smaltdb property graph finds them ignoring case)`);
-    }
   }
 
   // SET and REMOVE.

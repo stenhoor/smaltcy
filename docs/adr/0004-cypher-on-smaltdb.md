@@ -21,10 +21,13 @@ kind ([smaltdb ADR 0039](https://github.com/stenhoor/smaltdb/blob/main/docs/adr/
   registered under a reserved label, `smaltcy:node`. `labels(n)` never shows it, and a Cypher write that uses it will
   be an error.
 - **Labels:** each Cypher label is a label of the graph (`alterPropertyGraph` `addLabel`), whose own table
-  (`<graph>_l<k>`) stays empty, and an entry in the graph's label index, `<graph>_labels`, one row per node and label.
+  (`<graph>_l<k>`, numbered, as smaltdb's table names ignore case) stays empty, and an entry in the graph's label index, `<graph>_labels`, one row per node and label.
   The index's rowid keeps a node's labels in the order it has them. A node with no labels has no entries. A label is
   found by a semi-join on the index; every label of a pattern is required.
-- **Relationships:** one edge table per type (`addType`: `start`, `end`, `props`, indexes on `start` and `end`). A
+- **Case:** labels and relationship types are case-sensitive in a smaltdb property graph (its `caseSensitive`, true by
+  default, stenhoor/smaltdb#265), as in Cypher: `Person` and `person` are two labels, each with its own table.
+- **Relationships:** one edge table per type (`addType`: `start`, `end`, `props`, indexes on `start` and `end`; the
+  table `<graph>_t<k>`). A
   relationship's rowid is its smaltcy id when the graph to load gives them (an `id` on each relationship), so `id(r)`
   is the same on both engines; otherwise relationships are numbered in order and `id(r)` is refused. A relationship's
   identity in the compiler is its type and rowid.
@@ -92,8 +95,7 @@ all it wrote, the labels and types it added included:
   keeps its kind). The ids are chosen by the runner, not by smaltdb: a node's is one more than the largest node id, a
   relationship's rowid one more than the largest rowid of any edge table (so it stays unique across types, and `id(r)`
   reads it); within a statement they count on. **New labels and types** are added with `alterPropertyGraph` (`addLabel`
-  / `addType`) the first time a write uses them; the reserved label `smaltcy:node`, and labels or types that differ from
-  the graph's only in case, are refused.
+  / `addType`) the first time a write uses them; the reserved label `smaltcy:node` is refused.
 - **SET and REMOVE** are `update`s of the `props` map in smaltdb (`map_merge`, `map_remove`), so the properties a write
   doesn't touch keep their stored kind: `n.k = v` sets one key (NULL removes it), `n = map` replaces the map, `n += map`
   merges it (its NULLs remove keys). A label is an entry in the label index, added or deleted. A NULL target is a no-op
@@ -166,17 +168,24 @@ It keeps Cypher's meaning:
 - **Quantifiers and list comprehensions** with Cypher's NULLs, over smaltdb's `each`.
 
 What it can't compile yet it refuses with `Unsupported`, which names the feature. What it can compile but whose meaning
-only the values show it can't keep (comparing two lists, ordering a list, adding a boolean) raises an error when a row
-reaches it, never a different answer: smaltdb has no function that raises a message, so this is a strict conversion of
-the message to an integer, an error whose text starts with `smaltcy:`.
+only the values show it can't keep (comparing two lists, ordering a list, `+` of a list, or of a string and a number,
+`%` of floats) raises an error when a row reaches it, never a different answer: smaltdb's `raise_error(message, code)`
+(stenhoor/smaltdb#264), which raises only where a row reaches it, with `Unsupported`'s code (`SMALTCY_UNSUPPORTED`) and
+message. Cypher's own errors that only the values show raise the same way with smaltcy's code and message, as its
+engine words them: a predicate that isn't a boolean (`WHERE must be a boolean, not INTEGER`), arithmetic of other kinds
+(`Can't add BOOLEAN and INTEGER`), a function given a value of the wrong kind (`sum() can't take a STRING`, `size()`,
+`abs()`, `toUpper()`, `toLower()`, negation), iterating over a value that isn't a list, and division by zero
+(`SMALTCY_TYPE`). The value's type in the message (`typeName`) is found from the value when the query runs.
 
 **The tests.** `test/smaltdb-differential.test.ts` runs every read case of the Cypher suite on smaltdb, from the same
 graph, and lists those the compiler refuses; the list can only shrink. `test/smaltdb-writes.test.ts` runs every write
 case of the Cypher suite (`test/helpers/write-cases.ts`, which `test/cypher-write.test.ts` runs on smaltcy's engine) and
 more sequences of writes on both engines, comparing after each statement the rows, the counts and the whole graph (ids,
 labels in order, properties, relationships), statements that fail on both (smaltdb rolled back, new labels and types
-included), and the writes it refuses. Two more sets run queries on both engines and
-compare their rows: over properties of every kind, and over relationships on a graph with self-loops, parallel
+included; the same error code and message as smaltcy's), and the writes it refuses. Two more sets run queries on both engines and
+compare their rows: over properties of every kind (and the errors values of the wrong kind raise: the same code and
+message on both), over labels and types spelled two ways (`Person` and `person`, `KNOWS` and `knows`, read and
+written), and over relationships on a graph with self-loops, parallel
 relationships of two types and a node with none (uniqueness, both directions, OPTIONAL MATCH with WHERE, type
 alternatives, variable length, paths). A third runs EXISTS, pattern predicates and pattern comprehensions on that
 graph: correlated on nodes and relationships, negated, nested, in OPTIONAL MATCH, with WHERE, in ORDER BY and
@@ -205,7 +214,7 @@ after an index exists and checks smaltdb's catalog.
   engine does. That is slow on large inputs; set-based plans for writes that can't see each other (no reads between
   them) would be faster, and are left for later. The runner takes a synchronous `queryPlan` (smaltdb's `Database` in a
   worker), not the client's asynchronous one yet.
-- **Writes refused** (`Unsupported`): the reserved label and labels or types differing from the graph's only in case;
+- **Writes refused** (`Unsupported`): the reserved label;
   DISTINCT with writes before and after it in one pipeline (smaltcy's passes rows on as they come); UNION with writes;
   MERGE with a parameter as a property map (the compiler's pattern maps); after a DELETE, `labels()`, `properties()`,
   `type()`, `startNode()`, `endNode()`, `nodes()` and `relationships()` (smaltcy's engine fails on a deleted node or
@@ -216,14 +225,14 @@ after an index exists and checks smaltdb's catalog.
   order.
 - `allShortestPaths` enumerates acyclic paths before ranking them, which can grow fast on a dense graph.
 - **Known differences, recorded rather than hidden:**
-  - smaltdb finds a graph's labels and types ignoring case when they are added; Cypher's are case-sensitive. A graph
-    with two labels (or types) that differ only in case is refused when it is loaded.
   - A smaltdb map keeps its keys sorted, so `keys(n)` can't give them in the order they were set: it is refused.
   - smaltdb compares text by its UTF-8 bytes, smaltcy by UTF-16 code units: the order of characters above U+FFFF
     against U+E000 to U+FFFF differs. Not guarded.
   - Integers are 64-bit on smaltdb: an overflow is an error, where smaltcy's numbers become inexact floats.
-  - Errors have smaltdb's codes and the `smaltcy:` messages above, not smaltcy's. The runner's own checks (deleting a
-    node with relationships, a relationship to NULL, values that can't be properties) raise smaltcy's errors.
+  - The errors above have smaltcy's codes and messages, and so do the runner's own checks (deleting a node with
+    relationships, a relationship to NULL, values that can't be properties); the tests compare them. Errors smaltdb
+    raises itself (an integer overflow, a limit) have smaltdb's codes and messages. Where several rows would fail, the
+    one reported is the first the engine reaches, which can differ (the planner's order, below).
   - New ids are one more than the largest: smaltcy's stores count on from the largest id they ever gave, so after the
     node (or relationship) with the largest id is deleted, or a statement that created some fails, smaltdb gives that
     id again where smaltcy gives the next one. With history, ids in past versions count (so only an id no version
@@ -253,3 +262,7 @@ after an index exists and checks smaltdb's catalog.
 - A third workaround went once smaltdb fixed it (stenhoor/smaltdb#263): an `update` whose input joins the target with a
   `values` plan (`UPDATE … FROM`) failed with `SMALT_INTERNAL` ("the physical planner declined a write") when the
   join had `ordered: true`; the runner's SET joins with `ordered: true` again.
+- A fourth workaround and a refusal went once smaltdb added what they lacked: errors were raised as a strict
+  conversion of a `smaltcy:` message to an integer (`cast_integer_strict`, an `SMALT_MISMATCH` error; now
+  `raise_error`, stenhoor/smaltdb#264), and graphs with labels or types that differ only in case were refused, when
+  loaded or written, while smaltdb found them ignoring case (stenhoor/smaltdb#265 made them case-sensitive).

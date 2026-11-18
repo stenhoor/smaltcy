@@ -90,19 +90,67 @@ describe("Cypher's meaning, where smaltdb's differs: both engines give the same 
     expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
   });
 
-  // Errors in Cypher, where smaltdb would give a value. The messages differ: smaltdb's start with `smaltcy:`.
+  // Errors in Cypher, where smaltdb would give a value: the plan raises smaltcy's error (smaltdb's raise_error), with
+  // its code and message.
   test.each([
     ['division by zero', 'RETURN 1 / 0 AS x'],
     ['a predicate that is not a boolean', 'MATCH (n:T) WHERE n.v RETURN n.k AS k'],
-    ['adding a boolean', 'MATCH (n:T) RETURN n.k AS k, n.v + 1 AS p ORDER BY k'],
+    ['adding a boolean', "MATCH (n:T) WHERE NOT n.k IN ['str', 'str2', 'list'] RETURN n.k AS k, n.v + 1 AS p ORDER BY k"],
+    ['adding a boolean to a float', "MATCH (n:T) WHERE n.k = 'true' RETURN 1.5 + n.v AS p"],
+    ['subtracting from a string', "MATCH (n:T) WHERE n.k = 'str' RETURN n.v - 1 AS p"],
+    ['multiplying a boolean', "MATCH (n:T) WHERE n.k = 'true' RETURN n.v * 1.5 AS p"],
+    ['dividing a list', "MATCH (n:T) WHERE n.k = 'list' RETURN n.v / 2 AS p"],
+    ['the modulo of a string', "MATCH (n:T) WHERE n.k = 'str' RETURN n.v % 2 AS p"],
     ['sum of a string', 'MATCH (n:T) RETURN sum(n.v) AS s'],
-  ])('both engines refuse %s', (_name, cypher) => {
-    expect(() => g.query(cypher)).toThrow();
-    expect(() => onSmaltdb(db, tables, cypher)).toThrow(/smaltcy: /);
+    ['avg of a boolean', "MATCH (n:T) WHERE n.k = 'true' RETURN avg(n.v) AS a"],
+    ['size of a boolean', "MATCH (n:T) WHERE n.k = 'true' RETURN size(n.v) AS s"],
+    ['size of a number', "MATCH (n:T) WHERE n.k = 'int' RETURN size(n.v) AS s"],
+    ['abs of a boolean', "MATCH (n:T) WHERE n.k = 'true' RETURN abs(n.v) AS a"],
+    ['negating a string', "MATCH (n:T) WHERE n.k = 'str' RETURN -n.v AS a"],
+    ['toUpper of a number', "MATCH (n:T) WHERE n.k = 'float' RETURN toUpper(n.v) AS u"],
+    ['a list comprehension over a number', "MATCH (n:T) WHERE n.k = 'float' RETURN [x IN n.v | x] AS l"],
+    ['a quantifier over a boolean', "MATCH (n:T) WHERE n.k = 'true' RETURN any(x IN n.v WHERE x = 1) AS a"],
+    ["a list comprehension's predicate that is not a boolean", "MATCH (n:T) WHERE n.k = 'list' RETURN [x IN n.v WHERE x | x] AS l"],
+    ["a quantifier's predicate that is not a boolean", "MATCH (n:T) WHERE n.k = 'list' RETURN all(x IN n.v WHERE x) AS a"],
+    ['NOT of a string', "MATCH (n:T) WHERE n.k = 'str' RETURN NOT n.v AS a"],
+    ['AND of a number', "MATCH (n:T) WHERE n.k = 'int' RETURN n.v AND true AS a"],
+    ['a CASE condition that is not a boolean', "MATCH (n:T) WHERE n.k = 'int' RETURN CASE WHEN n.v THEN 1 END AS c"],
+  ])('both engines raise the same error: %s', (_name, cypher) => {
+    const error = (run: () => unknown) => {
+      try {
+        run();
+      } catch (e) {
+        return { code: (e as { code: string }).code, message: (e as Error).message };
+      }
+      return undefined;
+    };
+    const mine = error(() => g.query(cypher));
+    expect(mine?.code).toBe('SMALTCY_TYPE');
+    expect(error(() => onSmaltdb(db, tables, cypher))).toEqual(mine);
   });
 
-  test('lists in ORDER BY are refused when they are met (smaltdb orders them by their bytes)', () => {
-    expect(() => onSmaltdb(db, tables, 'MATCH (n:T) RETURN n.v ORDER BY n.v')).toThrow(/smaltcy: ordering lists and maps/);
+  // Values whose Cypher meaning the compiler can't keep yet: refused when a row meets them, with Unsupported's code and
+  // message, where smaltcy gives a value.
+  test.each([
+    ['lists in ORDER BY (smaltdb orders them by their bytes)', 'MATCH (n:T) RETURN n.v ORDER BY n.v', 'ordering lists and maps'],
+    ['lists compared with <', "MATCH (n:T) WHERE n.k = 'list' RETURN n.v < n.v AS l", 'ordering of lists and maps'],
+    ['the modulo of a float', "MATCH (n:T) WHERE n.k = 'float' RETURN n.v % 1 AS m", '% of floats'],
+    ['+ of a list and a value', "MATCH (n:T) WHERE n.k = 'list' RETURN n.v + 1 AS p", '+ of a list, or of a string and a number or a boolean'],
+    ['+ of a string and a number', "MATCH (n:T) WHERE n.k = 'str' RETURN n.v + 1 AS p", '+ of a list, or of a string and a number or a boolean'],
+  ])('refused when met: %s', (_name, cypher, feature) => {
+    expect(() => g.query(cypher)).not.toThrow();
+    let error: unknown;
+    try {
+      onSmaltdb(db, tables, cypher);
+    } catch (e) {
+      error = e;
+    }
+    expect({ code: (error as { code: string }).code, message: (error as Error).message }).toEqual({ code: 'SMALTCY_UNSUPPORTED', message: new Unsupported(feature).message });
+  });
+
+  test('size of a map, as smaltcy gives it', () => {
+    const cypher = 'RETURN size({a: 1, b: 2}) AS s';
+    expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
   });
 });
 
@@ -242,6 +290,43 @@ describe('nested plans: both engines give the same rows', () => {
   });
 });
 
+/** Labels and relationship types that differ only in case: two of each, as in Cypher (smaltdb's graphs are case-sensitive). */
+const CASES = `CREATE (a:Person {k: 'a'}), (b:person {k: 'b'}), (c:Person:person {k: 'c'}), (d:PERSON {k: 'd'}),
+  (a)-[:KNOWS {w: 1}]->(b), (b)-[:knows {w: 2}]->(c), (c)-[:KNOWS {w: 3}]->(a), (a)-[:knows {w: 4}]->(d), (d)-[:Knows {w: 5}]->(a)`;
+
+describe('labels and types that differ only in case: both engines give the same rows', () => {
+  const g = open();
+  g.run(CASES);
+  const { db, tables } = both(g);
+  test('each spelling is a label and a type of its own in smaltdb, with a table of its own', () => {
+    expect([...tables.labelTables.keys()]).toEqual(['Person', 'person', 'PERSON']);
+    expect([...tables.types.keys()]).toEqual(['KNOWS', 'knows', 'Knows']);
+    const names = [...tables.labelTables.values(), ...tables.types.values()].map((n) => n.toLowerCase());
+    expect(new Set(names).size).toBe(names.length);
+    expect(db.catalog.graph('graph')!.nodes.map((n) => n.label)).toEqual(['smaltcy:node', 'Person', 'person', 'PERSON']);
+    expect(db.catalog.graph('graph')!.edges.map((e) => e.type)).toEqual(['KNOWS', 'knows', 'Knows']);
+  });
+  test.each([
+    ['each label', 'MATCH (n:Person) RETURN n.k AS k ORDER BY k'],
+    ['the other spelling', 'MATCH (n:person) RETURN n.k AS k ORDER BY k'],
+    ['both labels', 'MATCH (n:Person:person) RETURN n.k AS k'],
+    ['a spelling no node has', 'MATCH (n:PERSON) RETURN n.k AS k'],
+    ['a spelling the graph lacks', 'MATCH (n:PeRsOn) RETURN n.k AS k'],
+    ['labels in order', 'MATCH (n) RETURN n.k AS k, labels(n) AS l ORDER BY k'],
+    ['label tests', 'MATCH (n) RETURN n.k AS k, n:Person AS a, n:person AS b, n:PERSON AS c ORDER BY k'],
+    ['each type', 'MATCH (x)-[r:KNOWS]->(y) RETURN r.w AS w, x.k AS x, y.k AS y ORDER BY w'],
+    ['the other spelling of a type', 'MATCH (x)-[r:knows]->(y) RETURN r.w AS w, type(r) AS t ORDER BY w'],
+    ['type alternatives', 'MATCH ()-[r:KNOWS|Knows]->() RETURN r.w AS w, type(r) AS t ORDER BY w'],
+    ['a type the graph lacks', 'MATCH ()-[r:kNoWs]->() RETURN r.w AS w'],
+    ['every relationship and its type', 'MATCH ()-[r]->() RETURN r.w AS w, type(r) AS t ORDER BY w'],
+    ['variable length over one spelling', "MATCH (a {k: 'a'})-[:KNOWS*1..3]->(b) RETURN b.k AS k ORDER BY k"],
+    ['a pattern with labels and types of both spellings', 'MATCH (a:Person)-[:knows]->(b:person) RETURN a.k AS a, b.k AS b ORDER BY a, b'],
+    ['EXISTS with one spelling', 'MATCH (n) WHERE EXISTS { (n)-[:knows]->(:person) } RETURN n.k AS k ORDER BY k'],
+  ])('%s', (_name, cypher) => {
+    expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
+  });
+});
+
 describe('the graph in smaltdb', () => {
   test('nodes, labels in order, and relationships by type', () => {
     const { db, tables } = both(social());
@@ -252,10 +337,7 @@ describe('the graph in smaltdb', () => {
     expect(db.catalog.graph('graph')!.nodes.map((n) => n.label)).toEqual(['smaltcy:node', 'Person', 'Admiral', 'City']);
   });
 
-  test('a label spelled two ways, or the reserved label, is refused', () => {
-    const g = open();
-    g.run('CREATE (:Person), (:person)');
-    expect(() => graphTablesFor(dumpGraph(g.store))).toThrow(/differ only in case/);
+  test('the reserved label is refused', () => {
     const h = open();
     h.run('CREATE (:`smaltcy:node`)');
     expect(() => graphTablesFor(dumpGraph(h.store))).toThrow(/reserved/);
