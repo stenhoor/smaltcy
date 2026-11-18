@@ -51,13 +51,77 @@ export interface CompileOptions {
    * number an `int`). A parameter not given here is refused.
    */
   readonly params?: Readonly<Record<string, unknown>>;
+  /**
+   * The past to read, found already (the runner resolves `AT VERSION` and `AT TIME` against the history): replaces
+   * the plan's own `asOf`, which is otherwise read from its literal or parameter.
+   */
+  readonly asOf?: AsOf;
+}
+
+/** The past a query reads (`AT VERSION`, `AT TIME`): a smaltdb commit id, or a time in milliseconds since 1970. */
+export type AsOf = { readonly commit: number } | { readonly time: number };
+
+/**
+ * A plan's `AT VERSION` or `AT TIME`, its literal or parameter read and checked as smaltcy's engine checks it: a
+ * version is a whole number (a smaltdb commit id, ADR 0004), a time milliseconds since 1970, an ISO 8601 text or a
+ * `Date`. Undefined when the plan reads the present.
+ */
+export function asOfOf(gp: GraphPlan, params: Readonly<Record<string, unknown>>): AsOf | undefined {
+  if (gp.kind !== 'query' || !gp.asOf) return undefined;
+  const value = (x: Expr): unknown => {
+    if (x.k === 'lit') return x.v;
+    if (x.k === 'param') {
+      const v = params[x.name];
+      if (v === undefined) throw new SmaltcyError('SMALTCY_PARAM', `Missing parameter $${x.name}`);
+      return v;
+    }
+    throw new SmaltcyError('SMALTCY_PLAN', 'asOf takes a literal or a parameter');
+  };
+  if ('version' in gp.asOf) {
+    const v = value(gp.asOf.version);
+    if (typeof v !== 'number' || !Number.isInteger(v)) throw new SmaltcyError('SMALTCY_TYPE', `AT VERSION takes a whole number, not ${JSON.stringify(v)}`);
+    return { commit: v };
+  }
+  const t = value(gp.asOf.time);
+  const ms = typeof t === 'number' ? t : typeof t === 'string' ? Date.parse(t) : t instanceof Date ? t.getTime() : NaN;
+  if (!Number.isFinite(ms)) throw new SmaltcyError('SMALTCY_TYPE', `AT TIME takes milliseconds since 1970 or an ISO 8601 date and time, not ${JSON.stringify(t)}`);
+  return { time: ms };
+}
+
+/** smaltcy's error for a graph that keeps no history, asked for its past. */
+export const noHistory = (): never => {
+  throw new SmaltcyError('SMALTCY_UNSUPPORTED', 'The graph keeps no history, so it has no past versions to read');
+};
+
+/** smaltdb's table of commits (`id`, `time`, `author`, `message`): a database with a graph that keeps history has one. */
+export const COMMITS_TABLE = 'smalt_commits';
+
+/**
+ * A compiled plan reading the past: every scan of the graph's tables (in subqueries too) reads them as of `asOf`.
+ * smaltdb's `paths` reads its edge tables as they are now, so variable-length relationships and shortest paths are
+ * refused.
+ */
+function readAsOf<T>(x: T, t: GraphTables, asOf: AsOf): T {
+  const graph = new Set([t.nodes, t.labels, ...t.labelTables.values(), ...t.types.values()].map((n) => n.toLowerCase()));
+  const at = 'commit' in asOf ? { commit: lit(asOf.commit) } : { time: lit(asOf.time) };
+  const walk = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(walk);
+    if (v === null || typeof v !== 'object') return v;
+    const o = v as Record<string, unknown>;
+    if (o.op === 'paths') unsupported('variable-length relationships and shortest paths with AT VERSION or AT TIME (smaltdb reads them in the present)');
+    const out = Object.fromEntries(Object.entries(o).map(([k, e]) => [k, walk(e)]));
+    if (o.op === 'scan' && graph.has(String(o.table).toLowerCase())) out.asOf = at;
+    return out;
+  };
+  return walk(x) as T;
 }
 
 /** Compiles a graph plan (a query that reads) to a smaltdb query statement. */
 export function compileQuery(gp: GraphPlan, tables: GraphTables, options: CompileOptions = {}): CompiledQuery {
   if (gp.kind !== 'query') return unsupported('index plans');
-  if (gp.asOf) unsupported('AT VERSION and AT TIME');
-  const c = new Compiler(tables, options.params ?? {});
+  const asOf = gp.asOf ? (options.asOf ?? asOfOf(gp, options.params ?? {})) : undefined;
+  if (asOf && !tables.history) noHistory();
+  const c = new Compiler(tables, options.params ?? {}, asOf);
   const { plan: root, frame } = c.op(gp.root);
   const exprs: PlanExpr[] = [];
   const columns: PlanColumn[] = [];
@@ -74,8 +138,9 @@ export function compileQuery(gp: GraphPlan, tables: GraphTables, options: Compil
       columns.push({ name: col.name, type: r.t });
     }
   }
+  const plan: PlanOp = { op: 'project', input: root, exprs };
   return {
-    statement: { kind: 'query', plan: { op: 'project', input: root, exprs }, columns },
+    statement: { kind: 'query', plan: asOf ? readAsOf(plan, tables, asOf) : plan, columns },
     columns: gp.columns.map((col) => col.name),
     params: c.paramNames,
   };
@@ -350,6 +415,8 @@ export class Compiler {
   constructor(
     private readonly t: GraphTables,
     private readonly params: Readonly<Record<string, unknown>>,
+    /** The past the plan reads (`AT VERSION`, `AT TIME`): what `version()` gives. */
+    private readonly asOf?: AsOf,
   ) {}
 
   // Operations.
@@ -1571,9 +1638,29 @@ export class Compiler {
         const list = call('coalesce', [{ k: 'subquery', mode: 'scalar', plan: agg, type: IDS, collation: 'binary' }, call('list_of', [], IDS)], IDS);
         return value(caseWhen([[or(...vs.map((v) => isNull(v.e))), NULL]], list, IDS), IDS);
       }
+      case 'version':
+        return this.version();
+      case 'commits': case 'commit': case 'history':
+        // smaltdb records a commit's id, time, author and message (smalt_commits); smaltcy's commit maps also hold
+        // its counts and the graph's size, and history() each change, which smaltdb doesn't record.
+        return unsupported(`${fn}(), whose commit maps hold counts and changes smaltdb doesn't record`);
       default:
         return unsupported(`the function ${fn}()`);
     }
+  }
+
+  /**
+   * `version()`: the version the query reads, a smaltdb commit id (ADR 0004). `AT VERSION v` reads v; otherwise the
+   * last commit recorded in `smalt_commits` (at or before `AT TIME`'s moment), 0 before the first. NULL for a graph
+   * that keeps no history, as smaltcy gives it.
+   */
+  private version(): Val {
+    if (!this.t.history) return literal(null);
+    if (this.asOf && 'commit' in this.asOf) return { k: 'value', e: lit(this.asOf.commit), t: 'int' };
+    let commits: PlanOp = { op: 'scan', table: COMMITS_TABLE, columns: [0, 1] };
+    if (this.asOf) commits = { op: 'filter', input: commits, pred: call('cmp_le', [colRef(1, 'int'), lit(this.asOf.time)], 'bool') };
+    const last: PlanOp = { op: 'aggregate', input: commits, keys: [], aggs: [{ fn: 'max', args: [colRef(0, 'int')], star: false, distinct: false, collation: 'binary', type: 'int' }], carry: [] };
+    return { k: 'value', e: call('coalesce', [{ k: 'subquery', mode: 'scalar', plan: last, type: 'int', collation: 'binary' }, lit(0)], 'int'), t: 'int' };
   }
 
   /** A value that must be a number: anything else (but NULL) is Cypher's type error. */

@@ -296,3 +296,32 @@ describe('transactions on smaltdb', () => {
     expect(r.tables).toBe(p.tables);
   });
 });
+
+describe('indexes on smaltdb', () => {
+  /** The graph's indexes in smaltdb's catalog: name and table. */
+  const indexes = (db: Database) =>
+    (db.queryPlan({ kind: 'query', plan: { op: 'scan', table: 'sqlite_schema', columns: [0, 1, 2] } }).rows as string[][])
+      .filter(([type, name]) => type === 'index' && name!.startsWith('graph_ix_'))
+      .map(([, name, table]) => [name, table]);
+  const hex = (x: string) => Buffer.from(x).toString('hex');
+
+  test('an index is an expression index on the node table, and results stay the same', () => {
+    const p = start('social');
+    p.run('CREATE INDEX FOR (p:Person) ON (p.name)');
+    p.run('CREATE INDEX FOR (p:Person) ON (p.name)');
+    // Cypher's labels differ by case; smaltdb's names don't, so each has its own index.
+    p.run('CREATE INDEX FOR (p:person) ON (p.name)');
+    expect(indexes(p.db)).toEqual([[`graph_ix_${hex('Person')}_${hex('name')}`, 'graph_node'], [`graph_ix_${hex('person')}_${hex('name')}`, 'graph_node']]);
+    for (const cypher of [
+      "MATCH (p:Person {name: 'Grace'}) RETURN p.born AS b",
+      "MATCH (p:Person {name: 'Grace'}) SET p.name = 'Grace H'",
+      "MATCH (p:Person {name: 'Grace'}) RETURN p.born AS b",
+      "MATCH (p:Person) WHERE p.name = 'Grace H' RETURN p.born AS b",
+      "CREATE (:City {name: 'Ada'})",
+      "MATCH (p:Person {name: 'Ada'}) RETURN count(p) AS n",
+      'DROP INDEX ON :Person(name)',
+      'DROP INDEX ON :Person(name)',
+    ]) p.run(cypher);
+    expect(indexes(p.db)).toEqual([[`graph_ix_${hex('person')}_${hex('name')}`, 'graph_node']]);
+  });
+});

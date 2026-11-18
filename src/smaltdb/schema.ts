@@ -11,6 +11,8 @@
  * - One edge table per relationship type, `<graph>_t<k>` (`start`, `end`, `props`), with indexes on `start` and `end`.
  *   A relationship's rowid is its smaltcy id when the graph to load gives them (`id`), so `id(r)` reads the same;
  *   otherwise relationships are numbered from 0 in order, across the tables, and `id(r)` is refused.
+ * - A graph that keeps history (`history`, smaltcy's `open({ history })`) is a property graph with smaltdb's
+ *   `history`: all its tables keep their past versions, and every commit that writes them is a version.
  */
 import type { plan, PlanStatementInput } from 'smaltdb/engine';
 import { SmaltcyError } from '../errors.js';
@@ -33,6 +35,11 @@ export interface GraphTables {
   readonly types: ReadonlyMap<string, string>;
   /** Whether a relationship's rowid is its smaltcy id (the graph was loaded with them): what `id(r)` needs. */
   readonly relationshipIds: boolean;
+  /**
+   * How the graph keeps its history, when it does (smaltdb's `history` on the property graph: every table of the graph
+   * keeps it, `versions` being smaltdb's default method): what `AT VERSION`, `AT TIME` and `version()` read.
+   */
+  readonly history?: 'versions' | 'log';
 }
 
 /** A graph to load: GraphJSON's shape (`dumpGraph` in `@smaltworks/smaltcy/engine` gives one). */
@@ -104,7 +111,10 @@ export function graphTablesFor(data: GraphData, graph = 'graph'): GraphTables {
 
 const schema = (op: plan.SchemaOp): PlanStatementInput => ({ kind: 'schema', op }) as PlanStatementInput;
 
-/** The statements that make the graph's tables and property graph, run in order on an empty database. */
+/**
+ * The statements that make the graph's tables and property graph, run in order on an empty database. With `history`,
+ * the node table and the graph keep it, and smaltdb makes the graph's other tables keep it too.
+ */
 export function schemaStatements(t: GraphTables): PlanStatementInput[] {
   const column = (name: string, type: plan.StorageType, declaredType: string): plan.ColumnDef => ({ name, declaredType, type, notNull: false, collation: 'binary' });
   const nodeTable = {
@@ -115,11 +125,12 @@ export function schemaStatements(t: GraphTables): PlanStatementInput[] {
     checks: [],
     foreignKeys: [],
     storage: 'row',
+    ...(t.history ? { history: t.history } : {}),
   } as plan.TableDef;
   const alter = (action: Extract<plan.SchemaOp, { op: 'alterPropertyGraph' }>['action']) => schema({ op: 'alterPropertyGraph', name: t.graph, action });
   return [
     schema({ op: 'createTable', table: nodeTable, temp: false, ifNotExists: false } as plan.SchemaOp),
-    schema({ op: 'createPropertyGraph', ifNotExists: false, graph: { name: t.graph, nodes: [{ label: NODE_LABEL, table: t.nodes, id: 'id', props: 'props' }], edges: [] } }),
+    schema({ op: 'createPropertyGraph', ifNotExists: false, graph: { name: t.graph, nodes: [{ label: NODE_LABEL, table: t.nodes, id: 'id', props: 'props' }], edges: [], ...(t.history ? { history: t.history } : {}) } }),
     alter({ kind: 'addLabelIndex', table: t.labels }),
     ...[...t.labelTables].map(([label, table]) => alter({ kind: 'addLabel', label, table })),
     ...[...t.types].map(([type, table]) => alter({ kind: 'addType', type, table })),
