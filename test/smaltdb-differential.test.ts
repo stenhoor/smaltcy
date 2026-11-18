@@ -171,13 +171,11 @@ describe('relationships: both engines give the same rows', () => {
   });
 
   test("a variable-length relationship's hops are not bound again by a later hop (Cypher's uniqueness)", () => {
-    // smaltcy's own engine expands the variable-length relationship first here and doesn't count its hops as used, so
-    // it also gives the rows whose r is one of rs; smaltdb gives the others, as Cypher does.
     const cypher = "MATCH (x {k: 'a'})-[rs:R*1..2]-(y)-[r:R]-(z) RETURN [q IN rs | q.w] AS ws, r.w AS w";
-    const all = g.query(cypher) as { ws: number[]; w: number }[];
-    const unique = all.filter((row) => !row.ws.includes(row.w));
-    expect(unique.length).toBeLessThan(all.length);
-    expect(sorted(onSmaltdb(db, tables, cypher))).toEqual(sorted(unique));
+    const rows = g.query(cypher) as { ws: number[]; w: number }[];
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((row) => !row.ws.includes(row.w))).toBe(true);
+    expect(sorted(onSmaltdb(db, tables, cypher))).toEqual(sorted(rows));
   });
 
   test('id(r) and relationships in results are refused when the graph was loaded without relationship ids', () => {
