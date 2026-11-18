@@ -71,6 +71,44 @@ one MATCH are refused.
   (`kind`, `id`, `labels` or `type`, `start` and `end`, `properties`; a path's `nodes` and `relationships`).
   `collect()` of nodes is a list of their ids.
 
+**Writes** (`src/smaltdb/write.ts`, `runOnSmaltdb`) run as smaltcy's engine runs them, row by row, on a smaltdb
+`Database` given by type only (its synchronous `queryPlan`). A statement that only reads is one query; one that writes is
+several smaltdb statements, in a savepoint (inside the caller's transaction when there is one), so an error rolls back
+all it wrote, the labels and types it added included:
+
+- **Rows stream.** Each row goes through the writes and the operations between them (`project`, `filter`, `unwind`,
+  `match`) before the next row starts, so a write sees what earlier rows wrote (`UNWIND … MERGE` finds what it created
+  for an earlier row; `SET c.n = c.n + 1` counts up), and a LIMIT stops what feeds it, as in smaltcy's engine. The
+  runner holds the rows as the compiler's columns; an operation on a row is a smaltdb query over that row (a `values`
+  plan, with `any` columns as one-element `list<any>` columns, so booleans, lists and maps keep their kind), and EAGER,
+  ORDER BY and aggregates one query over all their rows. What reads before any write, or doesn't read the graph, is one
+  query.
+- **Entities are read live.** A row holds a node's id and a relationship's type and rowid; every query over it reads
+  their properties from their tables again. Values computed before a write keep what they were. Nodes, relationships and
+  paths in the results are read once the statement is done, as smaltcy's engine reads them (a deleted node with no
+  labels or properties, a deleted relationship with no type or ends).
+- **CREATE** appends each new node (`id`, `props`) and its label-index entries, then each relationship to its type's
+  edge table, with the property maps evaluated against the row as it is (a map literal's entries one by one, so each
+  keeps its kind). The ids are chosen by the runner, not by smaltdb: a node's is one more than the largest node id, a
+  relationship's rowid one more than the largest rowid of any edge table (so it stays unique across types, and `id(r)`
+  reads it); within a statement they count on. **New labels and types** are added with `alterPropertyGraph` (`addLabel`
+  / `addType`) the first time a write uses them; the reserved label `smaltcy:node`, and labels or types that differ from
+  the graph's only in case, are refused.
+- **SET and REMOVE** are `update`s of the `props` map in smaltdb (`map_merge`, `map_remove`), so the properties a write
+  doesn't touch keep their stored kind: `n.k = v` sets one key (NULL removes it), `n = map` replaces the map, `n += map`
+  merges it (its NULLs remove keys). A label is an entry in the label index, added or deleted. A NULL target is a no-op
+  (its value not computed), a deleted one too; a value that isn't a node or relationship is smaltcy's type error, and a
+  map or a list of lists as a property its storable-value error.
+- **DELETE** deletes a relationship's row, or a node's after checking it has none (smaltcy's error and message
+  otherwise; smaltdb's own rule backs it); DETACH deletes the node's relationships first. Paths delete their
+  relationships, then their nodes; lists of nodes and of relationships each element. The label index's entries go with
+  the node (smaltdb's rules on a graph's tables).
+- **MERGE** matches the whole pattern for each row (the compiler's match, with its uniqueness); every match goes through
+  ON MATCH, or, with none, the pattern is created (its unbound nodes and its relationships, in the pattern's direction)
+  and goes through ON CREATE.
+- **Counts** are smaltcy's (`nodesCreated` … `labelsRemoved`), counted as its engine counts them (a property set to
+  NULL counts, a label already there doesn't).
+
 It keeps Cypher's meaning:
 
 - **Comparisons by kind:** `=` is NULL with a NULL and false across kinds (`true = 1` is false), `<` is NULL across
@@ -90,7 +128,11 @@ reaches it, never a different answer: smaltdb has no function that raises a mess
 the message to an integer, an error whose text starts with `smaltcy:`.
 
 **The tests.** `test/smaltdb-differential.test.ts` runs every read case of the Cypher suite on smaltdb, from the same
-graph, and lists those the compiler refuses; the list can only shrink. Two more sets run queries on both engines and
+graph, and lists those the compiler refuses; the list can only shrink. `test/smaltdb-writes.test.ts` runs every write
+case of the Cypher suite (`test/helpers/write-cases.ts`, which `test/cypher-write.test.ts` runs on smaltcy's engine) and
+more sequences of writes on both engines, comparing after each statement the rows, the counts and the whole graph (ids,
+labels in order, properties, relationships), statements that fail on both (smaltdb rolled back, new labels and types
+included), and the writes it refuses. Two more sets run queries on both engines and
 compare their rows: over properties of every kind, and over relationships on a graph with self-loops, parallel
 relationships of two types and a node with none (uniqueness, both directions, OPTIONAL MATCH with WHERE, type
 alternatives, variable length, paths). A third runs EXISTS, pattern predicates and pattern comprehensions on that
@@ -99,7 +141,18 @@ aggregates.
 
 ## Consequences
 
-- Reads compile now (58 of the 59 read cases). `keys()` (below) and writes are later slices.
+- Reads compile now (58 of the 59 read cases); `keys()` (below) is refused. Writes run (all 14 write cases, and the
+  sequences in `test/smaltdb-writes.test.ts`). `range()` compiles to smaltdb's `range` table function.
+- A write is many smaltdb statements: queries and writes for each row, as the runner streams rows the way smaltcy's
+  engine does. That is slow on large inputs; set-based plans for writes that can't see each other (no reads between
+  them) would be faster, and are left for later. The runner takes a synchronous `queryPlan` (smaltdb's `Database` in a
+  worker), not the client's asynchronous one yet.
+- **Writes refused** (`Unsupported`): the reserved label and labels or types differing from the graph's only in case;
+  DISTINCT with writes before and after it in one pipeline (smaltcy's passes rows on as they come); UNION with writes;
+  MERGE with a parameter as a property map (the compiler's pattern maps); after a DELETE, `labels()`, `properties()`,
+  `type()`, `startNode()`, `endNode()`, `nodes()` and `relationships()` (smaltcy's engine fails on a deleted node or
+  relationship, smaltdb would give a value), and paths and lists of nodes or relationships in its results (smaltcy's
+  engine gives a deleted one as an empty one, smaltdb's lists would drop it).
 - An OPTIONAL MATCH puts its input's plan in the smaltdb plan twice, so a query's plan doubles with each one; smaltdb
   runs that input twice. Every operation the compiler makes keeps an order, so both give the same rows in the same
   order.
@@ -111,7 +164,11 @@ aggregates.
   - smaltdb compares text by its UTF-8 bytes, smaltcy by UTF-16 code units: the order of characters above U+FFFF
     against U+E000 to U+FFFF differs. Not guarded.
   - Integers are 64-bit on smaltdb: an overflow is an error, where smaltcy's numbers become inexact floats.
-  - Errors have smaltdb's codes and the `smaltcy:` messages above, not smaltcy's.
+  - Errors have smaltdb's codes and the `smaltcy:` messages above, not smaltcy's. The runner's own checks (deleting a
+    node with relationships, a relationship to NULL, values that can't be properties) raise smaltcy's errors.
+  - New ids are one more than the largest: smaltcy's stores count on from the largest id they ever gave, so after the
+    node (or relationship) with the largest id is deleted, or a statement that created some fails, smaltdb gives that
+    id again where smaltcy gives the next one.
   - Where a `shortestPath` has several shortest paths, Cypher returns any one: smaltdb's may be another than
     smaltcy's.
   - A node's or relationship's `properties` in a result come back with their keys sorted (a smaltdb map), where
@@ -126,3 +183,6 @@ aggregates.
 - Two workarounds for smaltdb's planner (a sort key that is an expression over a project or filter, and `values` with
   no rows) went once smaltdb fixed both (stenhoor/smaltdb#262): the compiler gives sort keys as expressions and an
   empty edge source as `values` with `rows: []`.
+- A workaround for smaltdb, recorded for when it is fixed: an `update` whose input joins the target with a `values` plan
+  (`UPDATE … FROM`) fails with `SMALT_INTERNAL` ("the physical planner declined a write") when the join has
+  `ordered: true`; the runner's SET leaves `ordered` out there.

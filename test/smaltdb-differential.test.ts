@@ -4,8 +4,9 @@ import { compile } from '../src/cypher/index.js';
 import { dumpGraph } from '../src/engine/io.js';
 import { open, type Graph } from '../src/index.js';
 import { compileQuery, paramValues, Unsupported } from '../src/smaltdb/compile.js';
-import { graphTablesFor, loadStatements, schemaStatements, type GraphData, type GraphTables } from '../src/smaltdb/schema.js';
+import { graphTablesFor, type GraphTables } from '../src/smaltdb/schema.js';
 import { social } from './helpers/graphs.js';
+import { both, dataOf } from './helpers/smaltdb.js';
 import { READ_CASES, READ_PARAMS } from './helpers/read-cases.js';
 
 /**
@@ -21,23 +22,6 @@ import { READ_CASES, READ_PARAMS } from './helpers/read-cases.js';
 const UNSUPPORTED = new Map<string, string>([
   ['labels and keys', 'keys() (a smaltdb map keeps its keys sorted)'],
 ]);
-
-/** A store's graph to load, with its relationship ids (`dumpGraph` gives relationships in id order, without them). */
-function dataOf(g: Graph): GraphData {
-  const data = dumpGraph(g.store);
-  const ids: number[] = [];
-  g.store.scanRels(null, (id) => void ids.push(id));
-  return { ...data, relationships: data.relationships.map((r, i) => ({ ...r, id: ids[i]! })) };
-}
-
-/** A smaltcy graph and the same graph in a smaltdb database. */
-function both(g: Graph): { g: Graph; db: Database; tables: GraphTables } {
-  const data = dataOf(g);
-  const tables = graphTablesFor(data);
-  const db = Database.openMemory();
-  for (const st of [...schemaStatements(tables), ...loadStatements(data, tables)]) db.queryPlan(st);
-  return { g, db, tables };
-}
 
 /** Runs a Cypher query on smaltdb: its rows as objects keyed by column, as `Graph.query` gives them. */
 function onSmaltdb(db: Database, tables: GraphTables, cypher: string, params: Record<string, unknown> = {}) {
