@@ -3,6 +3,7 @@ import { open, SmaltcyError, type Graph } from '@smaltworks/smaltcy';
 import { HistoryStore, snapshotOf, type GraphDiff, type GraphSnapshot } from '@smaltworks/smaltcy/history';
 import { network, ontology, social } from '@smaltworks/smaltcy/datasets';
 import { createHandler } from '@smaltworks/smaltcy/worker-runtime';
+import { EVOLVING, randomSteps } from './helpers/history-cases.js';
 
 /** A snapshot in a canonical order, for comparing. */
 function canon(s: GraphSnapshot): unknown {
@@ -40,36 +41,24 @@ function applyDiff(s: GraphSnapshot, d: GraphDiff): GraphSnapshot {
 
 /** Random writes, one commit each (some in multi-statement transactions, some rolled back), recording every version. */
 function randomHistory(seed: number, commits: number, checkpointEvery = 7): { g: Graph; versions: GraphSnapshot[] } {
-  let s = seed;
-  const rand = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 2 ** 32);
-  const pick = <T>(a: readonly T[]) => a[Math.floor(rand() * a.length)]!;
   let t = Date.UTC(2026, 0, 1);
   const g = open({ history: { checkpointEvery, clock: () => (t += 60_000), author: 'test' } });
   const versions: GraphSnapshot[] = [snapshotOf(g.store, 0)];
-  const statements = [
-    () => `CREATE (:${pick(['A', 'B', 'C'])} {k: ${Math.floor(rand() * 5)}, name: 'n${Math.floor(rand() * 1000)}'})`,
-    () => `MATCH (a), (b) WHERE id(a) = ${Math.floor(rand() * 40)} AND id(b) = ${Math.floor(rand() * 40)} CREATE (a)-[:R {w: ${Math.floor(rand() * 9)}}]->(b)`,
-    () => `MATCH (n) WHERE id(n) % 3 = ${Math.floor(rand() * 3)} SET n.k = ${Math.floor(rand() * 9)}`,
-    () => `MATCH (n:A) WHERE n.k = ${Math.floor(rand() * 5)} SET n:Tagged REMOVE n.name`,
-    () => `MATCH (n:Tagged) REMOVE n:Tagged SET n.name = 'back'`,
-    () => `MATCH (n) WHERE id(n) = ${Math.floor(rand() * 40)} DETACH DELETE n`,
-    () => `MATCH ()-[r:R]->() WHERE r.w = ${Math.floor(rand() * 9)} DELETE r`,
-    () => `MATCH ()-[r:R]->() WHERE r.w > 4 SET r.w = r.w - 1, r.seen = true`,
-  ];
+  const steps = randomSteps(seed);
   while (g.version! < commits) {
     const before = g.version!;
-    const roll = rand();
-    if (roll < 0.1) {
+    const step = steps.next().value;
+    if (step.kind === 'fail') {
       // A transaction that fails changes nothing and makes no version.
       expect(() => g.transaction((tx) => {
-        tx.run(pick(statements)());
+        tx.run(step.statement);
         throw new Error('stop');
       })).toThrow('stop');
       expect(g.version).toBe(before);
       continue;
     }
-    if (roll < 0.25) g.transaction((tx) => { tx.run(pick(statements)()); tx.run(pick(statements)()); }, { message: 'two at once' });
-    else g.run(pick(statements)(), {}, rand() < 0.5 ? { author: pick(['ana', 'bo']), message: 'edit' } : {});
+    if (step.kind === 'transaction') g.transaction((tx) => { for (const st of step.statements) tx.run(st); }, step.options);
+    else g.run(step.statement, {}, step.options);
     if (g.version! > before) {
       expect(g.version).toBe(before + 1);
       versions.push(snapshotOf(g.store, g.version!));
@@ -143,10 +132,8 @@ describe('temporal Cypher', () => {
   function evolving() {
     let t = Date.UTC(2026, 10, 1);
     const g = open({ history: { clock: () => (t += 86_400_000), author: 'ana' } }); // a day apart
-    g.load(social(), { message: 'Load the social graph' }); // version 1
-    g.run("MATCH (p:Person {name: 'Ada'}) SET p.title = 'Countess'", {}, { message: 'Add title' }); // 2
-    g.run("MATCH (p:Person {name: 'Tim'}) DETACH DELETE p", {}, { author: 'bo', message: 'Remove Tim' }); // 3
-    g.run("CREATE (:Person {name: 'Hedy', born: 1914})", {}, { message: 'Add Hedy' }); // 4
+    g.load(social(), EVOLVING.load); // version 1
+    for (const [cypher, options] of EVOLVING.writes) g.run(cypher, {}, options); // 2: Ada's title; 3: Tim goes; 4: Hedy comes
     return g;
   }
 

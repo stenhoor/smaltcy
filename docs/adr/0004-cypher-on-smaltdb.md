@@ -108,6 +108,49 @@ all it wrote, the labels and types it added included:
   and goes through ON CREATE.
 - **Counts** are smaltcy's (`nodesCreated` … `labelsRemoved`), counted as its engine counts them (a property set to
   NULL counts, a label already there doesn't).
+- **A commit's author and message** (`RunOptions.author`, `message`, as smaltcy's `run(…, { author, message })`): the
+  statement then runs in a transaction of its own (`begin` with them, `commit`), not a savepoint, so smaltdb records
+  them in `smalt_commits` with the commit. Inside the caller's transaction they are refused: its `begin` or `commit`
+  takes them (smaltdb has no way to give them to a savepoint).
+
+**History** (smaltcy's [ADR 0002](0002-graph-history.md); smaltdb ADR 0033, decisions 14 to 17):
+
+- **A graph that keeps history** (`GraphTables.history`, smaltcy's `open({ history })`) is a property graph made with
+  smaltdb's `history` (`versions`, smaltdb's default method; `log` is passed through): its node table is created with
+  it, and smaltdb creates the label index and every label's and type's table with it, those added by writes included.
+- **Versions are smaltdb commit ids** (smaltdb's decision 17), with no table to map them: smaltcy's version 1, 2, 3 …
+  is the commit each write made, and a version between two of the graph's (a commit that wrote other tables, or the
+  schema statements that made the graph) reads the graph as of the one before. Version 0 is still the empty graph
+  before the first commit. This is the simplest mapping that reads the same graph at every version; numbering 1, 2, 3
+  would need a table the runner writes in each commit, and smaltdb gives no plan the commit's id while it is open.
+- **A write is a commit.** A Cypher statement (or the caller's transaction around several) is one smaltdb transaction,
+  so one commit, one version. A write that changes nothing makes none on either engine: smaltdb makes no commit for a
+  transaction that writes nothing, and the runner writes nothing for a SET whose properties stay what they are (it
+  compares them first, as smaltcy's history compares values), a label already there, or a target that's gone.
+- **`AT VERSION v`** reads every scan of the graph's tables (in subqueries too) with `asOf: { commit: v }`, and
+  **`AT TIME t`** (milliseconds, ISO 8601 text or a `Date`, as smaltcy takes it) with `asOf: { time: t }`. The runner
+  finds the version first, as smaltcy's engine does: `AT VERSION` must be between the oldest version kept and the
+  latest (smaltdb would read the present for a later commit, and a query that scans nothing would not see a forgotten
+  one), and `AT TIME` reads the last commit at or before then, or the oldest kept when that is later; it then reads
+  that commit. The latest is the last commit in `smalt_commits` (smaltdb records every commit that writes a table
+  with history), the oldest kept the node table's horizon in `smalt_history`. A plan with `AT VERSION` that writes is
+  smaltcy's error.
+- **`version()`** is the version read: `AT VERSION`'s, else the last commit in `smalt_commits` (at or before `AT
+  TIME`'s moment), 0 before the first; NULL on a graph without history, as smaltcy gives it.
+- **`forget(v)`** is `forgetOnSmaltdb`: smaltdb's `forget` maintenance statement with `before: { commit: v }`, for each
+  of the graph's tables, in one savepoint; a version after the latest is smaltcy's error.
+- **New ids with history** also count the largest id in the graph's past versions (smaltdb's `smalt_versions_<table>`,
+  or `smalt_log_<table>`), so an id a readable version holds is never given to another node or relationship, as
+  smaltcy's ADR 0002 keeps ids stable across versions. A caller can also keep the next ids itself (`RunOptions.ids`,
+  as smaltcy's store keeps them across statements, rolled back or not): ids then go on as smaltcy's do.
+
+**Indexes.** smaltcy's `CREATE INDEX FOR (n:L) ON (n.k)` and `DROP INDEX ON :L(k)` (`IndexPlan`) run as smaltdb schema
+statements: an expression index on the node table, on `map_get(props, k)`, named `<graph>_ix_<label>_<key>` with the
+label and key in hex (smaltdb's names ignore case, Cypher's labels don't). The node table holds every node, so the
+index holds the key's values of nodes of every label: an index can't be filtered by label, since labels live in the
+label index, and a match by label stays a semi-join on it. Creating an index that exists and dropping one that doesn't
+do nothing, as in smaltcy's stores. Indexes don't change results; on a graph that keeps history they don't change its
+versions.
 
 It keeps Cypher's meaning:
 
@@ -137,12 +180,27 @@ compare their rows: over properties of every kind, and over relationships on a g
 relationships of two types and a node with none (uniqueness, both directions, OPTIONAL MATCH with WHERE, type
 alternatives, variable length, paths). A third runs EXISTS, pattern predicates and pattern comprehensions on that
 graph: correlated on nodes and relationships, negated, nested, in OPTIONAL MATCH, with WHERE, in ORDER BY and
-aggregates.
+aggregates. `test/smaltdb-history.test.ts` writes the histories of `test/history.test.ts` (random writes from a seed,
+some in transactions of two statements, some failing; the social graph changing over four versions;
+`test/helpers/history-cases.ts`) on both engines, checks that smaltdb commits exactly when smaltcy makes a version,
+with its author and message, then reads every version with `AT VERSION` (nodes, relationships, a pattern) and each
+commit's moment with `AT TIME` on both, before and after `forget`. The index test runs the same queries before and
+after an index exists and checks smaltdb's catalog.
 
 ## Consequences
 
 - Reads compile now (58 of the 59 read cases); `keys()` (below) is refused. Writes run (all 14 write cases, and the
-  sequences in `test/smaltdb-writes.test.ts`). `range()` compiles to smaltdb's `range` table function.
+  sequences in `test/smaltdb-writes.test.ts`). `range()` compiles to smaltdb's `range` table function. History runs:
+  `AT VERSION`, `AT TIME`, `version()` and `forget`, compared on the histories of smaltcy's own history tests, and
+  so do `CREATE INDEX` and `DROP INDEX`.
+- **History refused** (`Unsupported`): `commits()`, `commit(v)` and `history(x)`, whose maps hold a commit's counts and
+  the graph's size, and each change to a node or relationship, which smaltdb doesn't record (`smalt_commits` holds a
+  commit's id, time, author and message); variable-length relationships and shortest paths with `AT VERSION` or `AT
+  TIME`, as smaltdb's `paths` reads its edge tables as they are now; an author or message for one statement inside a
+  transaction.
+- **Indexes aren't used yet.** smaltdb's planner doesn't seek with them for the compiled queries (EXPLAIN shows a scan
+  of the node table): a property match compiles to Cypher's comparison by kind, not to the plain `map_get(props, k) =
+  v` an expression index matches. A seekable form of that comparison is left for later.
 - A write is many smaltdb statements: queries and writes for each row, as the runner streams rows the way smaltcy's
   engine does. That is slow on large inputs; set-based plans for writes that can't see each other (no reads between
   them) would be faster, and are left for later. The runner takes a synchronous `queryPlan` (smaltdb's `Database` in a
@@ -168,7 +226,15 @@ aggregates.
     node with relationships, a relationship to NULL, values that can't be properties) raise smaltcy's errors.
   - New ids are one more than the largest: smaltcy's stores count on from the largest id they ever gave, so after the
     node (or relationship) with the largest id is deleted, or a statement that created some fails, smaltdb gives that
-    id again where smaltcy gives the next one.
+    id again where smaltcy gives the next one. With history, ids in past versions count (so only an id no version
+    holds, or one from before a `forget`, comes again); with `RunOptions.ids`, the numbering is smaltcy's.
+  - smaltcy's versions count 1, 2, 3 …; on smaltdb they are commit ids, which skip the commits that didn't write the
+    graph (the schema statements that made it, other tables' writes). A commit's time is smaltdb's clock
+    (`Date.now()`, never earlier than the commit before), so several commits can have the same millisecond, and `AT
+    TIME` then reads the last of them; smaltcy's history takes a clock of its own.
+  - A graph's default author (smaltcy's `open({ history: { author } })`) is the caller's to give with each statement.
+  - smaltdb's `smalt_commits` is the database's: a commit with an author or message that writes other tables is there
+    too, and `version()` and `AT VERSION` count it.
   - Where a `shortestPath` has several shortest paths, Cypher returns any one: smaltdb's may be another than
     smaltcy's.
   - A node's or relationship's `properties` in a result come back with their keys sorted (a smaltdb map), where
@@ -183,6 +249,6 @@ aggregates.
 - Two workarounds for smaltdb's planner (a sort key that is an expression over a project or filter, and `values` with
   no rows) went once smaltdb fixed both (stenhoor/smaltdb#262): the compiler gives sort keys as expressions and an
   empty edge source as `values` with `rows: []`.
-- A workaround for smaltdb, recorded for when it is fixed: an `update` whose input joins the target with a `values` plan
-  (`UPDATE … FROM`) fails with `SMALT_INTERNAL` ("the physical planner declined a write") when the join has
-  `ordered: true`; the runner's SET leaves `ordered` out there.
+- A third workaround went once smaltdb fixed it (stenhoor/smaltdb#263): an `update` whose input joins the target with a
+  `values` plan (`UPDATE … FROM`) failed with `SMALT_INTERNAL` ("the physical planner declined a write") when the
+  join had `ordered: true`; the runner's SET joins with `ordered: true` again.

@@ -13,12 +13,17 @@
  *   write keep what they were. Nodes, relationships and paths in the results are read once the statement is done, as
  *   smaltcy's engine reads them.
  * - **One transaction.** The statement runs in a savepoint (inside the caller's transaction, if there is one): an
- *   error rolls back everything it wrote, the new labels and types included.
+ *   error rolls back everything it wrote, the new labels and types included. Given an author or a message, it runs
+ *   in a transaction of its own, which carries them to its commit (`smalt_commits`).
+ * - **History.** On a graph that keeps history, each commit that changes it is a version, numbered by its smaltdb
+ *   commit id; a write that changes nothing (a property set to the value it has) writes nothing, so it makes none.
  * - **New labels and types** are added to the graph (`alterPropertyGraph` `addLabel` / `addType`) when a write first
  *   uses them. The reserved label `smaltcy:node` is refused, as are labels and types that differ from the graph's
  *   only in case (smaltdb finds them ignoring case).
  * - **New ids** are chosen here: a node's is one more than the largest node id, a relationship's rowid one more than
- *   the largest rowid of any edge table, so a relationship's rowid stays unique across types (its id).
+ *   the largest rowid of any edge table, so a relationship's rowid stays unique across types (its id). With history,
+ *   the largest in the graph's past versions counts too, so an id is never given again while a version holds it. A
+ *   caller that keeps the next ids (`RunOptions.ids`) gets smaltcy's numbering: ids go on from there, used or not.
  *
  * What it can't run as smaltcy's engine does it refuses with `Unsupported`: before anything runs where the plan shows
  * it, else when a row shows it (a DELETE of a list value), and the savepoint undoes what earlier rows wrote. After a
@@ -32,8 +37,8 @@ import type { GraphPlan, Op, Pattern, RemoveItem, SetItem } from '../plan/ops.js
 import type { GraphTables } from './schema.js';
 import { NODE_LABEL } from './schema.js';
 import {
-  and, call, caseWhen, colRef, Compiler, compileQuery, eq, HOPS, IDS, isNull, lit, NULL, or, paramValues, PROPS, Unsupported,
-  type Binding, type Frame, type Rel, type Val,
+  and, asOfOf, call, caseWhen, colRef, COMMITS_TABLE, Compiler, compileQuery, eq, HOPS, IDS, isNull, lit, noHistory, NULL, or,
+  paramValues, PROPS, Unsupported, type AsOf, type Binding, type Frame, type Rel, type Val,
 } from './compile.js';
 
 type PlanOp = plan.PlanOp;
@@ -56,6 +61,8 @@ const emptyCounts = (): WriteCounts => ({ nodesCreated: 0, nodesDeleted: 0, rela
 /** What the runner needs of a smaltdb database: `Database.queryPlan` of `smaltdb/engine` (synchronous). */
 export interface SmaltdbDatabase {
   queryPlan(stmt: PlanStatementInput, params?: readonly unknown[]): { readonly rows: readonly (readonly unknown[])[] };
+  /** Whether a transaction is open (`Database.inTransaction`): a statement with an author or a message needs none. */
+  readonly inTransaction?: boolean;
 }
 
 export interface RunResult {
@@ -65,10 +72,33 @@ export interface RunResult {
   readonly counts: WriteCounts;
   /** The graph's tables after the statement: with the labels and types it added. */
   readonly tables: GraphTables;
+  /**
+   * On a graph that keeps history: the version the statement read (`AT VERSION`, `AT TIME`), or the latest once it is
+   * done (a smaltdb commit id; 0 before the first). Not given for a statement inside an open transaction.
+   */
+  readonly version?: number;
+}
+
+/** The next node and relationship ids, kept by the caller across statements, as smaltcy's stores keep them. */
+export interface NextIds {
+  node: number;
+  relationship: number;
 }
 
 export interface RunOptions {
   readonly params?: Readonly<Record<string, unknown>>;
+  /**
+   * The commit's author and message (smaltcy's `run(…, { author, message })`): the statement runs in a transaction
+   * of its own, whose commit records them in `smalt_commits`. Refused inside an open transaction: its `begin` or
+   * `commit` takes them.
+   */
+  readonly author?: string;
+  readonly message?: string;
+  /**
+   * The next ids, kept by the caller: new nodes and relationships take ids from here (or past the largest the graph
+   * holds, when that is higher) and move them on, whether the statement succeeds or not, as smaltcy's stores do.
+   */
+  readonly ids?: NextIds;
 }
 
 const refuse = (feature: string): never => {
@@ -93,23 +123,125 @@ export function writes(op: Op): boolean {
  */
 export function runOnSmaltdb(db: SmaltdbDatabase, gp: GraphPlan, tables: GraphTables, options: RunOptions = {}): RunResult {
   const params = options.params ?? {};
-  if (gp.kind !== 'query' || !writes(gp.root)) {
-    const q = compileQuery(gp, tables, { params });
+  const own = options.author !== undefined || options.message !== undefined;
+  if (gp.kind !== 'query') {
+    db.queryPlan(indexStatement(gp, tables));
+    return { columns: [], rows: [], counts: emptyCounts(), tables };
+  }
+  if (!writes(gp.root)) {
+    const asOf = asOfOf(gp, params);
+    if (asOf && !tables.history) noHistory();
+    const version = asOf ? versionRead(db, tables, asOf) : undefined;
+    const q = compileQuery(gp, tables, { params, ...(version !== undefined ? { asOf: { commit: version } } : {}) });
     const r = db.queryPlan(q.statement, paramValues(q, params));
-    return { columns: q.columns, rows: r.rows, counts: emptyCounts(), tables };
+    const read = version ?? (tables.history && !db.inTransaction ? latestVersion(db) : undefined);
+    return { columns: q.columns, rows: r.rows, counts: emptyCounts(), tables, ...(read !== undefined ? { version: read } : {}) };
   }
   if (gp.asOf) throw new Unsupported('AT VERSION and AT TIME');
-  const run = new Runner(db, tables, params);
-  db.queryPlan({ kind: 'transaction', action: 'savepoint', name: SAVEPOINT } as PlanStatementInput);
+  if (own && db.inTransaction) throw new Unsupported("an author or a message for a statement inside a transaction (give them to the transaction's begin or commit)");
+  const run = new Runner(db, tables, params, options.ids);
+  const transaction = (action: string, more: object = {}) => db.queryPlan({ kind: 'transaction', action, ...more } as PlanStatementInput);
+  if (own) {
+    transaction('begin', { mode: 'deferred', ...(options.author !== undefined ? { author: options.author } : {}), ...(options.message !== undefined ? { message: options.message } : {}) });
+  } else {
+    transaction('savepoint', { name: SAVEPOINT });
+  }
+  let out: { columns: readonly string[]; rows: unknown[][] };
   try {
-    const out = run.statement(gp);
-    db.queryPlan({ kind: 'transaction', action: 'release', name: SAVEPOINT } as PlanStatementInput);
-    return { ...out, counts: run.counts, tables: run.tables() };
+    out = run.statement(gp);
   } catch (e) {
-    db.queryPlan({ kind: 'transaction', action: 'rollback', savepoint: SAVEPOINT } as PlanStatementInput);
-    db.queryPlan({ kind: 'transaction', action: 'release', name: SAVEPOINT } as PlanStatementInput);
+    if (own) transaction('rollback');
+    else {
+      transaction('rollback', { savepoint: SAVEPOINT });
+      transaction('release', { name: SAVEPOINT });
+    }
     throw e;
   }
+  if (own) transaction('commit');
+  else transaction('release', { name: SAVEPOINT });
+  const version = tables.history && !db.inTransaction ? latestVersion(db) : undefined;
+  return { ...out, counts: run.counts, tables: run.tables(), ...(version !== undefined ? { version } : {}) };
+}
+
+/**
+ * The smaltdb index a smaltcy property index (`CREATE INDEX FOR (n:L) ON (n.k)`) is: an expression index on the node
+ * table, on `map_get(props, k)`. A node table holds every node, so it indexes the key's values of nodes of any label;
+ * the label stays a semi-join on the label index, as in every match. Its name is the graph's, `_ix_`, then the label
+ * and the key in hex (smaltdb's names ignore case; Cypher's don't), so each label and key has its own. Creating one
+ * that exists and dropping one that doesn't do nothing, as in smaltcy's stores.
+ */
+export function indexStatement(gp: Extract<GraphPlan, { kind: 'createIndex' | 'dropIndex' }>, t: GraphTables): PlanStatementInput {
+  const hex = (x: string) => [...new TextEncoder().encode(x)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const name = `${t.graph}_ix_${hex(gp.label)}_${hex(gp.key)}`;
+  if (gp.kind === 'dropIndex') return { kind: 'schema', op: { op: 'drop', objectType: 'index', name, ifExists: true } } as PlanStatementInput;
+  const expr = call('map_get', [colRef(1, PROPS), lit(gp.key, 'text')], 'any');
+  const index: plan.IndexDef = {
+    name,
+    table: t.nodes,
+    unique: false,
+    columns: [{ column: -1, expr: { text: `map_get(props, ${JSON.stringify(gp.key)})`, expr }, desc: false, collation: 'binary' }],
+  };
+  return { kind: 'schema', op: { op: 'createIndex', index, ifNotExists: true } } as PlanStatementInput;
+}
+
+/** The latest version of a graph that keeps history: the last commit recorded in `smalt_commits`, 0 before any. */
+export function latestVersion(db: SmaltdbDatabase): number {
+  return lastCommit(db);
+}
+
+function lastCommit(db: SmaltdbDatabase, atOrBefore?: number): number {
+  let commits: PlanOp = scan(COMMITS_TABLE, [0, 1]);
+  if (atOrBefore !== undefined) commits = filter(commits, call('cmp_le', [colRef(1, 'int'), lit(atOrBefore)], 'bool'));
+  const r = db.queryPlan({ kind: 'query', plan: maxOf(commits), columns: [{ name: 'v', type: 'int' }] } as PlanStatementInput);
+  return (r.rows[0]?.[0] as number | null) ?? 0;
+}
+
+/**
+ * The version a query of the past reads, as smaltcy's engine finds it: `AT VERSION v`'s v, which must be one the
+ * history keeps (from the oldest not forgotten to the latest: smaltdb would read the present for a commit after it),
+ * or the last commit at or before `AT TIME`'s moment (the oldest kept, when that is later).
+ */
+function versionRead(db: SmaltdbDatabase, t: GraphTables, asOf: AsOf): number {
+  const first = horizon(db, t);
+  if ('time' in asOf) return Math.max(lastCommit(db, asOf.time), first);
+  const latest = lastCommit(db);
+  if (asOf.commit < first || asOf.commit > latest) throw new SmaltcyError('SMALTCY_NOT_FOUND', `There is no version ${asOf.commit}: this history has versions ${first} to ${latest}`);
+  return asOf.commit;
+}
+
+/**
+ * The oldest version the graph's history keeps: the node table's horizon in smaltdb's `smalt_history` (`name`,
+ * `horizon`; there once something was forgotten), 0 when nothing was. `forgetOnSmaltdb` moves every table's together.
+ */
+function horizon(db: SmaltdbDatabase, t: GraphTables): number {
+  const names = db.queryPlan({ kind: 'query', plan: scan('sqlite_schema', [1]), columns: [{ name: 'name', type: 'text' }] } as PlanStatementInput).rows;
+  if (!names.some(([n]) => n === 'smalt_history')) return 0;
+  const mine = filter(scan('smalt_history', [0, 1]), eq(call('lower', [colRef(0, 'text')], 'text'), lit(t.nodes.toLowerCase(), 'text')));
+  const r = db.queryPlan({ kind: 'query', plan: project(mine, [colRef(1, 'int')]), columns: [{ name: 'h', type: 'int' }] } as PlanStatementInput).rows;
+  return (r[0]?.[0] as number | undefined) ?? 0;
+}
+
+/**
+ * smaltcy's `forget(version)` on smaltdb: the graph's tables forget the versions before `version` (smaltdb's `forget`
+ * maintenance statement, for each of them, in one savepoint), so reading an earlier one is an error. The horizon only
+ * moves forward; a version after the latest is smaltcy's error.
+ */
+export function forgetOnSmaltdb(db: SmaltdbDatabase, tables: GraphTables, version: number): void {
+  if (!tables.history) noHistory();
+  if (!Number.isInteger(version)) throw new SmaltcyError('SMALTCY_TYPE', `forget() takes a whole number, not ${JSON.stringify(version)}`);
+  const latest = lastCommit(db);
+  if (version > latest) throw new SmaltcyError('SMALTCY_NOT_FOUND', `There is no version ${version}`);
+  const all = [tables.nodes, tables.labels, ...tables.labelTables.values(), ...tables.types.values()];
+  const transaction = (action: string, more: object) => db.queryPlan({ kind: 'transaction', action, ...more } as PlanStatementInput);
+  transaction('savepoint', { name: SAVEPOINT });
+  try {
+    for (const table of all) db.queryPlan({ kind: 'maintenance', action: 'forget', before: { commit: lit(version) }, table } as PlanStatementInput);
+  } catch (e) {
+    transaction('rollback', { savepoint: SAVEPOINT });
+    transaction('release', { name: SAVEPOINT });
+    throw e;
+  }
+  transaction('release', { name: SAVEPOINT });
 }
 
 // The rows the runner holds: the compiler's columns (`Frame`), as JavaScript values.
@@ -237,6 +369,7 @@ class Runner {
     private readonly db: SmaltdbDatabase,
     private readonly t0: GraphTables,
     private readonly params: Readonly<Record<string, unknown>>,
+    private readonly ids?: NextIds,
   ) {
     this.labelTables = new Map(t0.labelTables);
     this.types = new Map(t0.types);
@@ -645,23 +778,38 @@ class Runner {
   }
 
   private newNodeId(): number {
-    if (this.nextNode === undefined) {
-      const max = this.lookup(maxOf(scan(this.tables().nodes, [0])), ['int'])[0]![0] as number | null;
-      this.nextNode = max === null ? 0 : max + 1;
-    }
-    return this.nextNode++;
+    if (this.nextNode === undefined) this.nextNode = Math.max(this.largest(this.tables().nodes, 0) + 1, this.ids?.node ?? 0);
+    const id = this.nextNode++;
+    if (this.ids) this.ids.node = this.nextNode;
+    return id;
   }
 
   private newRelId(): number {
     if (this.nextRel === undefined) {
       let max = -1;
-      for (const table of this.types.values()) {
-        const m = this.lookup(maxOf(scan(table, [-1])), ['int'])[0]![0] as number | null;
-        if (m !== null && m > max) max = m;
-      }
-      this.nextRel = max + 1;
+      for (const table of this.types.values()) max = Math.max(max, this.largest(table, -1));
+      this.nextRel = Math.max(max + 1, this.ids?.relationship ?? 0);
     }
-    return this.nextRel++;
+    const id = this.nextRel++;
+    if (this.ids) this.ids.relationship = this.nextRel;
+    return id;
+  }
+
+  /**
+   * The largest rowid of a table (`column`: the rowid's column, or -1), -1 for none; with history, of its past versions
+   * too (smaltdb's `smalt_versions_<table>` or `smalt_log_<table>`, whose `$rowid` is column 0 or 2), so an id a version
+   * holds is not given again.
+   */
+  private largest(table: string, column: number): number {
+    const tables: [string, number][] = [[table, column]];
+    if (this.t0.history === 'versions') tables.push([`smalt_versions_${table}`, 0]);
+    if (this.t0.history === 'log') tables.push([`smalt_log_${table}`, 2]);
+    let max = -1;
+    for (const [t, c] of tables) {
+      const m = this.lookup(maxOf(scan(t, [c])), ['int'])[0]![0] as number | null;
+      if (m !== null && m > max) max = m;
+    }
+    return max;
   }
 
   /** A label's table: the label added to the graph if it hasn't it yet. */
@@ -705,10 +853,10 @@ class Runner {
         case 'prop': {
           const target = this.entity(t, "Can't set a property on a");
           const v = this.evaluate(frame, row, it.value);
-          if (v.k === 'value' && v.v === null) this.setProps(target, (cur) => removeKeys(cur, [it.key]), 1);
+          if (v.k === 'value' && v.v === null) this.setProps(target, (cur) => removeKeys(cur, [it.key]), 1, without(target.props, [it.key]));
           else {
             const value = propertyValue(v, 'SET');
-            this.setProps(target, (cur, given) => call('map_merge', [removeKeys(cur, [it.key]), call('map_of', [lit(it.key), given], PROPS)], PROPS), 1, value);
+            this.setProps(target, (cur, given) => call('map_merge', [removeKeys(cur, [it.key]), call('map_of', [lit(it.key), given], PROPS)], PROPS), 1, { ...without(target.props, [it.key]), [it.key]: value }, value);
           }
           break;
         }
@@ -719,11 +867,11 @@ class Runner {
           if (!it.merge) {
             // Every property the map hasn't is removed, then the map's set.
             const removed = Object.keys(target.props).filter((k) => !(k in props)).length;
-            this.setProps(target, (_cur, given) => given, removed + Object.keys(props).length, props, PROPS);
+            this.setProps(target, (_cur, given) => given, removed + Object.keys(props).length, props, props, PROPS);
           } else {
             // With +=, a NULL in the map removes the key.
             const gone = isMap ? nulls : [];
-            this.setProps(target, (cur, given) => call('map_merge', [removeKeys(cur, gone), given], PROPS), gone.length + Object.keys(props).length, props, PROPS);
+            this.setProps(target, (cur, given) => call('map_merge', [removeKeys(cur, gone), given], PROPS), gone.length + Object.keys(props).length, { ...without(target.props, gone), ...props }, props, PROPS);
           }
           break;
         }
@@ -746,7 +894,8 @@ class Runner {
       const t = this.evaluate(frame, row, it.target);
       if (isNullValue(t)) continue;
       if (it.kind === 'prop') {
-        this.setProps(this.entity(t, "Can't set a property on a"), (cur) => removeKeys(cur, [it.key]), 1);
+        const target = this.entity(t, "Can't set a property on a");
+        this.setProps(target, (cur) => removeKeys(cur, [it.key]), 1, without(target.props, [it.key]));
         continue;
       }
       if (t.k !== 'node') throw new SmaltcyError('SMALTCY_TYPE', `Can't remove labels from a ${valueTypeName(t)}`);
@@ -774,14 +923,19 @@ class Runner {
   /**
    * Sets a node's or relationship's properties to `f` of what they are (in the table) and of `given` (a value given
    * from here, `any` or `type`), counting `count` properties set; nothing when it's gone, as in smaltcy's engine.
+   * `next` is what they become: when it is what they are, nothing is written (smaltcy's history records no change).
    */
-  private setProps(e: { table: string; column: number; rowid: number; props: Props | null }, f: (cur: PlanExpr, given: PlanExpr) => PlanExpr, count: number, given: unknown = null, type: PlanType = 'any'): void {
+  private setProps(e: { table: string; column: number; rowid: number; props: Props | null }, f: (cur: PlanExpr, given: PlanExpr) => PlanExpr, count: number, next: Props | null, given: unknown = null, type: PlanType = 'any'): void {
     if (e.props === null) return;
+    if (next !== null && sameProps(e.props, next)) {
+      this.counts.propertiesSet += count;
+      return;
+    }
     // A value of `any` crosses as a one-element `list<any>`, which keeps its kind (smaltdb ADR 0039).
     const wrapped = type === 'any';
     const values = { op: 'values', rows: [], types: [wrapped ? 'list<any>' : type], columns: [[wrapped ? [given] : given]] } as unknown as PlanOp;
     // The target joined with the value (smaltdb's UPDATE … FROM shape: the WHERE over the join).
-    const input = filter({ op: 'join', kind: 'cross', inputs: [scan(e.table, [-1, e.column]), values] }, eq(colRef(0, 'int'), lit(e.rowid)));
+    const input = filter({ op: 'join', kind: 'cross', inputs: [scan(e.table, [-1, e.column]), values], ordered: true }, eq(colRef(0, 'int'), lit(e.rowid)));
     const g = wrapped ? call('list_get', [colRef(2, 'list<any>'), lit(0)], 'any') : colRef(2, type);
     this.db.queryPlan(write({ op: 'update', table: e.table, db: 'main', input, rowid: 0, sets: [{ column: e.column, value: f(colRef(1, PROPS), g) }], from: true }));
     this.counts.propertiesSet += count;
@@ -840,6 +994,27 @@ class Runner {
     this.deleted(this.tables().nodes, node);
     this.counts.nodesDeleted++;
   }
+}
+
+/** Properties without some keys (NULL: gone). */
+function without(props: Props | null, keys: readonly string[]): Props | null {
+  if (props === null) return null;
+  const out = { ...props };
+  for (const k of keys) delete out[k];
+  return out;
+}
+
+/** Whether two property maps hold the same values (as smaltcy's history compares them: lists by their elements). */
+function sameProps(a: Props, b: Props): boolean {
+  const ka = Object.keys(a);
+  if (ka.length !== Object.keys(b).length) return false;
+  return ka.every((k) => k in b && sameValue(a[k], b[k]));
+}
+
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => sameValue(x, b[i]));
+  return false;
 }
 
 /** A props map without some keys. */
