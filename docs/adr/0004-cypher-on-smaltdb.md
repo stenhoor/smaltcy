@@ -239,8 +239,9 @@ after an index exists and checks smaltdb's catalog.
     smaltcy's.
   - A node's or relationship's `properties` in a result come back with their keys sorted (a smaltdb map), where
     smaltcy's keep the order they were set; the values are the same.
-  - smaltcy's own engine doesn't count a variable-length relationship's hops as used, so a hop it expands after one in
-    the same MATCH can bind one of them again; the compiler keeps Cypher's uniqueness (tested).
+  - smaltcy's own engine didn't count a variable-length relationship's hops as used, so a hop it expanded after one in
+    the same MATCH could bind one of them again. Fixed in its engine (`varExpand`); both engines now keep Cypher's
+    uniqueness there (tested).
   - A pattern comprehension's list is in the order its pattern matches, which Cypher leaves open, as it does a
     MATCH's: smaltdb's goes by relationship type, then by relationship, smaltcy's store by relationship id. The
     elements are the same; the tests compare them in any order where the two can differ.

@@ -505,7 +505,11 @@ export class Executor implements EvalContext {
             if (reverse) list.reverse();
             row[rs] = list;
             if (!into) row[ts] = new NodeRef(node);
-            return next(row, used, sink);
+            // The path's relationships are bound for the rest of the match: a later step can't bind them again.
+            for (const r of stack) used.add(r);
+            const go = next(row, used, sink);
+            for (const r of stack) used.delete(r);
+            return go;
           };
           const walk = (node: number, depth: number): boolean => {
             if (depth >= min && !emit(node)) return false;
