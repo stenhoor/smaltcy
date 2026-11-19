@@ -58,6 +58,15 @@ export interface CompileOptions {
    * the plan's own `asOf`, which is otherwise read from its literal or parameter.
    */
   readonly asOf?: AsOf;
+  /**
+   * The most join regions a MATCH's pattern splits into (default 1). A relationship of several types, or read both
+   * ways, is a scan of its edge table for each type and reading, each in a region of its own, as long as their number
+   * stays within this; past it, it is the union of those scans, one FROM item of the region. smaltdb's planner seeks
+   * into the scans with their indexes, not into the union, but it can't tell how few rows a property match gives, so
+   * it joins with hashes either way, and a region per reading repeats the rest of the pattern: slower today
+   * (docs/research/benchmarks.md, "smaltdb").
+   */
+  readonly maxBranches?: number;
 }
 
 /** The past a query reads (`AT VERSION`, `AT TIME`): a smaltdb commit id, or a time in milliseconds since 1970. */
@@ -101,7 +110,8 @@ export const COMMITS_TABLE = 'smalt_commits';
 /**
  * A compiled plan reading the past: every scan of the graph's tables (in subqueries too) reads them as of `asOf`.
  * smaltdb's `paths` reads its edge tables as they are now, so variable-length relationships and shortest paths are
- * refused.
+ * refused (a shortest path's search, an `iterate`, too: it is compared with `paths` only in the present). A hop from a
+ * row (`HOP_ITERATE`, also an `iterate`) reads its tables with the other scans.
  */
 function readAsOf<T>(x: T, t: GraphTables, asOf: AsOf): T {
   const graph = new Set([t.nodes, t.labels, ...t.labelTables.values(), ...t.types.values()].map((n) => n.toLowerCase()));
@@ -110,7 +120,7 @@ function readAsOf<T>(x: T, t: GraphTables, asOf: AsOf): T {
     if (Array.isArray(v)) return v.map(walk);
     if (v === null || typeof v !== 'object') return v;
     const o = v as Record<string, unknown>;
-    if (o.op === 'paths') unsupported('variable-length relationships and shortest paths with AT VERSION or AT TIME (smaltdb reads them in the present)');
+    if (o.op === 'paths' || (o.op === 'iterate' && o.name !== HOP_ITERATE)) unsupported('variable-length relationships and shortest paths with AT VERSION or AT TIME (smaltdb reads them in the present)');
     const out = Object.fromEntries(Object.entries(o).map(([k, e]) => [k, walk(e)]));
     if (o.op === 'scan' && graph.has(String(o.table).toLowerCase())) out.asOf = at;
     return out;
@@ -118,12 +128,40 @@ function readAsOf<T>(x: T, t: GraphTables, asOf: AsOf): T {
   return walk(x) as T;
 }
 
+/**
+ * The slots that appear once in a plan (where they are bound, as a pattern's anonymous node is): nothing reads them.
+ * With `identity`, also those read only as `count(x)` and `id(x)`, which of a node or a relationship read only its id
+ * or rowid: a pattern binds them without reading the node table or the relationship's ends and props.
+ */
+function slotsOnce(gp: GraphPlan, identity = false): Set<number> {
+  const count = new Map<number, number>();
+  const add = (s: unknown) => typeof s === 'number' && count.set(s, (count.get(s) ?? 0) + 1);
+  const isSlot = (x: unknown) => (x as { k?: unknown } | null)?.k === 'slot';
+  const walk = (x: unknown): void => {
+    if (Array.isArray(x)) return x.forEach(walk);
+    if (x === null || typeof x !== 'object') return;
+    const o = x as Record<string, unknown>;
+    add(o.slot);
+    if (Array.isArray(o.slots)) o.slots.forEach(add);
+    if (o.k === 'slot') add(o.i);
+    // count(x) (an aggregate: it has a slot) and id(x) (a call) of a variable: its identity only.
+    const args = o.args;
+    if (identity && Array.isArray(args) && args.length === 1 && isSlot(args[0]) && ((o.fn === 'count' && typeof o.slot === 'number' && o.k === undefined) || (o.fn === 'id' && o.k === 'call'))) {
+      for (const [k, v] of Object.entries(o)) if (k !== 'args') walk(v);
+      return;
+    }
+    Object.values(o).forEach(walk);
+  };
+  walk(gp);
+  return new Set([...count].filter(([, n]) => n === 1).map(([s]) => s));
+}
+
 /** Compiles a graph plan (a query that reads) to a smaltdb query statement. */
 export function compileQuery(gp: GraphPlan, tables: GraphTables, options: CompileOptions = {}): CompiledQuery {
   if (gp.kind !== 'query') return unsupported('index plans');
   const asOf = gp.asOf ? (options.asOf ?? asOfOf(gp, options.params ?? {})) : undefined;
   if (asOf && !tables.history) noHistory();
-  const c = new Compiler(tables, options.params ?? {}, asOf);
+  const c = new Compiler(tables, options.params ?? {}, asOf, slotsOnce(gp), options.maxBranches, slotsOnce(gp, true));
   const { plan: root, frame } = c.op(gp.root);
   const exprs: PlanExpr[] = [];
   const columns: PlanColumn[] = [];
@@ -259,6 +297,8 @@ const REL: PlanType = `struct<type text, rowid int, start int, end int, props ma
 /** A node as a list element. */
 const NODE: PlanType = 'struct<id int, props map<text, any>>';
 export const IDS: PlanType = 'list<int>';
+/** A path found from a node (`Compiler.pathsFrom`): where it ends, its length, its hops. */
+const FOUND: PlanType = `struct<last int, len int, hops ${HOPS}>`;
 
 /** What a list comprehension's element is: a value, or a node or relationship read from a `NODE` or `REL` struct. */
 type ElementKind = 'value' | 'node' | 'rel';
@@ -287,6 +327,115 @@ const E_PROPS = 4;
 const E_FROM = 5;
 /** The end at the pattern's `to` node. */
 const E_TO = 6;
+/** The columns a hop from a row adds (`Compiler.hopFrom`): the relationship's, then its other end and that node's props. */
+const ADJ_TYPES: readonly PlanType[] = ['text', 'int', 'int', 'int', PROPS, 'int', PROPS];
+/** The name of a hop's `iterate` (`Compiler.hopFrom`), which reads its tables as of a version as any scan does. */
+const HOP_ITERATE = 'hop';
+/** The longest bounded variable-length search (`Compiler.walkFrom`) that keeps its relationships in columns, not a list. */
+const WALK_COLUMNS = 8;
+
+/**
+ * One way a pattern matches, as a smaltdb join region: its FROM items (bare scans, and the input first), its
+ * conditions over their columns, the row's columns as expressions over them, and the order its rows keep (`keys`, when
+ * the order is asked for).
+ */
+interface Branch {
+  readonly leaves: PlanOp[];
+  width: number;
+  readonly conds: PlanExpr[];
+  readonly out: PlanExpr[];
+  readonly keys: PlanExpr[];
+}
+
+const cloneBranch = (b: Branch): Branch => ({ leaves: [...b.leaves], width: b.width, conds: [...b.conds], out: [...b.out], keys: [...b.keys] });
+
+/** Adds a FROM item to a branch: the position of its first column. */
+function addLeaf(b: Branch, op: PlanOp, width: number): number {
+  b.leaves.push(op);
+  const at = b.width;
+  b.width += width;
+  return at;
+}
+
+/** An expression of the row (its columns `col` at depth 0) as one over a branch's FROM items, whose columns `out` gives. */
+function inline(e: PlanExpr, out: readonly PlanExpr[]): PlanExpr {
+  const walk = (x: unknown, level: number): unknown => {
+    if (Array.isArray(x)) return x.map((y) => walk(y, level));
+    if (x === null || typeof x !== 'object') return x;
+    const o = x as Record<string, unknown>;
+    // The row's columns: at depth 0 here, one deeper in each subquery.
+    if (o.k === 'col' && o.depth === level && (level > 0 || o.input === 0)) {
+      let r = out[o.index as number]!;
+      for (let i = 0; i < level; i++) r = deepen(r);
+      return r;
+    }
+    const nested = o.k === 'subquery' || o.k === 'inSubquery';
+    return Object.fromEntries(Object.entries(o).map(([k, v]) => [k, walk(v, nested && k === 'plan' ? level + 1 : level)]));
+  };
+  return walk(e, 0) as PlanExpr;
+}
+
+/** A condition's conjuncts. */
+const conjuncts = (e: PlanExpr): PlanExpr[] => (e.k === 'and' ? e.args.flatMap(conjuncts) : [e]);
+/** A Cypher condition's conjuncts. */
+const conjunctsOf = (e: Expr | undefined): Expr[] => (!e ? [] : e.k === 'and' ? e.args.flatMap(conjunctsOf) : [e]);
+
+/** Functions that never raise an error: a condition of only these can be evaluated on any row, in any order. */
+const SAFE_FNS = new Set(['cmp_eq', 'cmp_ne', 'cmp_lt', 'cmp_le', 'cmp_gt', 'cmp_ge', 'map_get', 'any_type', 'in_list', 'starts_with', 'ends_with', 'struct_field', 'coalesce']);
+
+/**
+ * Whether evaluating a condition may raise an error (Cypher's type errors, arithmetic, a value the compiler refuses
+ * when met): such conditions filter a region's rows rather than join it, so they see only the rows that match, as in
+ * smaltcy's engine.
+ */
+function canRaise(x: unknown): boolean {
+  if (Array.isArray(x)) return x.some(canRaise);
+  if (x === null || typeof x !== 'object') return false;
+  const o = x as Record<string, unknown>;
+  if (o.k === 'cast' || (o.k === 'call' && !SAFE_FNS.has(o.fn as string))) return true;
+  return Object.values(o).some(canRaise);
+}
+
+/**
+ * The columns of a plan that are the same literal on every row, as far as its shape shows (a projection's literals,
+ * through filters, sorts and inner joins): those a relationship or node binding leaves NULL, a type's name.
+ */
+function constantsOf(op: PlanOp): (PlanExpr | undefined)[] {
+  switch (op.op) {
+    case 'project': {
+      const inner = op.exprs.some((e) => e.k === 'col') ? constantsOf(op.input) : [];
+      return op.exprs.map((e) => (e.k === 'lit' ? e : e.k === 'col' && e.input === 0 && e.depth === 0 ? inner[e.index] : undefined));
+    }
+    case 'filter': case 'sort': case 'limit': case 'distinct':
+      return constantsOf(op.input);
+    case 'join':
+    {
+      const w = widthOf(op.inputs[0]);
+      if (w === undefined || (op.kind !== 'inner' && op.kind !== 'cross')) return [];
+      const l = constantsOf(op.inputs[0]);
+      return [...Array.from({ length: w }, (_, i) => l[i]), ...constantsOf(op.inputs[1])];
+    }
+    default:
+      return [];
+  }
+}
+
+/** The number of columns of a plan, for the operations `constantsOf` looks into (else undefined). */
+function widthOf(op: PlanOp): number | undefined {
+  switch (op.op) {
+    case 'project': return op.exprs.length;
+    case 'scan': return op.columns.length;
+    case 'values': case 'working': return op.types.length;
+    case 'filter': case 'sort': case 'limit': case 'distinct': return widthOf(op.input);
+    case 'iterate': return widthOf(op.init);
+    case 'join': {
+      if (op.kind === 'semi' || op.kind === 'anti') return widthOf(op.inputs[0]);
+      const [a, b] = [widthOf(op.inputs[0]), widthOf(op.inputs[1])];
+      return a === undefined || b === undefined ? undefined : a + b;
+    }
+    default: return undefined;
+  }
+}
 
 // Expression builders: plain data, as smaltdb's `plan` builders make them.
 
@@ -373,6 +522,20 @@ const isNumberType = (t: PlanType) => t === 'int' || t === 'real' || t === 'num'
 /** Whether a number's value may be NaN (a real, or a value of unknown type). */
 const mayBeNaN = (t: PlanType) => t !== 'int';
 
+/**
+ * A string literal, or a number literal smaltdb holds as the number it is (an integer JavaScript holds exactly, or a
+ * float that isn't whole or NaN): where a plain comparison with a value of any kind keeps Cypher's meaning.
+ */
+function scalarLiteral(v: Val): v is { k: 'value'; e: PlanExpr; t: PlanType } {
+  if (v.k !== 'value' || v.e.k !== 'lit') return false;
+  const { type, value } = v.e;
+  return (
+    (type === 'text' && typeof value === 'string') ||
+    (type === 'int' && Number.isSafeInteger(value)) ||
+    (type === 'real' && typeof value === 'number' && !Number.isInteger(value) && !Number.isNaN(value))
+  );
+}
+
 /** The kind of a value at run time, as one of the K_ codes (NULL: K_NULL; NaN: K_NUMBER). */
 function kindExpr(v: { e: PlanExpr; t: PlanType }): PlanExpr {
   const k = staticKind(v.t);
@@ -392,6 +555,9 @@ function kindExpr(v: { e: PlanExpr; t: PlanType }): PlanExpr {
     'int',
   );
 }
+
+/** Whether a value of any kind that isn't NULL is a number: `kindExpr`'s test for numbers, reading the value once. */
+const isNumber = (v: { e: PlanExpr }): PlanExpr => call('in_list', [call('any_type', [v.e], 'text'), lit('int'), lit('real')], 'bool');
 
 /**
  * The name of a value's type as smaltcy's errors give it (`typeName`): NULL, BOOLEAN, INTEGER (a number with a whole
@@ -848,6 +1014,8 @@ function floatModulo(x: PlanExpr, y: PlanExpr, t: PlanType): PlanExpr {
 /** Compiles graph plans and expressions over a graph's tables (`compileQuery`; the write runner in write.ts). */
 export class Compiler {
   readonly paramNames: string[] = [];
+  /** The `iterate` operations made so far (their ids). */
+  private iterates = 0;
   /** Operations whose rows are given (write.ts: rows it holds, as a `values` plan), compiled as those. */
   readonly given = new Map<Op, Rel>();
   /** The list elements in scope (`[x IN list …]`, `any(x IN list …)`), innermost last: what their slots read. */
@@ -860,13 +1028,31 @@ export class Compiler {
     private readonly params: Readonly<Record<string, unknown>>,
     /** The past the plan reads (`AT VERSION`, `AT TIME`): what `version()` gives. */
     private readonly asOf?: AsOf,
+    /**
+     * Slots nothing reads: those of the whole plan that appear once (`slotsOnce`). An anonymous node a relationship
+     * reaches, with no labels or properties, is then only that relationship's end, which smaltdb's graph keeps a node of
+     * the graph: no scan of the node table.
+     */
+    private readonly unread: ReadonlySet<number> = new Set(),
+    /** `CompileOptions.maxBranches`. */
+    private readonly maxBranches = 1,
+    /**
+     * Slots nothing reads but their identity (`slotsOnce` with `identity`): `count(x)` and `id(x)` of a node read its
+     * id, of a relationship its rowid, so the node table and the relationship's ends and props are not read for them.
+     */
+    private readonly idOnly: ReadonlySet<number> = unread,
   ) {}
 
   // Operations.
 
-  op(op: Op): Rel {
+  /**
+   * An operation's rows. `ordered`: whether their order shows (in the results, a `collect()`, a LIMIT, the ties of an
+   * ORDER BY); where it doesn't, the plan asks smaltdb for no order, so its planner is free to join and group in any.
+   */
+  op(op: Op, ordered = true): Rel {
     const given = this.given.get(op);
     if (given) return given;
+    const first = ordered ? { ordered: 'first' as const } : {};
     switch (op.op) {
       case 'argument': {
         if (!op.slots.length) return { plan: { op: 'values', rows: [[]], types: [] }, frame: { types: [], slots: new Map() } };
@@ -877,35 +1063,39 @@ export class Compiler {
         return { plan: { op: 'values', rows: [outer.types.map((t, i) => colRef(i, t, 1))], types: [...outer.types] }, frame: outer };
       }
       case 'eager':
-        return this.op(op.input);
+        return this.op(op.input, ordered);
       case 'match':
-        return this.match(op);
+        return this.match(op, ordered);
       case 'filter': {
-        const r = this.op(op.input);
+        const r = this.op(op.input, ordered);
         return { plan: { op: 'filter', input: r.plan, pred: this.predicate(op.pred, r.frame, 'WHERE') }, frame: r.frame };
       }
       case 'project':
-        return this.project(this.op(op.input), op.items, op.discard);
+        return this.project(this.op(op.input, ordered), op.items, op.discard);
       case 'aggregate':
-        return this.aggregate(this.op(op.input), op.keys, op.aggs);
+        // Groups come in the order of their first row (no keys: one group); only `count` gives the same whatever the
+        // order of its rows (sums of floats round by their order, `min` and `max` of equal numbers of two kinds keep
+        // the first, `collect` lists them).
+        return this.aggregate(this.op(op.input, (ordered && op.keys.length > 0) || op.aggs.some((a) => a.fn !== 'count')), op.keys, op.aggs, ordered);
       case 'distinct': {
-        const r = this.op(op.input);
+        const r = this.op(op.input, ordered);
         const on = op.slots.flatMap((s) => this.keyColumns(r.frame, s));
-        return { plan: { op: 'distinct', input: r.plan, collations: r.frame.types.map(() => 'binary'), on, keep: 'first', ordered: 'first' }, frame: r.frame };
+        return { plan: { op: 'distinct', input: r.plan, collations: r.frame.types.map(() => 'binary'), on, keep: 'first', ...first }, frame: r.frame };
       }
       case 'sort': {
-        const r = this.op(op.input);
+        // Stable: rows that tie keep their order.
+        const r = this.op(op.input, true);
         return { plan: { op: 'sort', input: r.plan, keys: op.keys.flatMap((k) => this.sortKeys(k, r.frame)) }, frame: r.frame };
       }
       case 'limit': {
-        const r = this.op(op.input);
+        const r = this.op(op.input, true);
         const count = op.count ? this.count(op.count, 'LIMIT') : lit(-1);
         return { plan: { op: 'limit', input: r.plan, count, ...(op.skip ? { offset: this.count(op.skip, 'SKIP') } : {}) }, frame: r.frame };
       }
       case 'unwind':
-        return this.unwind(this.op(op.input), op.list, op.slot);
+        return this.unwind(this.op(op.input, ordered), op.list, op.slot);
       case 'union':
-        return this.union(op);
+        return this.union(op, ordered);
       case 'create': case 'merge': case 'set': case 'remove': case 'delete':
         // Writes run row by row (write.ts), not as one query.
         return unsupported(`writes (${op.op.toUpperCase()}) in a query`);
@@ -913,25 +1103,23 @@ export class Compiler {
   }
 
   /** Every match of a pattern, for each input row; `where` is part of the match. */
-  private match(op: Extract<Op, { op: 'match' }>): Rel {
-    const input = this.op(op.input);
-    if (op.optional) return this.optionalMatch(input, op.pattern, op.where);
-    const r = this.pattern(input, op.pattern);
-    return op.where ? { plan: { op: 'filter', input: r.plan, pred: this.predicate(op.where, r.frame, 'WHERE') }, frame: r.frame } : r;
+  private match(op: Extract<Op, { op: 'match' }>, ordered: boolean): Rel {
+    const input = this.op(op.input, ordered);
+    if (op.optional) return this.optionalMatch(input, op.pattern, op.where, ordered);
+    return this.pattern(input, op.pattern, op.where, ordered);
   }
 
   /**
-   * OPTIONAL MATCH: the input's rows numbered (a window's `row_number`, in input order), matched, and left-joined back by
-   * their number, so a row without a match (or with none passing `where`) passes once with the pattern's new slots
-   * NULL. The input's plan appears twice: smaltdb runs it twice, and as every operation the compiler makes keeps an
-   * order, both give the same rows in the same order.
+   * OPTIONAL MATCH: the input's rows numbered (a window's `row_number`), matched, and left-joined back by their number,
+   * so a row without a match (or with none passing `where`) passes once with the pattern's new slots NULL. The input's
+   * plan appears twice: smaltdb runs it twice, and both runs must number the same rows the same way, as smaltdb's
+   * planner plans the same plan over the same data the same way (an assumption the tests bear out).
    */
-  private optionalMatch(input: Rel, p: Pattern, where: Expr | undefined): Rel {
+  private optionalMatch(input: Rel, p: Pattern, where: Expr | undefined, ordered: boolean): Rel {
     const w = input.frame.types.length;
     const numbered: Rel = { plan: this.numbered(input), frame: { types: [...input.frame.types, 'int'], slots: input.frame.slots } };
-    let m = this.pattern(numbered, p);
-    if (where) m = { plan: { op: 'filter', input: m.plan, pred: this.predicate(where, m.frame, 'WHERE') }, frame: m.frame };
-    const joined: PlanOp = { op: 'join', kind: 'left', inputs: [numbered.plan, m.plan], on: eq(colRef(w, 'int'), rightRef(w, 'int')), ordered: true };
+    const m = this.pattern(numbered, p, where, ordered);
+    const joined: PlanOp = { op: 'join', kind: 'left', inputs: [numbered.plan, m.plan], on: eq(colRef(w, 'int'), rightRef(w, 'int')), ...(ordered ? { ordered: true } : {}) };
     // The input's columns, then the match's new ones (after its copy of the input and the number).
     const types = [...input.frame.types, ...m.frame.types.slice(w + 1)];
     const exprs = [...input.frame.types.map((t, i) => colRef(i, t)), ...m.frame.types.slice(w + 1).map((t, i) => colRef(2 * (w + 1) + i, t))];
@@ -941,73 +1129,227 @@ export class Compiler {
   }
 
   /**
-   * Every match of a pattern, for each input row, in order: a new node is the input joined with the node table (its
-   * labels semi-joins on the label index); a relationship is a join with its edge source on the end that is bound, then
-   * with the node table on the other end; a variable-length relationship is smaltdb's `paths` in trail mode (no
-   * relationship twice), and a shortest path `paths` with a shortest selector once both its ends are bound.
+   * Every match of a pattern, for each input row, as one smaltdb join region (a flat join of bare table scans, which
+   * its planner orders and seeks into with the tables' indexes): the input, then for each new node a scan of the node
+   * table (and of the label index for each of its labels), for each relationship a scan of its type's edge table, all
+   * joined by conditions on their columns; the row's columns are one projection over them. A relationship that can be
+   * one of several types, or read both ways, splits the region into one per type and reading (a union, `branches`),
+   * up to `maxBranches`; past that, from a bound end, it is a hop from each row of the region so far (`hopFrom`: smaltdb
+   * seeks into the edge tables' indexes for each row), which starts a region of its own, as does every hop after it
+   * from a node it reached; from a node scanned without a property condition (or reached from one), or with neither
+   * end bound, its edge source is the union of the edge tables, one FROM item. A variable-length relationship is a search
+   * from each row of the region so far where the order of its rows doesn't show (`walkFrom`), else smaltdb's `paths` in
+   * trail mode (no relationship twice) over it,
+   * and a shortest path a breadth-first search once both its ends are bound; each starts a region of its own.
    * Relationships are distinct within the pattern (Cypher's uniqueness): two relationships whose types can be the same
-   * must differ in type or rowid, and a variable-length relationship's hops must not hold the others.
+   * must differ in type or rowid, and a variable-length relationship's hops must not hold the others. The pattern's
+   * property maps and the conjuncts of `where` that can't raise an error are conditions of the region; the others
+   * filter its rows. With `ordered`, rows come in the order of the input, then of each scan (smaltdb's `ordered`
+   * joins' order), by a sort of the region's rows.
    */
-  private pattern(input: Rel, p: Pattern): Rel {
-    let plan = input.plan;
+  private pattern(input: Rel, p: Pattern, where: Expr | undefined, ordered: boolean): Rel {
     const types = [...input.frame.types];
     const slots = new Map(input.frame.slots);
     const frame = (): Frame => ({ types, slots });
-    const conds: PlanExpr[] = [];
+    let branches: Branch[] = [this.startBranch(input, ordered)];
+    // Conditions over the row's columns (the frame), placed once the slots they read are bound.
+    let pending: { slots: readonly number[]; cond: () => PlanExpr }[] = [];
+    // Conditions that can raise an error: they filter the region's rows.
+    const after: PlanExpr[] = [];
     const done = p.nodes.map(() => false);
     const nodeAt = (i: number): NodeBinding | undefined => {
       const b = slots.get(p.nodes[i]!.slot);
       if (b && b.k !== 'node') unsupported(`a node pattern on a variable that holds ${b.k === 'value' ? 'a value' : entity(this.valueOf(b) as Exclude<Val, { k: 'value' }>)}`);
       return b as NodeBinding | undefined;
     };
-    // A property map: checked as soon as the slots it reads are bound, else after the whole pattern.
-    const later: (() => PlanExpr)[] = [];
-    const check = (props: Expr | undefined, target: () => PlanExpr) => {
-      if (!props) return;
-      const cond = () => this.propsMatch(target(), props, frame());
-      if (slotsIn(props).every((s) => slots.has(s))) plan = { op: 'filter', input: plan, pred: cond() };
-      else later.push(cond);
+    const outOf = (b: Branch, col: number): PlanExpr => b.out[col]!;
+    /** Adds a column to the row: its expression in each branch. */
+    const addColumn = (t: PlanType, e: (b: Branch) => PlanExpr): number => {
+      for (const b of branches) b.out.push(e(b));
+      return types.push(t) - 1;
     };
-    const bindNew = (i: number, join: (src: PlanOp) => PlanOp) => {
+    /** A condition over the row's columns: in each branch's region when it can't raise an error, else after it. */
+    const place = (cond: PlanExpr) => {
+      for (const c of conjuncts(cond)) {
+        if (canRaise(c)) after.push(c);
+        else for (const b of branches) b.conds.push(inline(c, b.out));
+      }
+    };
+    const placeBound = () => {
+      const now = pending.filter((c) => c.slots.every((s) => slots.has(s)));
+      pending = pending.filter((c) => !now.includes(c));
+      for (const c of now) place(c.cond());
+    };
+    /** The region's rows as a plan of the row's columns, its conditions placed; a new region starts from them. */
+    const finish = (): PlanOp => {
+      placeBound();
+      let plan = this.joinRegions(branches, types, ordered);
+      if (after.length) plan = { op: 'filter', input: plan, pred: and(...after.splice(0)) };
+      return plan;
+    };
+    const restart = (plan: PlanOp) => {
+      branches = [this.startBranch({ plan, frame: frame() }, ordered)];
+    };
+    const check = (props: Expr | undefined, target: () => PlanExpr) => {
+      if (props) pending.push({ slots: slotsIn(props), cond: () => this.propsMatch(target(), props, frame()) });
+    };
+    /** Binds node `i` to a new scan of the node table, whose id is `on`'s expression in each branch, if any. */
+    const bindNew = (i: number, on: (b: Branch) => PlanExpr | undefined) => {
       const n = p.nodes[i]!;
       const id = types.length;
-      plan = join(this.nodeSource(n.labels));
+      for (const b of branches) {
+        const at = addLeaf(b, { op: 'scan', table: this.t.nodes, columns: [0, 1] }, 2);
+        const idCol = colRef(at, 'int');
+        const e = on(b);
+        if (e) b.conds.push(eq(idCol, e));
+        else if (ordered) b.keys.push(idCol);
+        b.out.push(idCol, colRef(at + 1, PROPS));
+        this.labelEntries(b, idCol, n.labels);
+      }
       types.push('int', PROPS);
       slots.set(n.slot, { k: 'node', id, props: id + 1 });
       done[i] = true;
       check(n.props, () => colRef(id + 1, PROPS));
     };
-    const scanNode = (i: number) => bindNew(i, (src) => ({ op: 'join', kind: 'cross', inputs: [plan, src], ordered: true }));
-    /** Adds a column computed from the row. */
-    const addColumn = (e: PlanExpr, t: PlanType): number => {
-      plan = { op: 'project', input: plan, exprs: [...types.map((ty, i) => colRef(i, ty)), e] };
-      return types.push(t) - 1;
+    // How selective a node's scan is: 2 with a property map or an equality in WHERE on its properties, 1 with labels.
+    const whereEq = new Set(conjunctsOf(where).flatMap((c) => (c.k === 'call' && c.fn === 'eq' ? c.args : [])).flatMap((a) => (a.k === 'prop' && a.of.k === 'slot' ? [a.of.i] : [])));
+    const score = (i: number) => {
+      const n = p.nodes[i]!;
+      return (n.props && n.props.k === 'map' && n.props.entries.length) || whereEq.has(n.slot) ? 2 : n.labels.length ? 1 : 0;
     };
+    // Nodes scanned without a property condition, and those the region reaches from them: a hop from each of their rows
+    // would cost more than a join of the union of the edge tables.
+    const weak = new Set<number>();
+    const scanNode = (i: number) => {
+      if (score(i) < 2) weak.add(i);
+      bindNew(i, () => undefined);
+    };
+    /** Whether node `i` is only a relationship's end: anonymous (nothing reads it), with no labels or properties. */
+    const endOnly = (i: number) => {
+      const n = p.nodes[i]!;
+      return this.idOnly.has(n.slot) && !n.labels.length && !n.props;
+    };
+    /** Binds node `i` to a relationship's end, `id` in each branch, without a scan of the node table (its properties are never read). */
+    const bindEnd = (i: number, id: (b: Branch) => PlanExpr) => {
+      const at = types.length;
+      for (const b of branches) b.out.push(id(b), { k: 'lit', value: null, type: PROPS });
+      types.push('int', PROPS);
+      slots.set(p.nodes[i]!.slot, { k: 'node', id: at, props: at + 1 });
+      done[i] = true;
+    };
+    /** Binds node `i` to where a relationship ends: its id only when nothing reads it, else a scan of the node table. */
+    const bindAt = (i: number, id: (b: Branch) => PlanExpr) => (endOnly(i) ? bindEnd(i, id) : bindNew(i, id));
 
+    /** Each type of a relationship, read as the pattern reads it (`both`: forward, then backward), in smaltcy's order. */
+    const choicesOf = (r: PatternRel) => (r.dir === 'both' ? [false, true] : [r.dir === 'in']).flatMap((reverse) => this.typeNames(r.types).map((type) => ({ type, reverse })));
+    const typeSet = (r: PatternRel) => new Set(this.typeNames(r.types));
+    const overlap = (a: PatternRel, b: PatternRel) => {
+      const t = typeSet(b);
+      return [...typeSet(a)].some((x) => t.has(x));
+    };
     const fixed: { r: PatternRel; b: RelBinding }[] = [];
+    // Relationships a hop from a row (`expand`) is distinct from already (its step checks them): the pairs need no check.
+    const distinct = new Set<PatternRel>();
     const lists: { r: PatternRel; hops: number }[] = [];
-    /** One hop: a join with the edge source, then with the node table at the far end unless it is bound. */
+    /**
+     * One hop: a scan of an edge table for each type and reading (a branch each), joined on the end that is bound, then
+     * the node table at the far end unless it is bound.
+     */
     const hop = (r: PatternRel) => {
-      if (!nodeAt(r.from) && !nodeAt(r.to)) scanNode(r.from);
-      const fromBound = nodeAt(r.from) !== undefined;
+      const choices = choicesOf(r);
+      // A scan of an edge table per branch; else a hop from each row of the region before it (`expand`), or, with
+      // neither end bound, the union of the edge tables, a FROM item whose rows smaltdb's planner doesn't know (it
+      // assumes 1,000), so its ends are joined with the node table, whose rows it knows.
+      const scans = choices.length > 0 && branches.length * choices.length <= this.maxBranches;
+      // A hop from a row: of several types or readings, or any hop from a node a hop from a row reached (the region's
+      // input is then a plan whose rows smaltdb's planner doesn't know, so it would scan an edge table whole).
+      const fromRow = choices.length > 0 && ((!scans && choices.length > 1) || (expanded && (nodeAt(r.from) !== undefined || nodeAt(r.to) !== undefined)));
+      if (!nodeAt(r.from) && !nodeAt(r.to) && !(scans && endOnly(r.from))) scanNode(r.from);
+      // Neither end bound: the relationship's scan comes first, and its `from` end is the node.
+      const free = !nodeAt(r.from) && !nodeAt(r.to);
+      const fromBound = free || nodeAt(r.from) !== undefined;
       const near = fromBound ? r.from : r.to;
       const far = fromBound ? r.to : r.from;
-      const [nearCol, farCol] = fromBound ? [E_FROM, E_TO] : [E_TO, E_FROM];
+      const nearId = free ? -1 : nodeAt(near)!.id;
       const farNode = nodeAt(far);
+      if (fromRow && !free && !weak.has(near)) return expand(r, choices, fromBound, nearId, far, farNode);
+      // The ends at the pattern's `from` and `to` nodes, in each branch.
+      const ends = new Map<Branch, { from: PlanExpr; to: PlanExpr }>();
+      if (scans) {
+        branches = branches.flatMap((b) =>
+          choices.map((c, k) => {
+            const nb = cloneBranch(b);
+            const at = addLeaf(nb, { op: 'scan', table: this.t.types.get(c.type)!, columns: [-1, 0, 1, 2] }, 4);
+            const start = colRef(at + 1, 'int');
+            const end = colRef(at + 2, 'int');
+            if (r.dir === 'both' && c.reverse) nb.conds.push(not(eq(start, end)));
+            nb.out.push(lit(c.type, 'text'), colRef(at, 'int'), start, end, colRef(at + 3, PROPS));
+            const e = c.reverse ? { from: end, to: start } : { from: start, to: end };
+            // In order of the `from` node when the relationship's scan comes first, as a scan of the node table would.
+            if (ordered) nb.keys.push(...(free ? [e.from] : []), ...(choices.length > 1 ? [lit(k)] : []), colRef(at, 'int'));
+            ends.set(nb, e);
+            return nb;
+          }),
+        );
+      } else {
+        // The union of the edge tables (none: no rows), one FROM item.
+        const source = this.edges(r.types, r.dir);
+        for (const b of branches) {
+          const at = addLeaf(b, source, EDGE_TYPES.length + 1);
+          for (let i = 0; i <= E_PROPS; i++) b.out.push(colRef(at + i, EDGE_TYPES[i]!));
+          if (ordered) b.keys.push(...(free ? [colRef(at + E_FROM, 'int')] : []), colRef(at + EDGE_TYPES.length, 'int'), colRef(at + E_ROWID, 'int'));
+          ends.set(b, { from: colRef(at + E_FROM, 'int'), to: colRef(at + E_TO, 'int') });
+        }
+      }
       const w = types.length;
-      const on = [eq(colRef(nodeAt(near)!.id, 'int'), rightRef(nearCol, 'int'))];
-      if (farNode) on.push(eq(colRef(farNode.id, 'int'), rightRef(farCol, 'int')));
-      plan = { op: 'join', kind: 'inner', inputs: [plan, this.edges(r.types, r.dir)], on: and(...on), ordered: true };
-      types.push(...EDGE_TYPES);
-      const b: RelBinding = { k: 'rel', type: w + E_TYPE, rowid: w + E_ROWID, start: w + E_START, end: w + E_END, props: w + E_PROPS };
-      slots.set(r.slot, b);
-      fixed.push({ r, b });
-      if (!farNode) bindNew(far, (src) => ({ op: 'join', kind: 'inner', inputs: [plan, src], on: eq(colRef(w + farCol, 'int'), rightRef(0, 'int')), ordered: true }));
-      check(r.props, () => colRef(b.props, PROPS));
+      types.push(...EDGE_TYPES.slice(0, E_PROPS + 1));
+      const rb: RelBinding = { k: 'rel', type: w + E_TYPE, rowid: w + E_ROWID, start: w + E_START, end: w + E_END, props: w + E_PROPS };
+      slots.set(r.slot, rb);
+      fixed.push({ r, b: rb });
+      for (const b of branches) {
+        const e = ends.get(b)!;
+        if (!free) b.conds.push(eq(outOf(b, nearId), fromBound ? e.from : e.to));
+        if (farNode) b.conds.push(eq(outOf(b, farNode.id), fromBound ? e.to : e.from));
+      }
+      if (free) bindEnd(near, (b) => ends.get(b)!.from);
+      if (!farNode) {
+        (scans ? bindAt : bindNew)(far, (b) => (fromBound ? ends.get(b)!.to : ends.get(b)!.from));
+        if (free || weak.has(near)) weak.add(far);
+      }
+      check(r.props, () => colRef(rb.props, PROPS));
     };
     /**
-     * A variable-length relationship or a shortest path: `paths` from the bound end, the far end joined (or checked),
-     * and the hops read in the pattern's direction.
+     * A hop from a row (`hopFrom`): the region so far, run once, then for each of its rows the relationships at the
+     * bound end, sought in the edge tables' `start` and `end` indexes, with the far end's node; a new region starts from
+     * them. `expanded`: a hop from a row has been made in this pattern.
+     */
+    let expanded = false;
+    const expand = (r: PatternRel, choices: readonly { type: string; reverse: boolean }[], fromBound: boolean, nearId: number, far: number, farNode: NodeBinding | undefined) => {
+      expanded = true;
+      // The far end's node, read where the hop is (its props, its labels checked there) unless it is bound or only an end.
+      const farNew = !farNode && !endOnly(far) ? p.nodes[far]! : undefined;
+      const w = types.length;
+      // Uniqueness with the relationships before it, checked as it is found (before the far end is read).
+      const before = fixed.filter((f) => overlap(f.r, r)).map((f) => f.b);
+      const plan = this.hopFrom({ plan: finish(), frame: frame() }, nearId, choices, r.dir, fromBound, farNode?.id, farNew?.labels, before, !this.idOnly.has(r.slot) || r.props !== undefined, ordered);
+      distinct.add(r);
+      types.push(...ADJ_TYPES);
+      restart(plan);
+      const rb: RelBinding = { k: 'rel', type: w + E_TYPE, rowid: w + E_ROWID, start: w + E_START, end: w + E_END, props: w + E_PROPS };
+      slots.set(r.slot, rb);
+      fixed.push({ r, b: rb });
+      if (!farNode) {
+        // Its id and props (NULL when only an end: nothing reads them).
+        slots.set(p.nodes[far]!.slot, { k: 'node', id: w + E_PROPS + 1, props: w + E_PROPS + 2 });
+        done[far] = true;
+        if (farNew) check(farNew.props, () => colRef(w + E_PROPS + 2, PROPS));
+      }
+      check(r.props, () => colRef(rb.props, PROPS));
+    };
+    /**
+     * A variable-length relationship or a shortest path, over the region so far: `paths` from the bound end (or, for
+     * one shortest path, a search from the `from` end), the far end joined (or checked) in a new region, and the hops
+     * read in the pattern's direction.
      */
     const walk = (r: PatternRel) => {
       const shortest = r.shortest;
@@ -1025,56 +1367,78 @@ export class Compiler {
       const names = this.typeNames(r.types);
       const dir = fromBound ? r.dir : r.dir === 'out' ? 'in' : r.dir === 'in' ? 'out' : 'both';
       const start = nodeAt(near)!.id;
+      let plan = finish();
+      // smaltcy's shortest path from a node to itself is the empty path, from minHops 0 only.
+      if (shortest && min === 1) plan = { op: 'filter', input: plan, pred: not(eq(colRef(nodeAt(r.from)!.id, 'int'), colRef(nodeAt(r.to)!.id, 'int'))) };
       const w = types.length;
+      if (shortest === 'one' && names.length) {
+        // One shortest path: a search that stops at the far end, its hops already in the pattern's direction.
+        const path = this.shortestPath(colRef(start, 'int'), colRef(nodeAt(far)!.id, 'int'), names, dir, min, r.max);
+        plan = { op: 'filter', input: { op: 'project', input: plan, exprs: [...types.map((t, i) => colRef(i, t)), path] }, pred: isNotNull(colRef(w, HOPS)) };
+        types.push(HOPS);
+        restart(plan);
+        slots.set(r.slot, { k: 'rels', hops: w });
+        lists.push({ r, hops: w });
+        return;
+      }
       if (!names.length) {
         // No edge table: only the empty path, from minHops 0.
         plan = { op: 'project', input: min === 0 ? plan : { op: 'filter', input: plan, pred: FALSE }, exprs: [...types.map((t, i) => colRef(i, t)), colRef(start, 'int'), lit(0), call('list_of', [], HOPS)] };
         types.push('int', 'int', HOPS);
-      } else {
-        // `both` reads a self-loop both ways, two paths the same: the rows are numbered first, and kept once each.
-        const dedupe = dir === 'both' && !shortest;
-        if (dedupe) plan = this.numbered({ plan, frame: frame() });
-        const at = dedupe ? w + 1 : w;
-        if (dedupe) types.push('int');
-        plan = {
-          op: 'paths',
-          input: plan,
-          start,
-          edges: names.map((t) => ({ table: this.t.types.get(t)!, start: 0, end: 1 })),
-          direction: dir,
-          minHops: min,
-          ...(r.max !== undefined ? { maxHops: r.max } : {}),
-          mode: shortest === 'all' ? 'acyclic' : shortest ? 'walk' : 'trail',
-          selector: shortest === 'all' ? 'allShortest' : shortest ? 'anyShortest' : 'all',
-        };
+      } else if (!ordered && !shortest) {
+        // Where the order doesn't show: a search from each row (`walkFrom`), its rows the paths found.
+        plan = this.walkFrom(plan, types, start, names, dir, min, r.max, !this.unread.has(r.slot) || r.props !== undefined || p.rels.length > 1);
         types.push('int', 'int', HOPS);
-        if (dedupe) plan = { op: 'distinct', input: plan, collations: types.map(() => 'binary'), on: [w, at + 2], keep: 'first', ordered: 'first' };
-        if (dedupe) {
-          // Drop the number: the columns after it move back one.
-          plan = { op: 'project', input: plan, exprs: types.flatMap((t, i) => (i === w ? [] : [colRef(i, t)])) };
-          types.splice(w, 1);
-        }
+      } else {
+        // Each row's paths, from a subquery (smaltdb's `paths` from that row's node), one row each.
+        const found = this.pathsFrom(colRef(start, 'int'), names, dir, min, r.max, shortest, ordered);
+        plan = { op: 'explode', input: { op: 'project', input: plan, exprs: [...types.map((t, i) => colRef(i, t)), found] }, column: w, type: `list<${FOUND}>`, keepNulls: false };
+        const field = (i: number, t: PlanType) => call('struct_field', [colRef(w, FOUND), lit(i)], t);
+        plan = { op: 'project', input: plan, exprs: [...types.map((t, i) => colRef(i, t)), field(0, 'int'), field(1, 'int'), field(2, HOPS)] };
+        types.push('int', 'int', HOPS);
       }
+      restart(plan);
       const last = w;
       const farNode = nodeAt(far);
-      if (farNode) plan = { op: 'filter', input: plan, pred: eq(colRef(last, 'int'), colRef(farNode.id, 'int')) };
-      else bindNew(far, (src) => ({ op: 'join', kind: 'inner', inputs: [plan, src], on: eq(colRef(last, 'int'), rightRef(0, 'int')), ordered: true }));
-      // smaltcy's shortest path from a node to itself is the empty path, from minHops 0 only.
-      if (shortest && min === 1) plan = { op: 'filter', input: plan, pred: not(eq(colRef(nodeAt(r.from)!.id, 'int'), colRef(nodeAt(r.to)!.id, 'int'))) };
-      const hops = addColumn(this.hopsInPatternOrder(colRef(w + 2, HOPS), names, !fromBound), HOPS);
+      if (farNode) for (const b of branches) b.conds.push(eq(outOf(b, farNode.id), outOf(b, last)));
+      // A node only this relationship reaches; else the node table, whose rows the planner knows, joins it to the others.
+      else if (p.rels.every((x) => x === r || (x.from !== far && x.to !== far))) bindAt(far, (b) => outOf(b, last));
+      else bindNew(far, (b) => outOf(b, last));
+      if (!farNode && weak.has(near)) weak.add(far);
+      const hops = addColumn(HOPS, (b) => this.hopsInPatternOrder(outOf(b, w + 2), names, !fromBound));
       slots.set(r.slot, { k: 'rels', hops });
       lists.push({ r, hops });
       if (r.props) {
         if (slotsIn(r.props).length) unsupported('a variable-length relationship whose properties read variables');
         // Every hop's relationship has the properties: no hop without them.
         const match = this.propsMatch(colRef(5, PROPS), r.props, { types: [], slots: new Map() });
-        conds.push(not({ k: 'subquery', mode: 'exists', type: 'bool', collation: 'binary', plan: { op: 'filter', input: this.relRows(colRef(hops, HOPS)), pred: caseWhen([[match, FALSE]], TRUE, 'bool') } }));
+        pending.push({ slots: [], cond: () => not({ k: 'subquery', mode: 'exists', type: 'bool', collation: 'binary', plan: { op: 'filter', input: this.relRows(colRef(hops, HOPS)), pred: caseWhen([[match, FALSE]], TRUE, 'bool') } }) });
       }
     };
 
-    for (const r of p.rels) {
+    // Relationships in the pattern's order, except that a hop from a row (`expand`) starts where the pattern is bound,
+    // or at its most selective node: a relationship with a bound end first, else a scan of the node with a property
+    // map or an equality in WHERE on its properties, else with labels, else the first relationship's `from` node. Not
+    // where the order shows: rows then come in the order of the pattern's first node, as before.
+    for (const r of p.rels) if (r.shortest && slots.has(r.slot)) unsupported('a relationship pattern on a variable that is already bound');
+    const rest = p.rels.filter((r) => !r.shortest);
+    const isBound = (r: PatternRel) => nodeAt(r.from) !== undefined || nodeAt(r.to) !== undefined;
+    while (rest.length) {
+      let r = rest[0]!;
+      if (!ordered && r.min === undefined && !isBound(r) && choicesOf(r).length > 1 && branches.length * choicesOf(r).length > this.maxBranches) {
+        const next = rest.find(isBound);
+        if (next) r = next;
+        else {
+          const ends = rest.filter((x) => x.min === undefined).flatMap((x) => [x.from, x.to]);
+          const best = ends.reduce((a, b) => (score(b) > score(a) ? b : a), r.from);
+          if (best !== r.from) {
+            scanNode(best);
+            r = rest.find(isBound)!;
+          }
+        }
+      }
+      rest.splice(rest.indexOf(r), 1);
       if (slots.has(r.slot)) unsupported('a relationship pattern on a variable that is already bound');
-      if (r.shortest) continue;
       if (r.min !== undefined) walk(r);
       else hop(r);
     }
@@ -1083,7 +1447,7 @@ export class Compiler {
       if (done[i]) return;
       const b = nodeAt(i);
       if (!b) return scanNode(i);
-      if (n.labels.length) conds.push(this.hasLabels(colRef(b.id, 'int'), n.labels));
+      for (const br of branches) this.labelEntries(br, outOf(br, b.id), n.labels);
       check(n.props, () => colRef(b.props, PROPS));
     });
     const shortest = p.rels.filter((r) => r.shortest);
@@ -1091,27 +1455,31 @@ export class Compiler {
     for (const r of shortest) walk(r);
 
     // Uniqueness: relationships whose types can't be the same are distinct already.
-    const typeSet = (r: PatternRel) => new Set(this.typeNames(r.types));
-    const overlap = (a: PatternRel, b: PatternRel) => {
-      const t = typeSet(b);
-      return [...typeSet(a)].some((x) => t.has(x));
-    };
     fixed.forEach(({ r, b }, i) => {
       for (const { r: r2, b: b2 } of fixed.slice(i + 1)) {
-        if (overlap(r, r2)) conds.push(not(and(eq(colRef(b.type, 'text'), colRef(b2.type, 'text')), eq(colRef(b.rowid, 'int'), colRef(b2.rowid, 'int')))));
+        if (!overlap(r, r2) || distinct.has(r2)) continue;
+        for (const br of branches) {
+          const [t1, t2] = [outOf(br, b.type), outOf(br, b2.type)];
+          const sameRow = eq(outOf(br, b.rowid), outOf(br, b2.rowid));
+          if (t1.k !== 'lit' || t2.k !== 'lit') br.conds.push(not(and(eq(t1, t2), sameRow)));
+          else if (t1.value === t2.value) br.conds.push(not(sameRow));
+        }
       }
       for (const l of lists) {
         if (!overlap(r, l.r)) continue;
         const hopOf = (i: number) => call('struct_field', [colRef(0, HOP), lit(i)], 'int');
-        const same = and(eq(hopOf(0), deepen(this.typeIndexOf(colRef(b.type, 'text')))), eq(hopOf(1), deepen(colRef(b.rowid, 'int'))));
-        conds.push(not({ k: 'subquery', mode: 'exists', type: 'bool', collation: 'binary', plan: { op: 'filter', input: this.hopRows(colRef(l.hops, HOPS)), pred: same } }));
+        pending.push({
+          slots: [],
+          cond: () => {
+            const same = and(eq(hopOf(0), deepen(this.typeIndexOf(colRef(b.type, 'text')))), eq(hopOf(1), deepen(colRef(b.rowid, 'int'))));
+            return not({ k: 'subquery', mode: 'exists', type: 'bool', collation: 'binary', plan: { op: 'filter', input: this.hopRows(colRef(l.hops, HOPS)), pred: same } });
+          },
+        });
       }
     });
     lists.forEach((l, i) => {
       for (const l2 of lists.slice(i + 1)) if (overlap(l.r, l2.r)) unsupported('two variable-length relationships in one MATCH');
     });
-    conds.push(...later.map((f) => f()));
-    if (conds.length) plan = { op: 'filter', input: plan, pred: and(...conds) };
 
     // Named paths: the first node, and the hops of the relationships in order.
     for (const path of p.paths ?? []) {
@@ -1125,9 +1493,181 @@ export class Compiler {
       });
       const hops = segments.length ? segments.reduce((a, b) => call('list_concat', [a, b], HOPS)) : call('list_of', [], HOPS);
       const start = nodeAt(path.nodes[0]!)!.id;
-      slots.set(path.slot, { k: 'path', start, hops: addColumn(hops, HOPS) });
+      slots.set(path.slot, { k: 'path', start, hops: addColumn(HOPS, (b) => inline(hops, b.out)) });
     }
-    return { plan, frame: frame() };
+    if (where) pending.push({ slots: [], cond: () => this.predicate(where, frame(), 'WHERE') });
+    return { plan: finish(), frame: frame() };
+  }
+
+  /** A region's first branch: the input as its first FROM item (numbered when the order is kept), unless it is one empty row. */
+  private startBranch(input: Rel, ordered: boolean): Branch {
+    const p = input.plan;
+    const w = input.frame.types.length;
+    if (!w && p.op === 'values' && p.rows.length === 1) return { leaves: [], width: 0, conds: [], out: [], keys: [] };
+    // One row has its order already.
+    const number = ordered && !(p.op === 'values' && p.rows.length <= 1);
+    return {
+      leaves: [number ? this.numbered(input) : p],
+      width: number ? w + 1 : w,
+      conds: [],
+      out: input.frame.types.map((t, i) => colRef(i, t)),
+      keys: number ? [colRef(w, 'int')] : [],
+    };
+  }
+
+  /**
+   * The rows of a region's branches as a plan of the row's columns (`types`): each branch's FROM items joined, its
+   * conditions over them and its columns projected (a flat SELECT, smaltdb's join region), the branches' rows in one
+   * union; with `ordered`, sorted by their keys.
+   */
+  private joinRegions(branches: readonly Branch[], types: readonly PlanType[], ordered: boolean): PlanOp {
+    const plans = branches.map((b): PlanOp => {
+      const first = b.leaves[0];
+      // Only the input, as it is: its plan.
+      if (b.leaves.length === 1 && !b.conds.length && !b.keys.length && b.out.length === b.width && b.out.every((e, i) => e.k === 'col' && e.index === i && e.depth === 0)) return first!;
+      let plan: PlanOp = first ? b.leaves.slice(1).reduce((l, r): PlanOp => ({ op: 'join', kind: 'cross', inputs: [l, r] }), first) : { op: 'values', rows: [[]], types: [] };
+      if (b.conds.length) plan = { op: 'filter', input: plan, pred: and(...b.conds) };
+      return { op: 'project', input: plan, exprs: ordered ? [...b.out, ...b.keys] : b.out };
+    });
+    const keys = ordered ? branches[0]!.keys.length : 0;
+    const collations = [...types, ...Array.from({ length: keys }, () => 'int')].map(() => 'binary' as const);
+    let plan = plans.reduce((a, b): PlanOp => ({ op: 'setop', kind: 'unionAll', inputs: [a, b], collations }));
+    if (keys) {
+      const w = types.length;
+      plan = { op: 'sort', input: plan, keys: Array.from({ length: keys }, (_, i) => ({ expr: colRef(w + i, 'int'), desc: false, nullsFirst: false, collation: 'binary' as const })) };
+      plan = { op: 'project', input: plan, exprs: types.map((t, i) => colRef(i, t)) };
+    }
+    return plan;
+  }
+
+  /** A node's labels in a branch: an entry in the label index for each (one at most: the index is unique on label and node). */
+  private labelEntries(b: Branch, id: PlanExpr, labels: readonly string[]): void {
+    for (const l of labels) {
+      const at = addLeaf(b, { op: 'scan', table: this.t.labels, columns: [0, 1] }, 2);
+      b.conds.push(eq(colRef(at, 'int'), id), eq(colRef(at + 1, 'text'), lit(l)));
+    }
+  }
+
+  /**
+   * The paths from a node (`from`, an expression of the row) along these edge tables, as a scalar subquery: a list of
+   * `FOUND` structs (where each path ends, its length, its hops), in `paths`' order (shortest first). smaltdb's `paths`
+   * runs over the one row of the subquery, so the plan of the rows it starts from is run once, not once for the search
+   * and once to join its paths back. `both` reads a self-loop both ways, two paths the same: each kept once.
+   */
+  private pathsFrom(from: PlanExpr, names: readonly string[], dir: Direction, min: number, max: number | undefined, shortest: PatternRel['shortest'], ordered: boolean): PlanExpr {
+    let paths: PlanOp = {
+      op: 'paths',
+      input: { op: 'values', rows: [[deepen(from)]], types: ['int'] },
+      start: 0,
+      edges: names.map((t) => ({ table: this.t.types.get(t)!, start: 0, end: 1 })),
+      direction: dir,
+      minHops: min,
+      ...(max !== undefined ? { maxHops: max } : {}),
+      mode: shortest === 'all' ? 'acyclic' : shortest ? 'walk' : 'trail',
+      selector: shortest === 'all' ? 'allShortest' : shortest ? 'anyShortest' : 'all',
+    };
+    // Columns: the start, where the path ends, its length, its hops.
+    if (dir === 'both' && !shortest) paths = { op: 'distinct', input: paths, collations: [0, 1, 2, 3].map(() => 'binary'), on: [3], keep: 'first', ...(ordered ? { ordered: 'first' as const } : {}) };
+    const each: PlanOp = { op: 'project', input: paths, exprs: [call('struct_of', [colRef(1, 'int'), colRef(2, 'int'), colRef(3, HOPS)], FOUND)] };
+    const list: PlanType = `list<${FOUND}>`;
+    const agg: PlanOp = { op: 'aggregate', input: each, keys: [], aggs: [{ fn: 'implode', args: [colRef(0, FOUND)], star: false, distinct: false, collation: 'binary', type: list }], carry: [] };
+    return { k: 'subquery', mode: 'scalar', plan: agg, type: list, collation: 'binary' };
+  }
+
+  /**
+   * The paths from each row of `left` (whose columns are `lt`) at its node `near` along these edge tables, in trail mode
+   * (no relationship twice), as the rows of `pathsFrom` exploded: the row, then where the path ends, its length and,
+   * with `hops`, its hops as `paths` gives them (else NULL: nothing reads them). In no particular order: smaltdb's
+   * `iterate`, whose rows are the row and the path so far, with a step per table and reading that joins the path's
+   * last node (`working`, which the planner reads a row at a time) with the edge table's `start` or `end` index, so it
+   * seeks for each path rather than running `paths` (its input twice, its paths sorted) in a subquery for each row, and
+   * a relationship already on the path (its identity, as `paths` makes it, in columns or a list) is not walked again. `both` reads
+   * a self-loop once (`paths` reads it both ways, the two paths the same, one kept). Its tables are read in the
+   * present, as `paths` reads them.
+   */
+  private walkFrom(left: PlanOp, lt: readonly PlanType[], near: number, names: readonly string[], dir: Direction, min: number, max: number | undefined, hops: boolean): PlanOp {
+    const id = ++this.iterates;
+    const w = lt.length;
+    const INTS: PlanType = 'list<int>';
+    // The relationships on the path, to walk none twice: for a short bounded search one column for each but the last
+    // hop's (the latest first, shifted along at each hop; NULL for none), else a list.
+    const slots = max !== undefined && max <= WALK_COLUMNS ? Math.max(0, max - 1) : -1;
+    // Columns: the row's, the path's last node, its length, its hops (NULL without `hops`), the relationships on it.
+    const [END, LEN, PATH, IDS] = [w, w + 1, w + 2, w + 3];
+    const iterTypes: PlanType[] = [...lt, 'int', 'int', HOPS, ...(slots < 0 ? [INTS] : Array.from({ length: slots }, (): PlanType => 'int'))];
+    const nearCol = colRef(near, 'int');
+    const init: PlanOp = {
+      op: 'project',
+      input: { op: 'filter', input: left, pred: isNotNull(nearCol) },
+      exprs: [...lt.map((t, i) => colRef(i, t)), nearCol, lit(0), hops ? call('list_of', [], HOPS) : lit(null, HOPS), ...(slots < 0 ? [call('list_of', [], INTS)] : Array.from({ length: slots }, () => lit(null, 'int')))],
+    };
+    const ways: boolean[] = dir === 'out' ? [false] : dir === 'in' ? [true] : [false, true];
+    const steps = names.flatMap((name, i) =>
+      ways.map((reverse): PlanOp => {
+        const table = this.t.types.get(name)!;
+        const b: Branch = { leaves: [{ op: 'working', id, types: iterTypes }], width: iterTypes.length, conds: [], out: [], keys: [] };
+        const e = addLeaf(b, { op: 'scan', table, columns: [-1, 0, 1], indexedBy: `${table}_${reverse ? 'end' : 'start'}` }, 3);
+        const [from, to] = reverse ? [colRef(e + 2, 'int'), colRef(e + 1, 'int')] : [colRef(e + 1, 'int'), colRef(e + 2, 'int')];
+        // A relationship's identity as `paths` makes it: its rowid, with its table's position when there are several.
+        const rel = names.length === 1 ? colRef(e, 'int') : call('add', [call('mul', [colRef(e, 'int'), lit(names.length)], 'int'), lit(i)], 'int');
+        b.conds.push(eq(from, colRef(END, 'int')));
+        if (slots < 0) b.conds.push(not(call('list_contains', [colRef(IDS, INTS), rel], 'int')));
+        else for (let k = 0; k < slots; k++) b.conds.push({ k: 'or', args: [isNull(colRef(IDS + k, 'int')), not(eq(colRef(IDS + k, 'int'), rel))] });
+        // `both`: the reverse reading of a self-loop is the same path.
+        if (dir === 'both' && reverse) b.conds.push(not(eq(from, to)));
+        const hop = call('struct_of', [lit(i), colRef(e, 'int'), from, to], HOP);
+        const joined = b.leaves.slice(1).reduce((l, x): PlanOp => ({ op: 'join', kind: 'cross', inputs: [l, x] }), b.leaves[0]!);
+        const exprs = [
+          ...lt.map((t, k) => colRef(k, t)),
+          to,
+          call('add', [colRef(LEN, 'int'), lit(1)], 'int'),
+          hops ? call('list_concat', [colRef(PATH, HOPS), call('list_of', [hop], HOPS)], HOPS) : lit(null, HOPS),
+          ...(slots < 0 ? [call('list_concat', [colRef(IDS, INTS), call('list_of', [rel], INTS)], INTS)] : Array.from({ length: slots }, (_, k) => (k === 0 ? rel : colRef(IDS + k - 1, 'int')))),
+        ];
+        return { op: 'project', input: { op: 'filter', input: joined, pred: and(...b.conds) }, exprs };
+      }),
+    );
+    let plan: PlanOp = { op: 'iterate', id, name: 'walk', init, steps, distinct: false, collations: iterTypes.map(() => 'binary'), ...(max !== undefined ? { maxDepth: max } : {}) };
+    if (min > 0) plan = { op: 'filter', input: plan, pred: call('cmp_ge', [colRef(LEN, 'int'), lit(min)], 'bool') };
+    return { op: 'project', input: plan, exprs: [...lt.map((t, i) => colRef(i, t)), colRef(END, 'int'), colRef(LEN, 'int'), colRef(PATH, HOPS)] };
+  }
+
+  /**
+   * One shortest path from `from` to `to` (expressions of the row), in the pattern's direction, or NULL: a scalar
+   * subquery of a breadth-first search from `from` (smaltdb's `iterate`, the first row reaching each node kept, so its
+   * hops are a shortest path there), whose first row at `to` stops it (smaltdb runs an iterate's steps as its rows are
+   * read). Its hops give each relationship's type as its position in the graph's types.
+   */
+  private shortestPath(from: PlanExpr, to: PlanExpr, names: readonly string[], dir: Direction, min: number, max: number | undefined): PlanExpr {
+    const id = ++this.iterates;
+    const all = [...this.t.types.keys()];
+    const at = (input: 0 | 1, index: number, type: PlanType): PlanExpr => ({ k: 'col', input, index, depth: 0, type, collation: 'binary' });
+    // Columns: the node reached, its hops from `from`, the path.
+    const iterTypes: PlanType[] = ['int', 'int', HOPS];
+    const working: PlanOp = { op: 'working', id, types: iterTypes };
+    const steps = names.flatMap((name, i): PlanOp[] => {
+      const ways: [number, number][] = dir === 'out' ? [[0, 1]] : dir === 'in' ? [[1, 0]] : [[0, 1], [1, 0]];
+      return ways.map(([f, t]): PlanOp => {
+        const edge: PlanOp = { op: 'scan', table: this.t.types.get(name)!, columns: [f, t, -1] };
+        const joined: PlanOp = { op: 'join', kind: 'inner', inputs: [working, edge], on: eq(at(1, 0, 'int'), at(0, 0, 'int')) };
+        const hop = call('struct_of', [lit(all.indexOf(name)), at(0, 5, 'int'), at(0, 3, 'int'), at(0, 4, 'int')], HOP);
+        return { op: 'project', input: joined, exprs: [at(0, 4, 'int'), call('add', [at(0, 1, 'int'), lit(1)], 'int'), call('list_concat', [at(0, 2, HOPS), call('list_of', [hop], HOPS)], HOPS)] };
+      });
+    });
+    const search: PlanOp = {
+      op: 'iterate',
+      id,
+      name: 'shortest',
+      init: { op: 'values', rows: [[deepen(from), lit(0), call('list_of', [], HOPS)]], types: iterTypes },
+      steps,
+      distinct: true,
+      collations: iterTypes.map(() => 'binary'),
+      key: [0],
+      ...(max !== undefined ? { maxDepth: max } : {}),
+    };
+    const found: PlanOp = { op: 'filter', input: search, pred: and(eq(colRef(0, 'int'), deepen(to)), call('cmp_ge', [colRef(1, 'int'), lit(min)], 'bool')) };
+    const first: PlanOp = { op: 'limit', input: { op: 'project', input: found, exprs: [colRef(2, HOPS)] }, count: lit(1) };
+    return { k: 'subquery', mode: 'scalar', plan: first, type: HOPS, collation: 'binary' };
   }
 
   /** A plan's rows numbered in order (a window's `row_number`), in a last column. */
@@ -1188,35 +1728,117 @@ export class Compiler {
     return { op: 'project', input: joined, exprs: [colRef(0, HOP), colRef(2, 'text'), colRef(3, 'int'), colRef(4, 'int'), colRef(5, 'int'), colRef(6, PROPS)] };
   }
 
-  /** Every node with these labels (semi-joins on the label index), in the node table's order: columns `id`, `props`. */
-  private nodeSource(labels: readonly string[]): PlanOp {
-    let src: PlanOp = { op: 'scan', table: this.t.nodes, columns: [0, 1] };
-    for (const l of labels) {
-      const entries: PlanOp = { op: 'filter', input: { op: 'scan', table: this.t.labels, columns: [0, 1] }, pred: eq(colRef(1, 'text'), lit(l)) };
-      src = { op: 'join', kind: 'semi', inputs: [src, entries], on: eq(colRef(0, 'int'), rightRef(0, 'int')), ordered: true };
-    }
-    return src;
-  }
-
   /**
    * The relationships of these types (none: every type), each as a row of `EDGE_TYPES` read in the pattern's
-   * direction: `out` from start to end, `in` from end to start, `both` either way, a self-loop once (as smaltcy's
-   * stores expand it). A union of the types' edge tables; a type the graph doesn't have has no relationships.
+   * direction, then its part's position (the order `ordered` keeps): `out` from start to end, `in` from end to start,
+   * `both` either way, a self-loop once (as smaltcy's stores expand it). A union of the types' edge tables; a type the
+   * graph doesn't have has no relationships.
    */
   private edges(types: readonly string[], dir: Direction): PlanOp {
     const names = this.typeNames(types);
-    const branch = (type: string, reverse: boolean): PlanOp => {
+    const branch = (type: string, reverse: boolean, position: number): PlanOp => {
       const scan: PlanOp = { op: 'scan', table: this.t.types.get(type)!, columns: [-1, 0, 1, 2] };
       const start = colRef(1, 'int');
       const end = colRef(2, 'int');
-      const exprs = [lit(type, 'text'), colRef(0, 'int'), start, end, colRef(3, PROPS), reverse ? end : start, reverse ? start : end];
+      const exprs = [lit(type, 'text'), colRef(0, 'int'), start, end, colRef(3, PROPS), reverse ? end : start, reverse ? start : end, lit(position)];
       // `both`: the reverse reading of a self-loop is the same match.
       return { op: 'project', input: dir === 'both' && reverse ? { op: 'filter', input: scan, pred: not(eq(start, end)) } : scan, exprs };
     };
-    const parts = dir === 'both' ? [...names.map((t) => branch(t, false)), ...names.map((t) => branch(t, true))] : names.map((t) => branch(t, dir === 'in'));
-    if (!parts.length) return { op: 'values', rows: [], types: EDGE_TYPES };
-    const collations = EDGE_TYPES.map(() => 'binary' as const);
+    const readings = dir === 'both' ? [false, true] : [dir === 'in'];
+    const parts = readings.flatMap((reverse) => names.map((t) => ({ t, reverse }))).map(({ t, reverse }, i) => branch(t, reverse, i));
+    const columns: PlanType[] = [...EDGE_TYPES, 'int'];
+    if (!parts.length) return { op: 'values', rows: [], types: columns };
+    const collations = columns.map(() => 'binary' as const);
     return parts.reduce((a, b) => ({ op: 'setop', kind: 'unionAll', inputs: [a, b], collations }));
+  }
+
+  /**
+   * One hop from each row of `left` (the region before it, run once): the row, then a relationship at its node `near`
+   * of one of `choices` (`ADJ_TYPES`: the relationship's columns, its other end, that node's props). smaltdb's
+   * `iterate` with one step per choice: a step joins the rows (`working`, which the planner reads a row at a time) with
+   * the type's edge table on the end that is bound, so it seeks into its `start` or `end` index for each row, then, with
+   * `labels`, into the node table by the other end (and the label index for each label); without, the props are NULL.
+   * `bound`: the far end's column when it is bound (the step checks it); `before`: the row's relationships it must
+   * differ from (Cypher's uniqueness, checked before the far end is read). `read`: whether the relationship's ends and
+   * props are read (else NULL, and the edge table's index covers what the step reads). `both`'s reverse reading leaves
+   * self-loops out (one match). With `ordered`, rows come in the order of `left`, then of the choices, then of rowid.
+   */
+  private hopFrom(left: Rel, near: number, choices: readonly { type: string; reverse: boolean }[], dir: Direction, fromBound: boolean, bound: number | undefined, labels: readonly string[] | undefined, before: readonly RelBinding[], read: boolean, ordered: boolean): PlanOp {
+    const id = ++this.iterates;
+    const lt = left.frame.types;
+    // The iterate keeps a row for each hop found, so it carries only what varies: the row's columns that are not the
+    // same literal on every row (`constantsOf`: ends and properties nothing reads, a relationship's one type) and the
+    // hop's columns that differ between rows; the others are put back after it.
+    const consts = constantsOf(left.plan);
+    const carried = lt.flatMap((_, i) => (consts[i] ? [] : [i]));
+    const pos = new Map(carried.map((c, k) => [c, k]));
+    /** A column of the row, in the iterate. */
+    const rowCol = (i: number): PlanExpr => consts[i] ?? colRef(pos.get(i)!, lt[i]!);
+    const nulls = (ts: readonly PlanType[]): PlanExpr[] => ts.map((t) => ({ k: 'lit', value: null, type: t }));
+    const input = ordered ? this.numbered(left) : left.plan;
+    const base: PlanType[] = [...carried.map((i) => lt[i]!), ...(ordered ? ['int' as PlanType] : [])];
+    const w = carried.length;
+    const varying = (exprs: readonly PlanExpr[][]): boolean[] => exprs[0]!.map((e, j) => !exprs.every((x) => x[j]!.k === 'lit' && e.k === 'lit' && x[j]!.value === e.value));
+    // The hop's columns (`ADJ_TYPES`, then the choice's position) as each step gives them, the edge scan's at `e`.
+    const hopOf = (type: string, i: number, e: number, other: PlanExpr, props: PlanExpr): PlanExpr[] => {
+      const opt = (x: PlanExpr, t: PlanType): PlanExpr => (read ? x : { k: 'lit', value: null, type: t });
+      return [lit(type, 'text'), colRef(e, 'int'), opt(colRef(e + 1, 'int'), 'int'), opt(colRef(e + 2, 'int'), 'int'), opt(colRef(e + 3, PROPS), PROPS), other, props, lit(i)];
+    };
+    const hopTypes: PlanType[] = [...ADJ_TYPES, 'int'];
+    // The hop columns the iterate keeps: those the steps don't all give as the same literal (seen in the steps'
+    // expressions with any columns: a column varies).
+    const dry = choices.map(({ type }, i) => hopOf(type, i, 0, colRef(0, 'int'), labels ? colRef(0, PROPS) : { k: 'lit', value: null, type: PROPS }));
+    const keep = varying(dry).map((v, j) => v || dry.some((x) => x[j]!.k !== 'lit'));
+    // The choice's position orders rows (with `ordered`); else it is not needed.
+    keep[hopTypes.length - 1] = ordered;
+    const kept = hopTypes.flatMap((_, j) => (keep[j] ? [j] : []));
+    const iterTypes: PlanType[] = [...base, ...kept.map((j) => hopTypes[j]!)];
+    // The rowid (always kept: it varies) is NULL in a row of `left` and set in a hop's.
+    const ROWID = base.length + kept.indexOf(E_ROWID);
+    const init: PlanOp = { op: 'project', input, exprs: [...carried.map((i) => colRef(i, lt[i]!)), ...(ordered ? [colRef(lt.length, 'int')] : []), ...nulls(kept.map((j) => hopTypes[j]!))] };
+    const steps = choices.map(({ type, reverse }, i): PlanOp => {
+      const b: Branch = { leaves: [{ op: 'working', id, types: iterTypes }], width: iterTypes.length, conds: [], out: [], keys: [] };
+      // The end that is bound: `start` when the pattern's bound end is its `from` end, read forward.
+      const atStart = fromBound !== reverse;
+      // Its index, by the name smaltdb's `addType` gives it: the planner estimates a seek by the average rows per value,
+      // which for a type whose ends are few (people living in a few cities) is more than a scan costs, but a hop reads
+      // one node's. Its props only when read.
+      const table = this.t.types.get(type)!;
+      const e = addLeaf(b, { op: 'scan', table, columns: read ? [-1, 0, 1, 2] : [-1, 0, 1], ...(this.asOf ? {} : { indexedBy: `${table}_${atStart ? 'start' : 'end'}` }) }, read ? 4 : 3);
+      const start = colRef(e + 1, 'int');
+      const end = colRef(e + 2, 'int');
+      const [seek, other] = atStart ? [start, end] : [end, start];
+      b.conds.push(eq(seek, rowCol(near)));
+      if (dir === 'both' && reverse) b.conds.push(not(eq(start, end)));
+      if (bound !== undefined) b.conds.push(eq(other, rowCol(bound)));
+      for (const x of before) {
+        // A relationship of one type has it as a literal: the same as this one's, or never the same relationship.
+        const t = rowCol(x.type);
+        const sameRow = eq(rowCol(x.rowid), colRef(e, 'int'));
+        if (t.k !== 'lit') b.conds.push(not(and(eq(t, lit(type, 'text')), sameRow)));
+        else if (t.value === type) b.conds.push(not(sameRow));
+      }
+      let props: PlanExpr = { k: 'lit', value: null, type: PROPS };
+      if (labels) {
+        const n = addLeaf(b, { op: 'scan', table: this.t.nodes, columns: [0, 1] }, 2);
+        b.conds.push(eq(colRef(n, 'int'), other));
+        props = colRef(n + 1, PROPS);
+        this.labelEntries(b, other, labels);
+      }
+      const hop = hopOf(type, i, e, other, props);
+      const joined = b.leaves.slice(1).reduce((l, x): PlanOp => ({ op: 'join', kind: 'cross', inputs: [l, x] }), b.leaves[0]!);
+      const exprs = [...base.map((t, k) => colRef(k, t)), ...kept.map((j) => hop[j]!)];
+      return { op: 'project', input: { op: 'filter', input: joined, pred: and(...b.conds) }, exprs };
+    });
+    let plan: PlanOp = { op: 'iterate', id, name: HOP_ITERATE, init, steps, distinct: false, collations: iterTypes.map(() => 'binary'), maxDepth: 1 };
+    // The hops: not the rows of `left`, whose rowid is NULL.
+    plan = { op: 'filter', input: plan, pred: isNotNull(colRef(ROWID, 'int')) };
+    if (ordered) {
+      const key = (i: number) => ({ expr: colRef(i, 'int'), desc: false, nullsFirst: false, collation: 'binary' as const });
+      plan = { op: 'sort', input: plan, keys: [key(w), key(iterTypes.length - 1), key(ROWID)] };
+    }
+    const hopCol = (j: number): PlanExpr => (keep[j] ? colRef(base.length + kept.indexOf(j), hopTypes[j]!) : dry[0]![j]!);
+    return { op: 'project', input: plan, exprs: [...lt.map((_, i) => rowCol(i)), ...ADJ_TYPES.map((_, j) => hopCol(j))] };
   }
 
   /** A pattern's property map: each key equals its value (Cypher's `=`, true). */
@@ -1263,7 +1885,7 @@ export class Compiler {
     return { plan: { op: 'project', input: r.plan, exprs }, frame: { types, slots } };
   }
 
-  private aggregate(r: Rel, keys: readonly Projection[], aggs: readonly AggCall[]): Rel {
+  private aggregate(r: Rel, keys: readonly Projection[], aggs: readonly AggCall[], ordered: boolean): Rel {
     const keyExprs: { expr: PlanExpr; collation: 'binary' }[] = [];
     const carry: PlanExpr[] = [];
     const types: PlanType[] = [];
@@ -1303,7 +1925,7 @@ export class Compiler {
       carry.push(c.props);
       types.push(PROPS);
     }
-    let out: Rel = { plan: { op: 'aggregate', input: r.plan, keys: keyExprs, aggs: calls, carry, ordered: 'first' }, frame: { types, slots } };
+    let out: Rel = { plan: { op: 'aggregate', input: r.plan, keys: keyExprs, aggs: calls, carry, ...(ordered && keyExprs.length ? { ordered: 'first' as const } : {}) }, frame: { types, slots } };
     if (post.length) {
       // Results that need a step after the aggregate (collect's NULLs dropped, sum's 0 for no rows).
       const exprs = out.frame.types.map((t, i) => colRef(i, t));
@@ -1374,7 +1996,7 @@ export class Compiler {
     const k = staticKind(v.t);
     if (k === K_NUMBER || k === K_NULL) return v.e;
     if (k !== undefined) return unsupported(`${what} of a ${v.t}`);
-    return caseWhen([[isNull(v.e), NULL], [eq(kindExpr(v), lit(K_NUMBER)), v.e]], raise('SMALTCY_TYPE', message(`${what} can't take a `, typeNameExpr(v))), 'any');
+    return caseWhen([[isNull(v.e), NULL], [isNumber(v), v.e]], raise('SMALTCY_TYPE', message(`${what} can't take a `, typeNameExpr(v))), 'any');
   }
 
   /**
@@ -1442,8 +2064,8 @@ export class Compiler {
     return { plan, frame: { types: [...r.frame.types, elem], slots } };
   }
 
-  private union(op: Extract<Op, { op: 'union' }>): Rel {
-    const branches = op.inputs.map((i) => this.op(i));
+  private union(op: Extract<Op, { op: 'union' }>, ordered: boolean): Rel {
+    const branches = op.inputs.map((i) => this.op(i, ordered));
     const types: PlanType[] = [];
     op.slots.forEach((s, i) => {
       const bs = branches.map((b) => b.frame.slots.get(s) ?? unsupported('a UNION branch without a column'));
@@ -1458,7 +2080,7 @@ export class Compiler {
     for (const p of projected.slice(1)) plan = { op: 'setop', kind: 'unionAll', inputs: [plan, p], collations };
     if (!op.all) {
       for (const t of types) this.groupable(t, 'UNION of');
-      plan = { op: 'distinct', input: plan, collations, ordered: 'first' };
+      plan = { op: 'distinct', input: plan, collations, ...(ordered ? { ordered: 'first' as const } : {}) };
     }
     const slots = new Map<number, Binding>(op.slots.map((s, i) => [s, { k: 'value', col: i, type: types[i]! }]));
     return { plan, frame: { types, slots } };
@@ -1593,7 +2215,7 @@ export class Compiler {
         return value(this.quantifier(x, frame), 'bool');
       case 'exists':
         // EXISTS { … } and a pattern as a predicate: whether the nested plan has a row (true or false, never NULL).
-        return value(this.nested(x.plan, frame, (r) => ({ k: 'subquery', mode: 'exists', type: 'bool', collation: 'binary', plan: r.plan })), 'bool');
+        return value(this.nested(x.plan, frame, false, (r) => ({ k: 'subquery', mode: 'exists', type: 'bool', collation: 'binary', plan: r.plan })), 'bool');
       case 'collectSub':
         return this.patternComprehension(x, frame);
     }
@@ -1603,12 +2225,12 @@ export class Compiler {
    * A nested plan (EXISTS, a pattern comprehension) as a correlated subquery of the row `frame` describes: its
    * `argument` leaf is that row's columns, read one subquery out (`outer`).
    */
-  private nested<T>(op: Op, frame: Frame, f: (r: Rel) => T): T {
+  private nested<T>(op: Op, frame: Frame, ordered: boolean, f: (r: Rel) => T): T {
     // smaltdb's nested plans don't read an `each`'s elements.
     if (this.elements.length) unsupported('EXISTS and pattern comprehensions inside list comprehensions and quantifiers');
     this.outer.push(frame);
     try {
-      return f(this.op(op));
+      return f(this.op(op, ordered));
     } finally {
       this.outer.pop();
     }
@@ -1619,7 +2241,8 @@ export class Compiler {
    * correlated subquery); `[]` when it has none. Nodes are a list of their ids, as `collect()` gives them.
    */
   private patternComprehension(x: Extract<Expr, { k: 'collectSub' }>, frame: Frame): Val {
-    return this.nested(x.plan, frame, (r): Val => {
+    // The list keeps the order the pattern matches in.
+    return this.nested(x.plan, frame, true, (r): Val => {
       const m = this.expr(x.map, r.frame);
       let item: PlanExpr;
       let t: PlanType;
@@ -1873,6 +2496,10 @@ export class Compiler {
       if (a.k === 'rel' && b.k === 'rel') return and(eq(a.type, b.type), eq(a.rowid, b.rowid));
       return unsupported('comparing a node or relationship with another kind of value');
     }
+    // A value of any kind and a string or number literal: smaltdb's `cmp_eq` is Cypher's `=` there (NULL with a NULL;
+    // false for a value of another kind, booleans, lists and maps included; numbers by value, NaN equal to nothing), and
+    // a plain comparison lets smaltdb seek with an index on the property.
+    if ((a.t === 'any' && scalarLiteral(b)) || (b.t === 'any' && scalarLiteral(a))) return eq(a.e, b.e);
     const e = this.compareBy(a, b, (x, y, kind) => {
       if (kind === K_NUMBER) return mayBeNaN(x.t) || mayBeNaN(y.t) ? and(eq(x.e, y.e), not(isNaNExpr(x.e))) : eq(x.e, y.e);
       if (kind === K_BOOL) return eq(asBoolValue(x), asBoolValue(y));
@@ -1887,6 +2514,15 @@ export class Compiler {
    */
   private ordering(fn: string, a: Val, b: Val): PlanExpr {
     if (a.k !== 'value' || b.k !== 'value') return unsupported('ordering comparisons of nodes and relationships');
+    // A value of any kind and a string or number literal: smaltdb's comparison where the value is of the literal's kind
+    // (a number that isn't NaN), else NULL.
+    const literal = scalarLiteral(a) ? a : scalarLiteral(b) ? b : undefined;
+    const other = literal === a ? b : a;
+    if (literal && other.t === 'any') {
+      const kind = call('any_type', [other.e], 'text');
+      const same = literal.t === 'text' ? eq(kind, lit('text')) : and(call('in_list', [kind, lit('int'), lit('real')], 'bool'), not(isNaNExpr(other.e)));
+      return caseWhen([[same, call(fn, [a.e, b.e], 'bool')]], NULL, 'bool');
+    }
     const e = this.compareBy(a, b, (x, y, kind) => {
       const c = (p: PlanExpr, q: PlanExpr) => call(fn, [p, q], 'bool');
       if (kind === K_NUMBER) return mayBeNaN(x.t) || mayBeNaN(y.t) ? caseWhen([[or(isNaNExpr(x.e), isNaNExpr(y.e)), NULL]], c(x.e, y.e), 'bool') : c(x.e, y.e);
@@ -2115,7 +2751,7 @@ export class Compiler {
     const k = staticKind(v.t);
     if (k === K_NUMBER || k === K_NULL) return v.e;
     if (k !== undefined) return unsupported(`${what} of a ${v.t}`);
-    return caseWhen([[isNull(v.e), NULL], [eq(kindExpr(v), lit(K_NUMBER)), v.e]], raise('SMALTCY_TYPE', message(`${what} can't take a `, typeNameExpr(v))), 'any');
+    return caseWhen([[isNull(v.e), NULL], [isNumber(v), v.e]], raise('SMALTCY_TYPE', message(`${what} can't take a `, typeNameExpr(v))), 'any');
   }
 
   /** A value that must be a string. */

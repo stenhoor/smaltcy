@@ -3,7 +3,9 @@ import { Database } from 'smaltdb-src/engine/database.js';
 import { compile } from '../src/cypher/index.js';
 import { dumpGraph } from '../src/engine/io.js';
 import { open, type Graph } from '../src/index.js';
-import { compileQuery, paramValues, Unsupported } from '../src/smaltdb/compile.js';
+import { network } from '../src/datasets/index.js';
+import { compileQuery, paramValues, Unsupported, type CompileOptions } from '../src/smaltdb/compile.js';
+import { runOnSmaltdb } from '../src/smaltdb/write.js';
 import { graphTablesFor, type GraphTables } from '../src/smaltdb/schema.js';
 import { social } from './helpers/graphs.js';
 import { both, dataOf } from './helpers/smaltdb.js';
@@ -24,8 +26,8 @@ const UNSUPPORTED = new Map<string, string>([
 ]);
 
 /** Runs a Cypher query on smaltdb: its rows as objects keyed by column, as `Graph.query` gives them. */
-function onSmaltdb(db: Database, tables: GraphTables, cypher: string, params: Record<string, unknown> = {}) {
-  const q = compileQuery(compile(cypher).plan, tables, { params });
+function onSmaltdb(db: Database, tables: GraphTables, cypher: string, params: Record<string, unknown> = {}, options: CompileOptions = {}) {
+  const q = compileQuery(compile(cypher).plan, tables, { ...options, params });
   const r = db.queryPlan(q.statement, paramValues(q, params) as never);
   return r.rows.map((row) => Object.fromEntries(q.columns.map((c, i) => [c, row[i]])));
 }
@@ -252,48 +254,80 @@ const RELS = `CREATE (a:N {k: 'a'}), (b:N {k: 'b'}), (c:N:M {k: 'c'}), (d:M {k: 
   (a)-[:R {w: 1}]->(b), (b)-[:R {w: 2}]->(c), (c)-[:R {w: 3}]->(a), (a)-[:R {w: 4}]->(a),
   (a)-[:S {w: 5, f: true}]->(b), (b)-[:S {w: 6}]->(b), (c)-[:R {w: 7}]->(b)`;
 
+/** Queries over `RELS`. */
+const REL_CASES: [string, string][] = [
+  ['one hop out', "MATCH (x {k: 'a'})-[r]->(y) RETURN r.w AS w, y.k AS y ORDER BY w"],
+  ['one hop in', "MATCH (x {k: 'b'})<-[r]-(y) RETURN r.w AS w, y.k AS y ORDER BY w"],
+  ['either direction: a self-loop once', "MATCH (x {k: 'a'})-[r]-(y) RETURN r.w AS w, y.k AS y ORDER BY w"],
+  ['self-loops, either direction', 'MATCH (x)-[r]-(x) RETURN x.k AS x, r.w AS w ORDER BY w'],
+  ['self-loops, directed', 'MATCH (x)-[r]->(x) RETURN x.k AS x, r.w AS w ORDER BY w'],
+  ['uniqueness: a path never uses a relationship twice', 'MATCH (x)-[r1]-(y)-[r2]-(z) RETURN x.k AS x, r1.w AS a, r2.w AS b, z.k AS z ORDER BY a, b, x, z'],
+  ['uniqueness across the patterns of one MATCH', 'MATCH (x)-[r1:R]->(y), (u)-[r2:R]->(v) RETURN count(*) AS n'],
+  ['no uniqueness across MATCH clauses', 'MATCH (x)-[r1:R]->(y) MATCH (u)-[r2:R]->(v) RETURN count(*) AS n'],
+  ['uniqueness between types that may be the same', 'MATCH (x)-[r1]->(y)-[r2:S]->(z) RETURN r1.w AS a, r2.w AS b ORDER BY a, b'],
+  ['type alternatives', 'MATCH (x)-[r:R|S]->(y) RETURN type(r) AS t, r.w AS w ORDER BY w'],
+  ['a type the graph lacks', 'MATCH ()-[r:S|NOPE]->() RETURN r.w AS w ORDER BY w'],
+  ['only a type the graph lacks', 'MATCH ()-[r:NOPE]->() RETURN count(*) AS n'],
+  ['a relationship property map', 'MATCH (x)-[r {w: 2}]->(y) RETURN x.k AS x, y.k AS y'],
+  ['a boolean in a relationship property map', 'MATCH ()-[r {f: true}]->() RETURN r.w AS w'],
+  ['a cycle of three', 'MATCH (x)-[:R]->(y)-[:R]->(z)-[:R]->(x) RETURN x.k AS x, y.k AS y, z.k AS z ORDER BY x'],
+  ['labels on both ends', 'MATCH (x:N)-[r]->(y:M) RETURN x.k AS x, r.w AS w ORDER BY w'],
+  ['OPTIONAL MATCH with WHERE', 'MATCH (x:N) OPTIONAL MATCH (x)-[r:R]->(y) WHERE r.w > 2 RETURN x.k AS x, y.k AS y, r.w AS w ORDER BY x, w'],
+  ['OPTIONAL MATCH, then count', 'MATCH (x) OPTIONAL MATCH (x)<-[r:S]-(y) RETURN x.k AS x, count(r) AS n ORDER BY x'],
+  ['OPTIONAL MATCH between bound nodes', "MATCH (x {k: 'a'}), (y {k: 'c'}) OPTIONAL MATCH (x)-[r]-(y) RETURN r.w AS w ORDER BY w"],
+  ['OPTIONAL MATCH of a chain', 'MATCH (x:M) OPTIONAL MATCH (x)-[:R]->(y)-[:R]->(z) RETURN x.k AS x, y.k AS y, z.k AS z ORDER BY x, y, z'],
+  ['OPTIONAL MATCH on a NULL node', "OPTIONAL MATCH (x {k: 'none'}) OPTIONAL MATCH (x)-[r]->(y) RETURN x.k AS x, r.w AS w"],
+  ['relationships compared, and NULL', 'MATCH (x)-[r1]->(y) OPTIONAL MATCH (y)-[r2]->(x) RETURN r1.w AS a, r2.w AS b, r2 IS NULL AS none, r1 = r2 AS same ORDER BY a, b'],
+  ['id, startNode, endNode and properties', 'MATCH (x)-[r:S]->(y) RETURN id(r) AS id, startNode(r).k AS s, endNode(r).k AS e, properties(r) AS p ORDER BY id'],
+  ['relationships and nodes in results', 'MATCH (x:M)<-[r]-(y) RETURN x, r, y ORDER BY r.w'],
+  ['DISTINCT relationships', 'MATCH (x)-[r]-(y) WITH DISTINCT r RETURN count(*) AS n'],
+  ['counts by type', 'MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS n, sum(r.w) AS s ORDER BY t'],
+  ['degree', "MATCH (x) RETURN x.k AS x, degree(x) AS d, degree(x, 'out') AS o, degree(x, 'in', 'R') AS i ORDER BY x"],
+  ['WITH, then a hop from the bound node', 'MATCH (x:N) WITH x ORDER BY x.k LIMIT 2 MATCH (x)-[r:R]->(y) RETURN x.k AS x, y.k AS y ORDER BY x, y'],
+  ['a hop from the far end, whose property map is the selective part', "MATCH (x)-[r]-(y {k: 'b'}) RETURN x.k AS x, r.w AS w"],
+  ['a hop from the end WHERE finds', "MATCH (x)-[r:R|S]-(y) WHERE y.k = 'c' RETURN x.k AS x, r.w AS w"],
+  ['a hop from the far end, counted', "MATCH (x)-[r]-(y {k: 'b'}) RETURN count(*) AS n, count(DISTINCT x) AS d, count(DISTINCT id(r)) AS r"],
+  ['a hop from the end WHERE finds, counted', "MATCH (x:N)-[r:R|S]-(y) WHERE y.k = 'c' RETURN count(x) AS n, count(DISTINCT id(r)) AS r"],
+  ['hops from a row, a label, then a hop of one type', "MATCH (x {k: 'a'})-[r1]-(y:N)-[r2:R]->(z {k: 'c'}) RETURN r1.w AS a, y.k AS y, r2.w AS b"],
+  ['a hop from a row to a bound node', "MATCH (x {k: 'a'}), (y {k: 'b'}) MATCH (x)-[r]-(y) RETURN r.w AS w"],
+  ['a hop from a row, collected', "MATCH (x {k: 'b'})-[r:R]-(y) RETURN collect(r.w) AS ws, collect(y.k) AS ys"],
+  ['a hop from a row, the rows a LIMIT keeps', "MATCH (x {k: 'c'})-[r]-(y)-[q]-(z) RETURN r.w AS a, q.w AS b, z.k AS z LIMIT 4"],
+  ['variable length from zero', "MATCH (x {k: 'd'})-[*0..3]-(y) RETURN y.k AS y"],
+  // Where the order doesn't show (counts, EXISTS), a search from each row rather than `paths`.
+  ['variable length, counted', "MATCH (x {k: 'a'})-[*1..2]-(y) RETURN count(*) AS n, count(DISTINCT y) AS d"],
+  ['variable length of two types, counted', "MATCH (x {k: 'a'})-[:R|S*1..3]-(y) RETURN count(*) AS n, count(DISTINCT y) AS d, count(DISTINCT id(y)) AS i"],
+  ['variable length, unbounded trails, counted', 'MATCH (x)-[:R*]->(y) RETURN count(*) AS n, count(y) AS c'],
+  ['variable length in, counted', "MATCH (x {k: 'a'})<-[*1..3]-(y) RETURN count(*) AS n"],
+  ['variable length from zero, counted', 'MATCH (x)-[*0..2]-(y) RETURN count(*) AS n, count(DISTINCT y) AS d'],
+  ['variable length from the far end, counted', "MATCH (y {k: 'a'}) MATCH (x)-[*1..2]->(y) RETURN count(*) AS n, count(DISTINCT x) AS d"],
+  ['variable length with properties, counted', 'MATCH (x)-[rs:R*1..3 {w: 2}]->(y) RETURN count(*) AS n, count(rs) AS r'],
+  ['variable length, its relationships counted', "MATCH (x {k: 'b'})-[rs*1..2]-(y) RETURN count(rs) AS n, count(*) AS c"],
+  ['variable length and a fixed hop, counted', "MATCH (x {k: 'a'})-[r:R]->(y)-[rs:R*1..2]->(z) RETURN count(*) AS n, count(DISTINCT z) AS d"],
+  ['variable length, then a hop, counted', "MATCH (x {k: 'a'})-[:R*1..2]-(y)-[r]-(z) RETURN count(*) AS n, count(DISTINCT z) AS d, count(r) AS r"],
+  ['variable length to a labelled node, counted', "MATCH (x {k: 'c'})-[*1..3]-(y:N) RETURN count(*) AS n"],
+  ['variable length in EXISTS', "MATCH (x) WHERE EXISTS { (x)-[:R*2..2]->() } RETURN x.k AS x ORDER BY x"],
+  ['variable length from a NULL node, counted', "OPTIONAL MATCH (x {k: 'none'}) OPTIONAL MATCH (x)-[*0..2]-(y) RETURN count(y) AS n, count(*) AS c"],
+  ['hops whose far ends are only counted', "MATCH (x {k: 'a'})-[r]-()-[q]-(z) RETURN count(z) AS n, count(DISTINCT z) AS d, count(DISTINCT id(z)) AS i, count(q) AS q"],
+  ['variable length with properties', 'MATCH (x)-[rs:R*1..3 {w: 2}]->(y) RETURN x.k AS x, y.k AS y, size(rs) AS n ORDER BY x, y'],
+  ['variable length of a type the graph lacks', 'MATCH (x)-[:NOPE*0..1]->(y) RETURN x.k AS x, y.k AS y ORDER BY x'],
+  ['a named path in results', "MATCH p = (x {k: 'c'})-[:R*1..2]->(y {k: 'a'}) RETURN p ORDER BY length(p)"],
+  ['shortest path', "MATCH (x {k: 'c'}), (y {k: 'b'}), p = shortestPath((x)-[*]->(y)) RETURN length(p) AS len, [n IN nodes(p) | n.k] AS ks"],
+  ['shortest path to the same node', "MATCH (x {k: 'a'}), p = shortestPath((x)-[*0..]->(x)) RETURN length(p) AS len"],
+  ['collect of nodes', "MATCH (x:N) WITH collect(x) AS xs RETURN size(xs) AS n, [x IN xs | x.k] AS ks, xs"],
+];
+
 describe('relationships: both engines give the same rows', () => {
   const g = open();
   g.run(RELS);
   const { db, tables } = both(g);
-  test.each([
-    ['one hop out', "MATCH (x {k: 'a'})-[r]->(y) RETURN r.w AS w, y.k AS y ORDER BY w"],
-    ['one hop in', "MATCH (x {k: 'b'})<-[r]-(y) RETURN r.w AS w, y.k AS y ORDER BY w"],
-    ['either direction: a self-loop once', "MATCH (x {k: 'a'})-[r]-(y) RETURN r.w AS w, y.k AS y ORDER BY w"],
-    ['self-loops, either direction', 'MATCH (x)-[r]-(x) RETURN x.k AS x, r.w AS w ORDER BY w'],
-    ['self-loops, directed', 'MATCH (x)-[r]->(x) RETURN x.k AS x, r.w AS w ORDER BY w'],
-    ['uniqueness: a path never uses a relationship twice', 'MATCH (x)-[r1]-(y)-[r2]-(z) RETURN x.k AS x, r1.w AS a, r2.w AS b, z.k AS z ORDER BY a, b, x, z'],
-    ['uniqueness across the patterns of one MATCH', 'MATCH (x)-[r1:R]->(y), (u)-[r2:R]->(v) RETURN count(*) AS n'],
-    ['no uniqueness across MATCH clauses', 'MATCH (x)-[r1:R]->(y) MATCH (u)-[r2:R]->(v) RETURN count(*) AS n'],
-    ['uniqueness between types that may be the same', 'MATCH (x)-[r1]->(y)-[r2:S]->(z) RETURN r1.w AS a, r2.w AS b ORDER BY a, b'],
-    ['type alternatives', 'MATCH (x)-[r:R|S]->(y) RETURN type(r) AS t, r.w AS w ORDER BY w'],
-    ['a type the graph lacks', 'MATCH ()-[r:S|NOPE]->() RETURN r.w AS w ORDER BY w'],
-    ['only a type the graph lacks', 'MATCH ()-[r:NOPE]->() RETURN count(*) AS n'],
-    ['a relationship property map', 'MATCH (x)-[r {w: 2}]->(y) RETURN x.k AS x, y.k AS y'],
-    ['a boolean in a relationship property map', 'MATCH ()-[r {f: true}]->() RETURN r.w AS w'],
-    ['a cycle of three', 'MATCH (x)-[:R]->(y)-[:R]->(z)-[:R]->(x) RETURN x.k AS x, y.k AS y, z.k AS z ORDER BY x'],
-    ['labels on both ends', 'MATCH (x:N)-[r]->(y:M) RETURN x.k AS x, r.w AS w ORDER BY w'],
-    ['OPTIONAL MATCH with WHERE', 'MATCH (x:N) OPTIONAL MATCH (x)-[r:R]->(y) WHERE r.w > 2 RETURN x.k AS x, y.k AS y, r.w AS w ORDER BY x, w'],
-    ['OPTIONAL MATCH, then count', 'MATCH (x) OPTIONAL MATCH (x)<-[r:S]-(y) RETURN x.k AS x, count(r) AS n ORDER BY x'],
-    ['OPTIONAL MATCH between bound nodes', "MATCH (x {k: 'a'}), (y {k: 'c'}) OPTIONAL MATCH (x)-[r]-(y) RETURN r.w AS w ORDER BY w"],
-    ['OPTIONAL MATCH of a chain', 'MATCH (x:M) OPTIONAL MATCH (x)-[:R]->(y)-[:R]->(z) RETURN x.k AS x, y.k AS y, z.k AS z ORDER BY x, y, z'],
-    ['OPTIONAL MATCH on a NULL node', "OPTIONAL MATCH (x {k: 'none'}) OPTIONAL MATCH (x)-[r]->(y) RETURN x.k AS x, r.w AS w"],
-    ['relationships compared, and NULL', 'MATCH (x)-[r1]->(y) OPTIONAL MATCH (y)-[r2]->(x) RETURN r1.w AS a, r2.w AS b, r2 IS NULL AS none, r1 = r2 AS same ORDER BY a, b'],
-    ['id, startNode, endNode and properties', 'MATCH (x)-[r:S]->(y) RETURN id(r) AS id, startNode(r).k AS s, endNode(r).k AS e, properties(r) AS p ORDER BY id'],
-    ['relationships and nodes in results', 'MATCH (x:M)<-[r]-(y) RETURN x, r, y ORDER BY r.w'],
-    ['DISTINCT relationships', 'MATCH (x)-[r]-(y) WITH DISTINCT r RETURN count(*) AS n'],
-    ['counts by type', 'MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS n, sum(r.w) AS s ORDER BY t'],
-    ['degree', "MATCH (x) RETURN x.k AS x, degree(x) AS d, degree(x, 'out') AS o, degree(x, 'in', 'R') AS i ORDER BY x"],
-    ['WITH, then a hop from the bound node', 'MATCH (x:N) WITH x ORDER BY x.k LIMIT 2 MATCH (x)-[r:R]->(y) RETURN x.k AS x, y.k AS y ORDER BY x, y'],
-    ['variable length from zero', "MATCH (x {k: 'd'})-[*0..3]-(y) RETURN y.k AS y"],
-    ['variable length with properties', 'MATCH (x)-[rs:R*1..3 {w: 2}]->(y) RETURN x.k AS x, y.k AS y, size(rs) AS n ORDER BY x, y'],
-    ['variable length of a type the graph lacks', 'MATCH (x)-[:NOPE*0..1]->(y) RETURN x.k AS x, y.k AS y ORDER BY x'],
-    ['a named path in results', "MATCH p = (x {k: 'c'})-[:R*1..2]->(y {k: 'a'}) RETURN p ORDER BY length(p)"],
-    ['shortest path', "MATCH (x {k: 'c'}), (y {k: 'b'}), p = shortestPath((x)-[*]->(y)) RETURN length(p) AS len, [n IN nodes(p) | n.k] AS ks"],
-    ['shortest path to the same node', "MATCH (x {k: 'a'}), p = shortestPath((x)-[*0..]->(x)) RETURN length(p) AS len"],
-    ['collect of nodes', "MATCH (x:N) WITH collect(x) AS xs RETURN size(xs) AS n, [x IN xs | x.k] AS ks, xs"],
-  ])('%s', (_name, cypher) => {
+  test.each(REL_CASES)('%s', (_name, cypher) => {
     expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
+  });
+
+  // A relationship of several types, or read both ways, as a join region per type and reading (a union of them)
+  // rather than one region joining the union of its edge tables: the same rows, in the same order.
+  test.each(REL_CASES)('%s, in a region per type and reading', (_name, cypher) => {
+    expect(onSmaltdb(db, tables, cypher, {}, { maxBranches: 16 })).toEqual(g.query(cypher));
   });
 
   // Ordered by lists too (Cypher's order of lists, element by element).
@@ -449,5 +483,113 @@ describe('the graph in smaltdb', () => {
     const { db, tables } = both(social());
     expect(onSmaltdb(db, tables, 'MATCH (p:Person) WHERE p.born > $y AND $flag RETURN count(*) AS n', { y: 1925, flag: true })).toEqual([{ n: 2 }]);
     expect(() => compileQuery(compile('RETURN $nope AS x').plan, tables)).toThrow(Unsupported);
+  });
+});
+
+/**
+ * Comparisons of a property (a value of any kind) with a string or number literal compile to smaltdb's own comparison
+ * where it has Cypher's meaning (`=`: false across kinds; `<`: NULL across kinds and for NaN), so smaltdb can estimate
+ * them and seek with an index. Values of every kind, with and without an index on the property.
+ */
+const KINDS = `CREATE (:T {k: 'int1', v: 1}), (:T {k: 'float1', v: 1.0}), (:T {k: 'float', v: 1.5}), (:T {k: 'str1', v: '1'}),
+  (:T {k: 'stra', v: 'a'}), (:T {k: 'strtrue', v: 'true'}), (:T {k: 'true', v: true}), (:T {k: 'false', v: false}),
+  (:T {k: 'list', v: [1]}), (:T {k: 'liststr', v: ['a']}), (:T {k: 'none'}), (:T {k: 'zero', v: 0}), (:T {k: 'nan', v: 0.0 / 0.0}),
+  (:T {k: 'negzero', v: -0.0}), (:T {k: 'inf', v: 1.0 / 0}), (:T {k: 'neginf', v: -1.0 / 0}), (:T {k: 'big', v: 9007199254740991})`;
+
+describe('comparisons with literals: both engines give the same rows', () => {
+  const g = open();
+  g.run(KINDS);
+  const { db, tables } = both(g);
+  const cases: [string, string][] = [
+    ['= of numbers and strings', "MATCH (n:T) RETURN n.k AS k, n.v = 1 AS a, n.v = 0 AS b, n.v = 1.5 AS c, n.v = '1' AS d, n.v = 'a' AS e, n.v = 'true' AS f, 1 = n.v AS g, n.v = 9007199254740991 AS h ORDER BY k"],
+    ['<> of numbers and strings', "MATCH (n:T) RETURN n.k AS k, n.v <> 1 AS a, n.v <> 'a' AS b, 1.5 <> n.v AS c ORDER BY k"],
+    ['< and > of numbers', 'MATCH (n:T) RETURN n.k AS k, n.v < 1 AS a, n.v >= 0 AS b, n.v > 1.5 AS c, 0 < n.v AS d, n.v <= -1 AS e ORDER BY k'],
+    ['< and > of strings', "MATCH (n:T) RETURN n.k AS k, n.v < 'b' AS a, 'a' <= n.v AS b, n.v > '1' AS c ORDER BY k"],
+    ['= in WHERE', 'MATCH (n:T) WHERE n.v = 1 RETURN n.k AS k ORDER BY k'],
+    ['a string in WHERE', "MATCH (n:T) WHERE n.v = 'a' RETURN n.k AS k ORDER BY k"],
+    ['a property map', 'MATCH (n:T {v: 0}) RETURN n.k AS k ORDER BY k'],
+    ['a property map of a string', "MATCH (n:T {v: 'true'}) RETURN n.k AS k ORDER BY k"],
+    ['a range in WHERE', 'MATCH (n:T) WHERE n.v > 0 AND n.v < 2 RETURN n.k AS k ORDER BY k'],
+    ['a range of strings in WHERE', "MATCH (n:T) WHERE n.v >= '1' RETURN n.k AS k ORDER BY k"],
+    ['IN a list of literals', "MATCH (n:T) WHERE n.v IN [1, 'a'] RETURN n.k AS k ORDER BY k"],
+  ];
+  test.each(cases)('%s', (_name, cypher) => {
+    expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
+  });
+  test('with an index on the property: the same rows, and smaltdb seeks with it', () => {
+    const h = open();
+    h.run(KINDS);
+    h.run("UNWIND range(1, 500) AS i CREATE (:U {k: 'filler', v: i + 1000})");
+    const { db: idb, tables: it } = both(h);
+    runOnSmaltdb(idb, compile('CREATE INDEX FOR (n:T) ON (n.v)').plan, it);
+    for (const [, cypher] of cases) expect(onSmaltdb(idb, it, cypher), cypher).toEqual(h.query(cypher));
+    const q = compileQuery(compile('MATCH (n:T) WHERE n.v = 1 RETURN n.k AS k').plan, it);
+    const explained = idb.queryPlan({ kind: 'explain', mode: 'plan', query: q.statement } as never).rows.map((r) => r.join(' '));
+    expect(explained.some((line) => line.includes('USING INDEX graph_ix_'))).toBe(true);
+  });
+});
+
+/**
+ * A generated network (`network(300)`): the compiled MATCHes (join regions, unions of edge tables, nodes only a
+ * relationship reaches, paths from each row, shortest paths by a search) give smaltcy's rows. Cypher leaves the order
+ * of rows open without ORDER BY, and the two engines' orders differ where groups or paths are found in another order,
+ * so rows are compared in any order.
+ */
+describe('a generated network: both engines give the same rows', () => {
+  const g = open();
+  g.load(network(300));
+  const { db, tables } = both(g);
+  const norm = (rows: unknown[]) => rows.map((r) => JSON.stringify(r, (_k, v: unknown) => (typeof v === 'number' && !Number.isInteger(v) ? +v.toFixed(9) : v))).sort();
+  test.each([
+    ['one hop, either direction', 'MATCH (p:Person)-[:KNOWS]-(f) RETURN p.name AS p, f.name AS f'],
+    ['one hop out', 'MATCH (p:Person)-[:KNOWS]->(f) RETURN p.name AS p, f.name AS f'],
+    ['relationships with anonymous ends', 'MATCH ()-[r:KNOWS]->() RETURN id(r) AS r'],
+    ['relationships of every type, both ways', 'MATCH (a)-[r]-(b) RETURN id(a) AS a, id(r) AS r, id(b) AS b'],
+    ['an anonymous end, in', 'MATCH (a)<-[r]-() RETURN id(a) AS a, id(r) AS r'],
+    ['two hops through an anonymous node', 'MATCH (p:Person {community: 1})-[:KNOWS]-()-[:KNOWS]-(f) RETURN p.name AS p, f.name AS f'],
+    ['three hops', "MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-()-[:KNOWS]-()-[:KNOWS]-(f) RETURN count(f) AS n, count(DISTINCT f) AS d"],
+    ['triangles', 'MATCH (p:Person {community: 1})-[:KNOWS]->(b)-[:KNOWS]->(c), (p)-[:KNOWS]->(c) RETURN p.name AS p, b.name AS b, c.name AS c'],
+    ['groups', 'MATCH (p:Person)-[:LIVES_IN]->(c:City) RETURN c.name AS c, count(p) AS n, avg(p.age) AS a'],
+    ['variable length, either direction', 'MATCH (p:Person {community: 2})-[:KNOWS*1..2]-(f) RETURN p.name AS p, f.name AS f'],
+    ['variable length, its relationships', 'MATCH (p:Person {community: 2})-[rs:KNOWS*1..2]->(f) RETURN p.name AS p, [r IN rs | id(r)] AS rs, f.name AS f'],
+    ['variable length to an anonymous node', "MATCH (p:Person {name: 'Bo 1'})-[:KNOWS*1..3]-() RETURN count(*) AS n"],
+    ['variable length, counted', 'MATCH (p:Person {community: 2})-[:KNOWS*1..3]-(f) RETURN count(*) AS n, count(DISTINCT f) AS d'],
+    ['variable length out, from the far end, counted', "MATCH (f:Person {name: 'Bo 1'}) MATCH (p)-[:KNOWS*1..3]->(f) RETURN count(*) AS n, count(DISTINCT p) AS d"],
+    ['a filter on a label scan', 'MATCH (p:Person) WHERE p.age > 70 RETURN p.name AS p'],
+    ['OPTIONAL MATCH with WHERE', 'MATCH (p:Person) OPTIONAL MATCH (p)-[:KNOWS]->(q) WHERE q.age > 60 RETURN p.name AS p, q.name AS q'],
+    ['a match from bound nodes', 'MATCH (p:Person) WITH p ORDER BY p.name LIMIT 20 MATCH (p)-[:KNOWS]-(q) RETURN p.name AS p, q.name AS q'],
+    ['a pattern comprehension', 'MATCH (p:Person) RETURN p.name AS p, size([(p)-[:KNOWS]-(q) | q.name]) AS n'],
+    ['shortest paths between pairs', 'MATCH (a:Person), (b:Person) WHERE id(a) < 12 AND id(a) > 8 AND id(b) < 40 AND id(b) > 20 MATCH p = shortestPath((a)-[:KNOWS*]-(b)) RETURN id(a) AS a, id(b) AS b, length(p) AS n'],
+    ['shortest paths, directed and bounded', 'MATCH (a:Person), (b:Person) WHERE id(a) < 12 AND id(a) > 8 AND id(b) < 60 AND id(b) > 20 MATCH p = shortestPath((a)<-[:KNOWS*..4]-(b)) RETURN id(a) AS a, id(b) AS b, length(p) AS n'],
+    ['all shortest paths, bounded', 'MATCH (a:Person), (b:Person) WHERE id(a) < 11 AND id(a) > 8 AND id(b) < 30 AND id(b) > 20 MATCH p = allShortestPaths((a)-[:KNOWS*..3]-(b)) RETURN id(a) AS a, id(b) AS b, length(p) AS n'],
+    ['a named path', 'MATCH p = (a:Person {community: 3})-[:KNOWS]->(b)-[:LIVES_IN]->(c) RETURN [n IN nodes(p) | id(n)] AS ns'],
+    ['type alternatives', 'MATCH (a)-[:KNOWS|LIVES_IN]->(b) RETURN id(a) AS a, id(b) AS b'],
+    ['type alternatives, both ways, then a label', 'MATCH (a:Person)-[:KNOWS|LIVES_IN]-(b)-[:LIVES_IN]-(c:City) RETURN id(a) AS a, id(b) AS b, id(c) AS c'],
+    ['a hop from a person, then a hop of one type', "MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-(f)-[:LIVES_IN]->(c) RETURN f.name AS f, c.name AS c"],
+    ['a hop from the far end', "MATCH (a)-[:KNOWS]-(b:Person {name: 'Bo 1'}) RETURN a.name AS a"],
+    ['every type, both ways, from a node WHERE finds', "MATCH (p:Person)-[r]-(x) WHERE p.name = 'Bo 1' RETURN type(r) AS t, id(r) AS r, id(x) AS x"],
+  ])('%s', (_name, cypher) => {
+    const rows = g.query(cypher);
+    expect(rows.length).toBeGreaterThan(0);
+    expect(norm(onSmaltdb(db, tables, cypher))).toEqual(norm(rows));
+    expect(norm(onSmaltdb(db, tables, cypher, {}, { maxBranches: 16 }))).toEqual(norm(rows));
+  });
+
+  test('a match whose order shows nowhere asks smaltdb for none', () => {
+    const plan = JSON.stringify(compileQuery(compile("MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-()-[:KNOWS]-(f) RETURN count(f) AS n").plan, tables).statement);
+    expect(plan).not.toContain('"ordered"');
+    expect(plan).not.toContain('"sort"');
+    expect(plan).not.toContain('"window"');
+  });
+
+  test("a variable-length relationship whose order shows nowhere is a search from each row, and a node only counted isn't read", () => {
+    const walk = JSON.stringify(compileQuery(compile("MATCH (p:Person {name: 'Bo 1'})-[:KNOWS*1..3]-(f) RETURN count(DISTINCT f) AS n").plan, tables).statement);
+    expect(walk).toContain('"name":"walk"');
+    expect(walk).not.toContain('"op":"paths"');
+    expect(walk).not.toContain('"sort"');
+    // Its far node is only counted: the node table is read once, for the person found by name.
+    expect(walk.split(`"table":"${tables.nodes}"`).length - 1).toBe(1);
+    const hops = JSON.stringify(compileQuery(compile("MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-()-[:KNOWS]-(f) RETURN count(f) AS n").plan, tables).statement);
+    expect(hops.split(`"table":"${tables.nodes}"`).length - 1).toBe(1);
   });
 });

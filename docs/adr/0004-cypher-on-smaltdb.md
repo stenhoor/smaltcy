@@ -42,27 +42,80 @@ variable-length relationship's list one, its hops (`list<struct<edge int, rowid 
 `paths` type, with `edge` the type's position in the graph and the hops read in the pattern's direction); a path two
 (its first node and its hops); any other value is one column with a static type, or `any` when only the value knows.
 
-**Patterns.** A new node is a join with the node table (its labels semi-joins on the label index). A relationship is a
-join with its edge source, the union of its types' edge tables (no type: all of them), on the end that is bound, then
-with the node table on the other end. A relationship with no direction reads each relationship both ways, a self-loop
-once, as smaltcy's stores expand it. Within one MATCH, relationships are distinct (Cypher's uniqueness): two
-relationships whose types can be the same must differ in type or rowid, and a variable-length relationship's hops must
-not hold the others' (a subquery over its hops); two variable-length relationships of types that can be the same in
-one MATCH are refused.
+**Patterns.** A MATCH is one smaltdb join region: a flat join of bare table scans, which smaltdb's planner orders and
+can seek into with the tables' indexes (the edge tables' `start` and `end`, the node table's rowid, the label index),
+with all its conditions over their columns and the row's columns in one projection on top. Its FROM items are the
+input (when there is one: the first MATCH has none), a scan of the node table for each new node and of the label index
+for each of its labels (an inner join: the index is unique on label and node, so it never repeats a node), and a scan
+of an edge table for each relationship, joined on the end that is bound, then the node table on the other end. A
+relationship of several types (no type: all of them), or with no direction, is the union of its types' edge tables,
+each read as the pattern reads it (with no direction, both ways, a self-loop once, as smaltcy's stores expand it).
+smaltdb can't seek into a union, so where one end is bound such a relationship is a **hop from each row**: the region
+before it is finished (run once), then smaltdb's `iterate`, run for one step (`maxDepth` 1, the rows of the region its
+initial rows, dropped after), has a step per type and reading that joins the rows (`working`, which smaltdb's planner
+reads a row at a time) with the edge table on the bound end, so smaltdb seeks its `start` or `end` index for each row
+(the index named, `indexedBy`, outside `AT VERSION`: the planner estimates a seek by the rows per value, which for an
+end few relationships share, a city, is more than a scan); in the same step it checks the far end when it is bound,
+Cypher's uniqueness against the pattern's relationships before it, and reads the far node by id and its labels from
+the label index, unless only the relationship reaches it. A new region starts from those rows, and every later hop
+from a node a hop from a row reached is one too (smaltdb doesn't know how many rows such a region has, and would scan
+an edge table whole). Ends and properties of a relationship nothing reads are NULL, and then the step reads the edge
+table's index alone where it covers the other end (smaltdb's `(start, end)` and `(end, start)`). The `iterate` keeps a
+row for each hop, so it carries only the columns that differ between rows: those that are the same literal on every
+row (the NULL ends and properties, a relationship's one type) are put back after it. With the order kept, rows are
+sorted by the region's row, then the type and reading, then rowid, the order the union gave. Two exceptions keep the
+union as one FROM item: with neither end bound, and from a node scanned without a property condition (a property map,
+or an equality in WHERE on its properties), or reached from one, where seeking for each of 20,000 rows was slower
+than hashing the union (docs/research/benchmarks.md). When the first relationship has neither end bound and the order
+of rows doesn't show, the pattern starts at a relationship with a bound end, else scans its node with a property
+condition first (else with labels, else the first relationship's `from` node). The compiler can instead split the
+region into one per type and reading (`CompileOptions.maxBranches`), which smaltdb seeks into when the region's start is
+found by an index, but each region repeats the start, and a pattern of k hops read both ways is 2^k regions (below). An
+anonymous node that only a relationship reaches,
+with no labels or properties, that nothing else in the query reads (but its identity: `count(n)`, `id(n)`, which read
+its id), is that relationship's end, not a scan of the node
+table: smaltdb's graph keeps every end a node of the graph. Next to a union of edge tables it is still joined: the
+planner doesn't know a union's rows, and joined two unions with a nested loop in the 3-hop benchmark when it wasn't.
+Within one MATCH, relationships are distinct (Cypher's uniqueness): two relationships whose types can be the same must
+differ in type or rowid, and a variable-length relationship's hops must not hold the others' (a subquery over its
+hops); two variable-length relationships of types that can be the same in one MATCH are refused.
 
-- **Variable length** is smaltdb's `paths` in trail mode (no relationship twice), with `minHops` and `maxHops`.
-  `paths` reads a self-loop both ways with direction `both`, two paths the same: the rows are numbered first and each
-  path kept once. A relationship property map is checked on every hop (none may lack it); its values must not read
+- **Conditions.** Property maps and the conjuncts of the MATCH's WHERE that can't raise an error (comparisons, label
+  tests, EXISTS: only functions that never raise) are conditions of the region, which the planner evaluates where it
+  chooses, at a scan or an index seek. Those that can raise (Cypher's type errors, arithmetic, values refused when met)
+  filter the region's rows, so they see only the rows that match, as in smaltcy's engine.
+- **Order.** Cypher gives rows no order without ORDER BY, but the compiler keeps the one it gave before wherever it
+  shows: in the results, a `collect()` or a pattern comprehension's list, the rows a LIMIT keeps, the ties of an ORDER
+  BY, the groups of an aggregate with keys, and the input of any aggregate but `count`. There a region's rows are
+  sorted by the input's position (a window's `row_number`), then each scan's rowid and each union's part, the order
+  smaltdb's `ordered` joins gave. Elsewhere (a count, EXISTS, what a grouping without keys reads) the plan asks for no
+  order, so smaltdb joins and groups as its planner chooses, without the sorts an `ordered` join costs.
+- **Variable length**, where the order of its rows doesn't show (a count, EXISTS), is a search from each row: smaltdb's
+  `iterate`, its rows the row and the path so far (its last node, length and, where read, hops in `paths`' form), with a
+  step per type and reading that seeks the edge table's `start` or `end` index at the path's last node, as a hop from a
+  row does, `maxDepth` the maximum. Trail mode: the relationships on the path (their identities as `paths` makes them)
+  are kept in a column each for a search of at most 8 hops (shifted along at each hop), else in a list, and none is
+  walked twice; with no direction a self-loop is read once. Elsewhere it is smaltdb's `paths` in trail mode (no
+  relationship twice), with `minHops` and `maxHops`, run
+  for each row in a subquery (the row's node, as a one-row `values`, to `paths`; its paths imploded into a list, then
+  exploded back into rows): `paths` runs its input twice, to search and to join its paths back, which here is a row of
+  values, not the plan before it. `paths` reads a self-loop both ways with direction `both`, two paths the same: each
+  path is kept once. A relationship property map is checked on every hop (none may lack it); its values must not read
   variables.
-- **Shortest paths** are `paths` with `anyShortest` (walk) or `allShortest` (acyclic), once both ends are bound, kept
-  where they end at the other end. smaltcy's engine checks properties as it searches and gives nothing when the
-  shortest path is shorter than the minimum, so a shortest path with properties, with a minimum above 1, or beside
-  other relationships in its MATCH is refused.
+- **Shortest paths**, once both ends are bound: one shortest path (`shortestPath`) is a breadth-first search in a
+  correlated subquery, smaltdb's `iterate` keeping the first row that reaches each node, so its hops are a shortest
+  path there, with a LIMIT of one row at the far end: smaltdb runs an iterate's steps as its rows are read, so the
+  search stops there, where `paths` with `anyShortest` searched the whole graph first. All shortest paths are `paths`
+  with `allShortest` (acyclic), for each row as above, kept where they end at the other end. smaltcy's engine checks
+  properties as it searches and gives nothing when the shortest path is shorter than the minimum, so a shortest path
+  with properties, with a minimum above 1, or beside other relationships in its MATCH is refused.
 - **Named paths** are the first node and the hops of their relationships in order; `length`, `nodes` and
   `relationships` read them, and a list comprehension over nodes or relationships reads each one's data in a subquery.
 - **OPTIONAL MATCH** numbers its input's rows (a window's `row_number`), matches, and left-joins the input back by
   number, so a row with no match (or none passing the WHERE, which is part of the match) passes once with the new
-  slots NULL.
+  slots NULL. The input's plan is in the smaltdb plan twice, and is planned once for each: both are expected to give
+  the same rows in the same order, as smaltdb's planner gives the same plan for the same plan and data (an
+  assumption: the OPTIONAL MATCH tests pass, smaltdb doesn't document it).
 - **EXISTS and pattern predicates** (a pattern in `WHERE`) are smaltdb `exists` subqueries, and **pattern
   comprehensions** scalar subqueries of an `implode` (NULLs kept, `[]` for none; nodes as a list of their ids, as
   `collect()` gives them). The nested plan is compiled as a match of its own (its uniqueness, its WHERE), from one row:
@@ -157,7 +210,13 @@ versions.
 It keeps Cypher's meaning:
 
 - **Comparisons by kind:** `=` is NULL with a NULL and false across kinds (`true = 1` is false), `<` is NULL across
-  kinds and for NaN; where a type is `any`, the kind is found when the query runs (`any_type`).
+  kinds and for NaN; where a type is `any`, the kind is found when the query runs (`any_type`). A value of any kind
+  (a property) compared with a string or number literal (an integer JavaScript holds exactly, or a float that isn't
+  whole or NaN) is smaltdb's own comparison: `cmp_eq` has Cypher's `=` there (NULL with a NULL, false for a value of
+  another kind, booleans, lists and maps included, NaN equal to nothing, `1 = 1.0`), and `<` and the others are
+  smaltdb's where `any_type` says the value is of the literal's kind (a number that isn't NaN), else NULL. So a
+  property map or a WHERE such as `{name: 'Ada'}` reads the property once a row, and smaltdb estimates it and seeks
+  with an index on the property (tested against smaltcy's engine on values of every kind, with and without one).
 - **Lists and maps** are compared element by element, as smaltcy's `equals` and `compare` do, where smaltdb compares
   their bytes: `=` of two lists is false for different lengths or a false element, else NULL for a NULL element
   (`[1, null] = [1, null]` is NULL), else true; of two maps, false for different keys, else their values in key order
@@ -221,7 +280,13 @@ some in transactions of two statements, some failing; the social graph changing 
 `test/helpers/history-cases.ts`) on both engines, checks that smaltdb commits exactly when smaltcy makes a version,
 with its author and message, then reads every version with `AT VERSION` (nodes, relationships, a pattern) and each
 commit's moment with `AT TIME` on both, before and after `forget`. The index test runs the same queries before and
-after an index exists and checks smaltdb's catalog.
+after an index exists and checks smaltdb's catalog. Two more sets compare rows on both engines: properties of every kind
+compared with string and number literals (with and without an index on the property, which EXPLAIN shows smaltdb seeks
+with), and a generated network (`network(300)`), on which the compiled patterns (unions of edge tables, hops from a row,
+anonymous ends, paths from each row, shortest paths by a search) give smaltcy's rows in any order. The network's
+queries and the relationship cases run both with one join region per MATCH and with a region per type and reading
+(`maxBranches`); the relationship cases include hops from a row from either end, to a bound node, after a label, before
+a hop of one type, in `collect()` and under a LIMIT, in the order smaltcy gives.
 
 ## Consequences
 
@@ -234,9 +299,33 @@ after an index exists and checks smaltdb's catalog.
   commit's id, time, author and message); variable-length relationships and shortest paths with `AT VERSION` or `AT
   TIME`, as smaltdb's `paths` reads its edge tables as they are now; an author or message for one statement inside a
   transaction.
-- **Indexes aren't used yet.** smaltdb's planner doesn't seek with them for the compiled queries (EXPLAIN shows a scan
-  of the node table): a property match compiles to Cypher's comparison by kind, not to the plain `map_get(props, k) =
-  v` an expression index matches. A seekable form of that comparison is left for later.
+- **Indexes are used for equality with a literal.** A property map or a WHERE comparing a property with a string or
+  number literal is the plain `map_get(props, k) = v` an index's expression matches, and smaltdb seeks with it (a
+  test checks EXPLAIN). A range (`<`) is still a CASE on the value's kind, which smaltdb doesn't seek with.
+- **Performance** (docs/research/benchmarks.md, "smaltdb": `npm run bench:smaltdb`, 20,000 people): the join regions,
+  the order asked for only where it shows, the comparisons with literals, the paths searched from each row and the
+  shortest path's search that stops at its end made the benchmark's queries 1.3 to 16 times faster (shortest path
+  459 to 57 ms, all relationships 96 to 6 ms, 3 hops 314 to 154 ms). Hops from a row then made the hops read both
+  ways seek for each row: with the index on `:Person(name)` that smaltcy's store has, 1 hop 15.3 to 1.3 ms, 2 hops
+  66.7 to 4.9 ms, 3 hops 121 to 36 ms, and 1 hop takes about as long at 2,000 people (0.9 ms) as at 20,000. A search
+  from each row for variable length where the order doesn't show, nodes only counted left unread and hop rows without
+  their constant columns took variable length 1..3 from 166 to 21 ms and 3 hops from 37 to 21 ms, and with smaltdb's
+  edge indexes covering the other end (`(start, end)`, `(end, start)`) to 13 ms each. Most of what is left is
+  smaltdb's:
+  - Its planner estimated a comparison of an expression (`map_get(props, 'name') = 'Bo 1'`) at a third of the
+    table's rows, with or without an index on it, so the rest of the pattern was joined with hashes over whole scans of
+    the edge tables. smaltdb estimates it from the index now (stenhoor/smaltdb#266), and a pattern's edge tables of
+    one type and direction are sought from the node found. It still knows nothing of the rows of a plan read as a FROM
+    item (a list exploded: 1,000; a correlated subquery's list per row decoded and its fields read back cost more than
+    the seeks, which is why a hop from a row is an `iterate` and not a subquery), and estimates an index seek by the
+    rows per value (`indexedBy` above).
+  - It assumes 1,000 rows for a FROM item that is a plan (a union of edge tables of 80,050 rows): two unions joined
+    directly were joined with a nested loop (3 hops took 3.2 s), hence the node table between them.
+  - `map_get` decodes the whole map on each call: a scan filtering 20,000 nodes on one property takes about 25 ms,
+    against 5 ms for a scan of 40,000 relationships filtered on a column. Every query that starts from a property
+    pays it, unless an index finds the node.
+  - `paths` with `anyShortest` searches from the start until every node is reached, with no way to give it the end;
+    `paths` runs its input twice. The compiler works around both (above).
 - A write is many smaltdb statements: queries and writes for each row, as the runner streams rows the way smaltcy's
   engine does. That is slow on large inputs; set-based plans for writes that can't see each other (no reads between
   them) would be faster, and are left for later. The runner takes a synchronous `queryPlan` (smaltdb's `Database` in a
@@ -248,8 +337,7 @@ after an index exists and checks smaltdb's catalog.
   relationship, smaltdb would give a value), and paths and lists of nodes or relationships in its results (smaltcy's
   engine gives a deleted one as an empty one, smaltdb's lists would drop it).
 - An OPTIONAL MATCH puts its input's plan in the smaltdb plan twice, so a query's plan doubles with each one; smaltdb
-  runs that input twice. Every operation the compiler makes keeps an order, so both give the same rows in the same
-  order.
+  runs that input twice (above: both runs must give the same rows in the same order).
 - `allShortestPaths` enumerates acyclic paths before ranking them, which can grow fast on a dense graph.
 - Comparing and ordering values whose kind only the value shows (`any`, as properties are) compiles every kind they
   may be, lists and maps four levels down included, so those plans are larger: about 64 KB of plan JSON for `MATCH
@@ -289,8 +377,9 @@ after an index exists and checks smaltdb's catalog.
   - A pattern comprehension's list is in the order its pattern matches, which Cypher leaves open, as it does a
     MATCH's: smaltdb's goes by relationship type, then by relationship, smaltcy's store by relationship id. The
     elements are the same; the tests compare them in any order where the two can differ.
-  - smaltdb's planner decides the order conditions are evaluated in; where a condition raises (a non-boolean in
-    `WHERE`), a query could raise on smaltdb where smaltcy stops early. The cases tried agree; nothing guarantees it.
+  - smaltdb's planner decides the order conditions are evaluated in. Conditions that can raise (a non-boolean in
+    `WHERE`) see only the rows that match the pattern, but among several such conditions, or rows, the one that raises
+    first can differ from smaltcy's. The cases tried agree; nothing guarantees it.
 - Two workarounds for smaltdb's planner (a sort key that is an expression over a project or filter, and `values` with
   no rows) went once smaltdb fixed both (stenhoor/smaltdb#262): the compiler gives sort keys as expressions and an
   empty edge source as `values` with `rows: []`.
