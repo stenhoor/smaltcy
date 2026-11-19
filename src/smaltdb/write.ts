@@ -465,8 +465,10 @@ class Runner {
         const input = this.stream(op.input, inputAbove, inputQuiet);
         return this.create(op, input, batch && this.createInBatch(op.pattern, input.frame));
       }
-      case 'merge':
-        return this.merge(op, this.stream(op.input, inputAbove, inputQuiet));
+      case 'merge': {
+        const input = this.stream(op.input, inputAbove, inputQuiet);
+        return this.merge(op, input, batch && this.mergeInBatch(op, input.frame));
+      }
       case 'set': {
         const input = this.stream(op.input, inputAbove, inputQuiet);
         if (batch && this.setInBatch(op.items, input.frame)) return this.batched(input, (rows) => this.setRows(op.items, input.frame, rows, false));
@@ -843,9 +845,10 @@ class Runner {
    * passed on), or, when there is none, the pattern created (its unbound nodes and its relationships), through ON
    * CREATE. A row sees what earlier rows created.
    */
-  private merge(op: Extract<Op, { op: 'merge' }>, input: Stream): Stream {
+  private merge(op: Extract<Op, { op: 'merge' }>, input: Stream, batch = false): Stream {
     const match: Extract<Op, { op: 'match' }> = { op: 'match', input: op.input, pattern: op.pattern, optional: false };
     const { frame } = this.over(match, input.frame, []).r;
+    if (batch) return this.batched(input, (rows) => this.mergeRows(op, match, input.frame, frame, rows), frame);
     return {
       frame,
       run: (sink) =>
@@ -864,6 +867,72 @@ class Runner {
           return sink(created);
         }),
     };
+  }
+
+  /**
+   * Whether a MERGE can run all its rows at once: one node, not bound before, with properties that read no nested
+   * plan, and no ON CREATE or ON MATCH. A row then matches either nodes that were there before the statement, or the
+   * node an earlier row with the same properties created (`mergeRows`).
+   */
+  private mergeInBatch(op: Extract<Op, { op: 'merge' }>, inFrame: Frame): boolean {
+    const p = op.pattern;
+    if (op.onCreate.length || op.onMatch.length || p.rels.length || p.nodes.length !== 1 || (p.paths ?? []).length) return false;
+    if (inFrame.slots.has(p.nodes[0]!.slot)) return false;
+    return this.createInBatch(p, inFrame);
+  }
+
+  /**
+   * MERGE of one node for all the rows at once: one query matches every row (each numbered, so its matches come back
+   * to it); of the rows that match nothing, the first with each set of properties creates the node (one CREATE batch),
+   * and the later ones with the same properties match it, as they would row by row. A property that is NULL runs the
+   * rows one by one.
+   */
+  private mergeRows(op: Extract<Op, { op: 'merge' }>, match: Extract<Op, { op: 'match' }>, inFrame: Frame, out: Frame, rows: Row[]): Row[] {
+    if (!rows.length) return [];
+    const n = op.pattern.nodes[0]!;
+    const maps = n.props ? this.propertyMaps(inFrame, rows, n.props, 'MERGE') : rows.map(() => ({ props: {} as Props, nulls: [] as string[], isMap: true }));
+    if (maps.some((m) => m.nulls.length) || rows.length === 1) {
+      const outRows: Row[] = [];
+      this.merge(op, { frame: inFrame, run: (sink) => rows.every((r) => sink(r)) }).run((r) => (outRows.push(r), true));
+      return outRows;
+    }
+    // Every row's matches, in one query: the rows numbered (a last column), so each match names its row.
+    const w = inFrame.types.length;
+    const numbered: Frame = { types: [...inFrame.types, 'int'], slots: inFrame.slots };
+    const c = this.compiler();
+    c.given.set(match.input, this.leaf(numbered, rows.map((r, i) => [...r, i])));
+    const r = c.op(match);
+    const found = new Map<number, Row[]>();
+    for (const f of this.rowsOf(c, r)) {
+      const i = f[w] as number;
+      let list = found.get(i);
+      if (!list) found.set(i, (list = []));
+      list.push([...f.slice(0, w), ...f.slice(w + 1)]);
+    }
+    // The rows that match nothing: the first of each set of properties creates.
+    const key = (props: Props) => JSON.stringify(Object.keys(props).sort().map((k) => [k, props[k]]));
+    const creators = new Map<string, number>();
+    const toCreate: number[] = [];
+    rows.forEach((_row, i) => {
+      if (found.has(i)) return;
+      const k = key(maps[i]!.props);
+      if (!creators.has(k)) {
+        creators.set(k, i);
+        toCreate.push(i);
+      }
+    });
+    const created = new Map<number, Row>();
+    const made = this.createRows(op.pattern, inFrame, out, toCreate.map((i) => rows[i]!));
+    toCreate.forEach((i, j) => created.set(i, made[j]!));
+    return rows.flatMap((row, i) => {
+      const matches = found.get(i);
+      if (matches) return matches;
+      const mine = created.get(i);
+      if (mine) return [mine];
+      // A later row with the same properties: the node the first created, with this row's own columns.
+      const first = created.get(creators.get(key(maps[i]!.props))!)!;
+      return [[...row, ...first.slice(w)]];
+    });
   }
 
   /**

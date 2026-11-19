@@ -130,6 +130,16 @@ const SEQUENCES: readonly [string, 'empty' | 'social', readonly string[]][] = [
     'MATCH (p:Tagged) WHERE p.k STARTS WITH \'A\' REMOVE p:Tagged, p:Nope RETURN count(*) AS n',
     'MATCH (n) RETURN labels(n) AS l, properties(n) AS p ORDER BY id(n)',
   ]],
+  ['writes in batches: MERGE', 'social', [
+    'UNWIND [1, 2, 1, 3, 2] AS i MERGE (n:M {i: i}) RETURN n',
+    "CREATE (:M {i: 3}), (:M {i: 4, x: true})",
+    'UNWIND [3, 4, 5, 5, 6] AS i MERGE (n:M {i: i}) RETURN n',
+    "UNWIND ['Ada', 'Nobody', 'Nobody', 'Grace'] AS name MERGE (p:Person {name: name}) RETURN p",
+    'UNWIND [1, 2, 3] AS i MERGE (n:Solo) RETURN n',
+    'UNWIND [1, null, 1] AS i MERGE (n:M {i: i, j: 1}) RETURN n',
+    'UNWIND [] AS i MERGE (n:M {i: i}) RETURN count(*) AS n',
+    'MATCH (n:M) RETURN n.i AS i, n.j AS j, n.x AS x ORDER BY id(n)',
+  ]],
   ['writes in batches: DELETE', 'social', [
     "MATCH (a:Person {name: 'Ada'}) CREATE (a)-[:SELF]->(a)",
     'MATCH (a)-[r:KNOWS]-(b) DELETE r RETURN count(*) AS n',
