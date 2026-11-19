@@ -1909,8 +1909,18 @@ export class Compiler {
     }
     const post: { slot: number; e: (col: number) => PlanExpr; t: PlanType; nodes?: boolean }[] = [];
     const calls: plan.AggCall[] = [];
+    // An argument the call reads more than once (a sum's or avg's check of its kind, min's and max's order keys) and
+    // that is computed, as a property is: a column of the input, computed once per row. Only one that can't raise an
+    // error, so the row's errors come in the same order.
+    const width = r.frame.types.length;
+    const computed: PlanExpr[] = [];
+    const once = (v: Val): Val => {
+      if (v.k !== 'value' || v.e.k === 'col' || v.e.k === 'lit' || staticKind(v.t) !== undefined || canRaise(v.e)) return v;
+      computed.push(v.e);
+      return { ...v, e: colRef(width + computed.length - 1, v.t) };
+    };
     for (const a of aggs) {
-      const { call: c, post: fix, type, nodes } = this.aggCall(a, r.frame);
+      const { call: c, post: fix, type, nodes } = this.aggCall(a, r.frame, a.fn === 'count' || a.fn === 'collect' ? undefined : once);
       const col = keyExprs.length + calls.length;
       calls.push(c);
       types.push(c.type);
@@ -1925,7 +1935,8 @@ export class Compiler {
       carry.push(c.props);
       types.push(PROPS);
     }
-    let out: Rel = { plan: { op: 'aggregate', input: r.plan, keys: keyExprs, aggs: calls, carry, ...(ordered && keyExprs.length ? { ordered: 'first' as const } : {}) }, frame: { types, slots } };
+    const input: PlanOp = computed.length ? { op: 'project', input: r.plan, exprs: [...r.frame.types.map((t, i) => colRef(i, t)), ...computed] } : r.plan;
+    let out: Rel = { plan: { op: 'aggregate', input, keys: keyExprs, aggs: calls, carry, ...(ordered && keyExprs.length ? { ordered: 'first' as const } : {}) }, frame: { types, slots } };
     if (post.length) {
       // Results that need a step after the aggregate (collect's NULLs dropped, sum's 0 for no rows).
       const exprs = out.frame.types.map((t, i) => colRef(i, t));
@@ -1943,11 +1954,11 @@ export class Compiler {
   }
 
   /** An aggregate call, and the step after the aggregate its result needs (reading its column). */
-  private aggCall(a: AggCall, frame: Frame): { call: plan.AggCall; post?: (col: number) => PlanExpr; type: PlanType; nodes?: boolean } {
+  private aggCall(a: AggCall, frame: Frame, once: (v: Val) => Val = (v) => v): { call: plan.AggCall; post?: (col: number) => PlanExpr; type: PlanType; nodes?: boolean } {
     const agg = (fn: string, args: readonly PlanExpr[], type: PlanType, star = false): plan.AggCall => ({ fn, args, star, distinct: a.distinct, collation: 'binary', type });
     if (a.fn === 'count' && a.args.length === 0) return { call: agg('count', [], 'int', true), type: 'int' };
     if (a.args.length !== 1) return unsupported(`${a.fn}() with ${a.args.length} arguments`);
-    const v = this.expr(a.args[0]!, frame);
+    const v = once(this.expr(a.args[0]!, frame));
     if (a.fn === 'count' && v.k !== 'value' && v.k !== 'node' && a.distinct) return unsupported(`count(DISTINCT …) of ${entity(v)}`);
     if (a.fn === 'count') return { call: agg('count', [nullTest(v)], 'int'), type: 'int' };
     if (a.fn === 'collect' && v.k === 'node' && !a.distinct) {
