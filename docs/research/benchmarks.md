@@ -169,3 +169,51 @@ property map or a WHERE equality on the node, or from a bound node, it is a hop 
 bound and the order of rows doesn't show, the pattern starts at its node with a property condition
 (`MATCH (a)-[:KNOWS]-(b:Person {name: 'Bo 1'})`: 49.0 to 29.9 ms, with the index 16.2 to 1.1 ms). Where the order
 shows (results without ORDER BY, `collect()`, LIMIT), it starts where it did, so rows keep their order.
+
+### Paths from a row, and rows that carry less (2026-11-19)
+
+Two queries were far behind: variable length 1..3 (`paths` in a subquery for each row: it ran its input twice, sorted
+its paths, and its list of paths was encoded, decoded and exploded) and 3 hops (EXPLAIN ANALYZE: each of 14,581
+relationships found was sought in the edge index, then read from the edge table for its other end, then its far node
+read by id, though only `count(f)` reads it; CPU profiles: B-tree descents first, then copying rows of 25 columns
+through the `iterate` and its projections). Now (ADR 0004, "Patterns"):
+
+- **Variable length where the order doesn't show** (a count, EXISTS) is a search from each row, an `iterate` that seeks
+  the edge index at the path's last node, as a hop from a row does, with the trail's relationships in a column each
+  (a list only past 8 hops or unbounded) and its hops built only where read.
+- **A node read only by `count()` or `id()`**, with no labels or properties, is a relationship's end: its node isn't
+  read (3 hops: 13,076 seeks fewer).
+- **A hop from a row carries less:** the columns that are the same literal on every row (ends and properties nothing
+  reads, a relationship's one type) stay out of the `iterate` and are put back after it (25 columns to 8 at the third
+  hop), and a relationship whose properties nothing reads is read without them.
+- **smaltdb's edge indexes** on `(start, end)` and `(end, start)` (the claude/perf-paths branch of smaltdb, as
+  smaltdb's ADR 0033 describes them; `addType` made them on `start` and on `end`) let a hop read the index alone.
+
+Milliseconds, median of 15 runs, `BENCH_INDEXES=1`, run one after the other. Before is the compiler at `ceb417d`;
+"main" is smaltdb `d180f45` (`packed.json`), "covering" the smaltdb branch with the covering indexes.
+
+At 20,000 people:
+
+| Query | smaltcy | before, main | after, main | before, covering | after, covering |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 hop | 0.21 | 1.26 | 0.79 | 0.98 | 0.73 |
+| 2 hops | 0.91 | 4.90 | 3.15 | 3.44 | 2.14 |
+| 3 hops (13,076 rows) | 4.55 | 37.46 | 20.85 | 28.88 | 13.40 |
+| Variable length 1..3, distinct | 12.05 | 165.70 | 21.48 | 135.74 | 13.38 |
+| Triangles (bounded) | 11.56 | 41.48 | 39.00 | 30.69 | 29.33 |
+
+At 2,000 people:
+
+| Query | smaltcy | before, main | after, main | before, covering | after, covering |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 hop | 0.16 | 0.72 | 0.56 | 0.72 | 0.54 |
+| 2 hops | 0.52 | 2.47 | 1.78 | 2.15 | 1.99 |
+| 3 hops (2,952 rows) | 0.93 | 8.57 | 4.85 | 11.01 | 3.81 |
+| Variable length 1..3, distinct | 2.28 | 31.18 | 4.93 | 29.90 | 3.76 |
+| Triangles (bounded) | 0.99 | 4.24 | 4.43 | 3.25 | 3.28 |
+
+The other queries run the same plans (their times differ by the container's noise, 10–30 % between runs here). With
+both changes, 3 hops is 2.9 times smaltcy's time and variable length about the same as smaltcy's, and both grow with
+the rows found, not the graph: 3.81 to 13.40 ms for 2,952 to 13,076 rows. What is left in 3 hops (profile) is the
+`iterate`'s per-row work: a row array and a queue entry for each hop found, the projections' register copies, and the
+index seeks.

@@ -293,6 +293,21 @@ const REL_CASES: [string, string][] = [
   ['a hop from a row, collected', "MATCH (x {k: 'b'})-[r:R]-(y) RETURN collect(r.w) AS ws, collect(y.k) AS ys"],
   ['a hop from a row, the rows a LIMIT keeps', "MATCH (x {k: 'c'})-[r]-(y)-[q]-(z) RETURN r.w AS a, q.w AS b, z.k AS z LIMIT 4"],
   ['variable length from zero', "MATCH (x {k: 'd'})-[*0..3]-(y) RETURN y.k AS y"],
+  // Where the order doesn't show (counts, EXISTS), a search from each row rather than `paths`.
+  ['variable length, counted', "MATCH (x {k: 'a'})-[*1..2]-(y) RETURN count(*) AS n, count(DISTINCT y) AS d"],
+  ['variable length of two types, counted', "MATCH (x {k: 'a'})-[:R|S*1..3]-(y) RETURN count(*) AS n, count(DISTINCT y) AS d, count(DISTINCT id(y)) AS i"],
+  ['variable length, unbounded trails, counted', 'MATCH (x)-[:R*]->(y) RETURN count(*) AS n, count(y) AS c'],
+  ['variable length in, counted', "MATCH (x {k: 'a'})<-[*1..3]-(y) RETURN count(*) AS n"],
+  ['variable length from zero, counted', 'MATCH (x)-[*0..2]-(y) RETURN count(*) AS n, count(DISTINCT y) AS d'],
+  ['variable length from the far end, counted', "MATCH (y {k: 'a'}) MATCH (x)-[*1..2]->(y) RETURN count(*) AS n, count(DISTINCT x) AS d"],
+  ['variable length with properties, counted', 'MATCH (x)-[rs:R*1..3 {w: 2}]->(y) RETURN count(*) AS n, count(rs) AS r'],
+  ['variable length, its relationships counted', "MATCH (x {k: 'b'})-[rs*1..2]-(y) RETURN count(rs) AS n, count(*) AS c"],
+  ['variable length and a fixed hop, counted', "MATCH (x {k: 'a'})-[r:R]->(y)-[rs:R*1..2]->(z) RETURN count(*) AS n, count(DISTINCT z) AS d"],
+  ['variable length, then a hop, counted', "MATCH (x {k: 'a'})-[:R*1..2]-(y)-[r]-(z) RETURN count(*) AS n, count(DISTINCT z) AS d, count(r) AS r"],
+  ['variable length to a labelled node, counted', "MATCH (x {k: 'c'})-[*1..3]-(y:N) RETURN count(*) AS n"],
+  ['variable length in EXISTS', "MATCH (x) WHERE EXISTS { (x)-[:R*2..2]->() } RETURN x.k AS x ORDER BY x"],
+  ['variable length from a NULL node, counted', "OPTIONAL MATCH (x {k: 'none'}) OPTIONAL MATCH (x)-[*0..2]-(y) RETURN count(y) AS n, count(*) AS c"],
+  ['hops whose far ends are only counted', "MATCH (x {k: 'a'})-[r]-()-[q]-(z) RETURN count(z) AS n, count(DISTINCT z) AS d, count(DISTINCT id(z)) AS i, count(q) AS q"],
   ['variable length with properties', 'MATCH (x)-[rs:R*1..3 {w: 2}]->(y) RETURN x.k AS x, y.k AS y, size(rs) AS n ORDER BY x, y'],
   ['variable length of a type the graph lacks', 'MATCH (x)-[:NOPE*0..1]->(y) RETURN x.k AS x, y.k AS y ORDER BY x'],
   ['a named path in results', "MATCH p = (x {k: 'c'})-[:R*1..2]->(y {k: 'a'}) RETURN p ORDER BY length(p)"],
@@ -538,6 +553,8 @@ describe('a generated network: both engines give the same rows', () => {
     ['variable length, either direction', 'MATCH (p:Person {community: 2})-[:KNOWS*1..2]-(f) RETURN p.name AS p, f.name AS f'],
     ['variable length, its relationships', 'MATCH (p:Person {community: 2})-[rs:KNOWS*1..2]->(f) RETURN p.name AS p, [r IN rs | id(r)] AS rs, f.name AS f'],
     ['variable length to an anonymous node', "MATCH (p:Person {name: 'Bo 1'})-[:KNOWS*1..3]-() RETURN count(*) AS n"],
+    ['variable length, counted', 'MATCH (p:Person {community: 2})-[:KNOWS*1..3]-(f) RETURN count(*) AS n, count(DISTINCT f) AS d'],
+    ['variable length out, from the far end, counted', "MATCH (f:Person {name: 'Bo 1'}) MATCH (p)-[:KNOWS*1..3]->(f) RETURN count(*) AS n, count(DISTINCT p) AS d"],
     ['a filter on a label scan', 'MATCH (p:Person) WHERE p.age > 70 RETURN p.name AS p'],
     ['OPTIONAL MATCH with WHERE', 'MATCH (p:Person) OPTIONAL MATCH (p)-[:KNOWS]->(q) WHERE q.age > 60 RETURN p.name AS p, q.name AS q'],
     ['a match from bound nodes', 'MATCH (p:Person) WITH p ORDER BY p.name LIMIT 20 MATCH (p)-[:KNOWS]-(q) RETURN p.name AS p, q.name AS q'],
@@ -563,5 +580,16 @@ describe('a generated network: both engines give the same rows', () => {
     expect(plan).not.toContain('"ordered"');
     expect(plan).not.toContain('"sort"');
     expect(plan).not.toContain('"window"');
+  });
+
+  test("a variable-length relationship whose order shows nowhere is a search from each row, and a node only counted isn't read", () => {
+    const walk = JSON.stringify(compileQuery(compile("MATCH (p:Person {name: 'Bo 1'})-[:KNOWS*1..3]-(f) RETURN count(DISTINCT f) AS n").plan, tables).statement);
+    expect(walk).toContain('"name":"walk"');
+    expect(walk).not.toContain('"op":"paths"');
+    expect(walk).not.toContain('"sort"');
+    // Its far node is only counted: the node table is read once, for the person found by name.
+    expect(walk.split(`"table":"${tables.nodes}"`).length - 1).toBe(1);
+    const hops = JSON.stringify(compileQuery(compile("MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-()-[:KNOWS]-(f) RETURN count(f) AS n").plan, tables).statement);
+    expect(hops.split(`"table":"${tables.nodes}"`).length - 1).toBe(1);
   });
 });

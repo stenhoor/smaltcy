@@ -59,7 +59,10 @@ end few relationships share, a city, is more than a scan); in the same step it c
 Cypher's uniqueness against the pattern's relationships before it, and reads the far node by id and its labels from
 the label index, unless only the relationship reaches it. A new region starts from those rows, and every later hop
 from a node a hop from a row reached is one too (smaltdb doesn't know how many rows such a region has, and would scan
-an edge table whole). Ends and properties of a relationship nothing reads are NULL. With the order kept, rows are
+an edge table whole). Ends and properties of a relationship nothing reads are NULL, and then the step reads the edge
+table's index alone where it covers the other end (smaltdb's `(start, end)` and `(end, start)`). The `iterate` keeps a
+row for each hop, so it carries only the columns that differ between rows: those that are the same literal on every
+row (the NULL ends and properties, a relationship's one type) are put back after it. With the order kept, rows are
 sorted by the region's row, then the type and reading, then rowid, the order the union gave. Two exceptions keep the
 union as one FROM item: with neither end bound, and from a node scanned without a property condition (a property map,
 or an equality in WHERE on its properties), or reached from one, where seeking for each of 20,000 rows was slower
@@ -69,7 +72,8 @@ condition first (else with labels, else the first relationship's `from` node). T
 region into one per type and reading (`CompileOptions.maxBranches`), which smaltdb seeks into when the region's start is
 found by an index, but each region repeats the start, and a pattern of k hops read both ways is 2^k regions (below). An
 anonymous node that only a relationship reaches,
-with no labels or properties, that nothing else in the query reads, is that relationship's end, not a scan of the node
+with no labels or properties, that nothing else in the query reads (but its identity: `count(n)`, `id(n)`, which read
+its id), is that relationship's end, not a scan of the node
 table: smaltdb's graph keeps every end a node of the graph. Next to a union of edge tables it is still joined: the
 planner doesn't know a union's rows, and joined two unions with a nested loop in the 3-hop benchmark when it wasn't.
 Within one MATCH, relationships are distinct (Cypher's uniqueness): two relationships whose types can be the same must
@@ -86,7 +90,13 @@ hops); two variable-length relationships of types that can be the same in one MA
   sorted by the input's position (a window's `row_number`), then each scan's rowid and each union's part, the order
   smaltdb's `ordered` joins gave. Elsewhere (a count, EXISTS, what a grouping without keys reads) the plan asks for no
   order, so smaltdb joins and groups as its planner chooses, without the sorts an `ordered` join costs.
-- **Variable length** is smaltdb's `paths` in trail mode (no relationship twice), with `minHops` and `maxHops`, run
+- **Variable length**, where the order of its rows doesn't show (a count, EXISTS), is a search from each row: smaltdb's
+  `iterate`, its rows the row and the path so far (its last node, length and, where read, hops in `paths`' form), with a
+  step per type and reading that seeks the edge table's `start` or `end` index at the path's last node, as a hop from a
+  row does, `maxDepth` the maximum. Trail mode: the relationships on the path (their identities as `paths` makes them)
+  are kept in a column each for a search of at most 8 hops (shifted along at each hop), else in a list, and none is
+  walked twice; with no direction a self-loop is read once. Elsewhere it is smaltdb's `paths` in trail mode (no
+  relationship twice), with `minHops` and `maxHops`, run
   for each row in a subquery (the row's node, as a one-row `values`, to `paths`; its paths imploded into a list, then
   exploded back into rows): `paths` runs its input twice, to search and to join its paths back, which here is a row of
   values, not the plan before it. `paths` reads a self-loop both ways with direction `both`, two paths the same: each
@@ -297,8 +307,11 @@ a hop of one type, in `collect()` and under a LIMIT, in the order smaltcy gives.
   shortest path's search that stops at its end made the benchmark's queries 1.3 to 16 times faster (shortest path
   459 to 57 ms, all relationships 96 to 6 ms, 3 hops 314 to 154 ms). Hops from a row then made the hops read both
   ways seek for each row: with the index on `:Person(name)` that smaltcy's store has, 1 hop 15.3 to 1.3 ms, 2 hops
-  66.7 to 4.9 ms, 3 hops 121 to 36 ms, and 1 hop takes about as long at 2,000 people (0.9 ms) as at 20,000. Most of
-  what is left is smaltdb's:
+  66.7 to 4.9 ms, 3 hops 121 to 36 ms, and 1 hop takes about as long at 2,000 people (0.9 ms) as at 20,000. A search
+  from each row for variable length where the order doesn't show, nodes only counted left unread and hop rows without
+  their constant columns took variable length 1..3 from 166 to 21 ms and 3 hops from 37 to 21 ms, and with smaltdb's
+  edge indexes covering the other end (`(start, end)`, `(end, start)`) to 13 ms each. Most of what is left is
+  smaltdb's:
   - Its planner estimated a comparison of an expression (`map_get(props, 'name') = 'Bo 1'`) at a third of the
     table's rows, with or without an index on it, so the rest of the pattern was joined with hashes over whole scans of
     the edge tables. smaltdb estimates it from the index now (stenhoor/smaltdb#266), and a pattern's edge tables of

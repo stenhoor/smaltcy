@@ -128,10 +128,15 @@ function readAsOf<T>(x: T, t: GraphTables, asOf: AsOf): T {
   return walk(x) as T;
 }
 
-/** The slots that appear once in a plan (where they are bound, as a pattern's anonymous node is): nothing reads them. */
-function slotsOnce(gp: GraphPlan): Set<number> {
+/**
+ * The slots that appear once in a plan (where they are bound, as a pattern's anonymous node is): nothing reads them.
+ * With `identity`, also those read only as `count(x)` and `id(x)`, which of a node or a relationship read only its id
+ * or rowid: a pattern binds them without reading the node table or the relationship's ends and props.
+ */
+function slotsOnce(gp: GraphPlan, identity = false): Set<number> {
   const count = new Map<number, number>();
   const add = (s: unknown) => typeof s === 'number' && count.set(s, (count.get(s) ?? 0) + 1);
+  const isSlot = (x: unknown) => (x as { k?: unknown } | null)?.k === 'slot';
   const walk = (x: unknown): void => {
     if (Array.isArray(x)) return x.forEach(walk);
     if (x === null || typeof x !== 'object') return;
@@ -139,6 +144,12 @@ function slotsOnce(gp: GraphPlan): Set<number> {
     add(o.slot);
     if (Array.isArray(o.slots)) o.slots.forEach(add);
     if (o.k === 'slot') add(o.i);
+    // count(x) (an aggregate: it has a slot) and id(x) (a call) of a variable: its identity only.
+    const args = o.args;
+    if (identity && Array.isArray(args) && args.length === 1 && isSlot(args[0]) && ((o.fn === 'count' && typeof o.slot === 'number' && o.k === undefined) || (o.fn === 'id' && o.k === 'call'))) {
+      for (const [k, v] of Object.entries(o)) if (k !== 'args') walk(v);
+      return;
+    }
     Object.values(o).forEach(walk);
   };
   walk(gp);
@@ -150,7 +161,7 @@ export function compileQuery(gp: GraphPlan, tables: GraphTables, options: Compil
   if (gp.kind !== 'query') return unsupported('index plans');
   const asOf = gp.asOf ? (options.asOf ?? asOfOf(gp, options.params ?? {})) : undefined;
   if (asOf && !tables.history) noHistory();
-  const c = new Compiler(tables, options.params ?? {}, asOf, slotsOnce(gp), options.maxBranches);
+  const c = new Compiler(tables, options.params ?? {}, asOf, slotsOnce(gp), options.maxBranches, slotsOnce(gp, true));
   const { plan: root, frame } = c.op(gp.root);
   const exprs: PlanExpr[] = [];
   const columns: PlanColumn[] = [];
@@ -320,6 +331,8 @@ const E_TO = 6;
 const ADJ_TYPES: readonly PlanType[] = ['text', 'int', 'int', 'int', PROPS, 'int', PROPS];
 /** The name of a hop's `iterate` (`Compiler.hopFrom`), which reads its tables as of a version as any scan does. */
 const HOP_ITERATE = 'hop';
+/** The longest bounded variable-length search (`Compiler.walkFrom`) that keeps its relationships in columns, not a list. */
+const WALK_COLUMNS = 8;
 
 /**
  * One way a pattern matches, as a smaltdb join region: its FROM items (bare scans, and the input first), its
@@ -381,6 +394,47 @@ function canRaise(x: unknown): boolean {
   const o = x as Record<string, unknown>;
   if (o.k === 'cast' || (o.k === 'call' && !SAFE_FNS.has(o.fn as string))) return true;
   return Object.values(o).some(canRaise);
+}
+
+/**
+ * The columns of a plan that are the same literal on every row, as far as its shape shows (a projection's literals,
+ * through filters, sorts and inner joins): those a relationship or node binding leaves NULL, a type's name.
+ */
+function constantsOf(op: PlanOp): (PlanExpr | undefined)[] {
+  switch (op.op) {
+    case 'project': {
+      const inner = op.exprs.some((e) => e.k === 'col') ? constantsOf(op.input) : [];
+      return op.exprs.map((e) => (e.k === 'lit' ? e : e.k === 'col' && e.input === 0 && e.depth === 0 ? inner[e.index] : undefined));
+    }
+    case 'filter': case 'sort': case 'limit': case 'distinct':
+      return constantsOf(op.input);
+    case 'join':
+    {
+      const w = widthOf(op.inputs[0]);
+      if (w === undefined || (op.kind !== 'inner' && op.kind !== 'cross')) return [];
+      const l = constantsOf(op.inputs[0]);
+      return [...Array.from({ length: w }, (_, i) => l[i]), ...constantsOf(op.inputs[1])];
+    }
+    default:
+      return [];
+  }
+}
+
+/** The number of columns of a plan, for the operations `constantsOf` looks into (else undefined). */
+function widthOf(op: PlanOp): number | undefined {
+  switch (op.op) {
+    case 'project': return op.exprs.length;
+    case 'scan': return op.columns.length;
+    case 'values': case 'working': return op.types.length;
+    case 'filter': case 'sort': case 'limit': case 'distinct': return widthOf(op.input);
+    case 'iterate': return widthOf(op.init);
+    case 'join': {
+      if (op.kind === 'semi' || op.kind === 'anti') return widthOf(op.inputs[0]);
+      const [a, b] = [widthOf(op.inputs[0]), widthOf(op.inputs[1])];
+      return a === undefined || b === undefined ? undefined : a + b;
+    }
+    default: return undefined;
+  }
 }
 
 // Expression builders: plain data, as smaltdb's `plan` builders make them.
@@ -982,6 +1036,11 @@ export class Compiler {
     private readonly unread: ReadonlySet<number> = new Set(),
     /** `CompileOptions.maxBranches`. */
     private readonly maxBranches = 1,
+    /**
+     * Slots nothing reads but their identity (`slotsOnce` with `identity`): `count(x)` and `id(x)` of a node read its
+     * id, of a relationship its rowid, so the node table and the relationship's ends and props are not read for them.
+     */
+    private readonly idOnly: ReadonlySet<number> = unread,
   ) {}
 
   // Operations.
@@ -1078,7 +1137,9 @@ export class Compiler {
    * up to `maxBranches`; past that, from a bound end, it is a hop from each row of the region so far (`hopFrom`: smaltdb
    * seeks into the edge tables' indexes for each row), which starts a region of its own, as does every hop after it
    * from a node it reached; from a node scanned without a property condition (or reached from one), or with neither
-   * end bound, its edge source is the union of the edge tables, one FROM item. A variable-length relationship is smaltdb's `paths` in trail mode (no relationship twice) over the region so far,
+   * end bound, its edge source is the union of the edge tables, one FROM item. A variable-length relationship is a search
+   * from each row of the region so far where the order of its rows doesn't show (`walkFrom`), else smaltdb's `paths` in
+   * trail mode (no relationship twice) over it,
    * and a shortest path a breadth-first search once both its ends are bound; each starts a region of its own.
    * Relationships are distinct within the pattern (Cypher's uniqueness): two relationships whose types can be the same
    * must differ in type or rowid, and a variable-length relationship's hops must not hold the others. The pattern's
@@ -1166,7 +1227,7 @@ export class Compiler {
     /** Whether node `i` is only a relationship's end: anonymous (nothing reads it), with no labels or properties. */
     const endOnly = (i: number) => {
       const n = p.nodes[i]!;
-      return this.unread.has(n.slot) && !n.labels.length && !n.props;
+      return this.idOnly.has(n.slot) && !n.labels.length && !n.props;
     };
     /** Binds node `i` to a relationship's end, `id` in each branch, without a scan of the node table (its properties are never read). */
     const bindEnd = (i: number, id: (b: Branch) => PlanExpr) => {
@@ -1270,7 +1331,7 @@ export class Compiler {
       const w = types.length;
       // Uniqueness with the relationships before it, checked as it is found (before the far end is read).
       const before = fixed.filter((f) => overlap(f.r, r)).map((f) => f.b);
-      const plan = this.hopFrom({ plan: finish(), frame: frame() }, nearId, choices, r.dir, fromBound, farNode?.id, farNew?.labels, before, !this.unread.has(r.slot) || r.props !== undefined, ordered);
+      const plan = this.hopFrom({ plan: finish(), frame: frame() }, nearId, choices, r.dir, fromBound, farNode?.id, farNew?.labels, before, !this.idOnly.has(r.slot) || r.props !== undefined, ordered);
       distinct.add(r);
       types.push(...ADJ_TYPES);
       restart(plan);
@@ -1323,6 +1384,10 @@ export class Compiler {
       if (!names.length) {
         // No edge table: only the empty path, from minHops 0.
         plan = { op: 'project', input: min === 0 ? plan : { op: 'filter', input: plan, pred: FALSE }, exprs: [...types.map((t, i) => colRef(i, t)), colRef(start, 'int'), lit(0), call('list_of', [], HOPS)] };
+        types.push('int', 'int', HOPS);
+      } else if (!ordered && !shortest) {
+        // Where the order doesn't show: a search from each row (`walkFrom`), its rows the paths found.
+        plan = this.walkFrom(plan, types, start, names, dir, min, r.max, !this.unread.has(r.slot) || r.props !== undefined || p.rels.length > 1);
         types.push('int', 'int', HOPS);
       } else {
         // Each row's paths, from a subquery (smaltdb's `paths` from that row's node), one row each.
@@ -1510,6 +1575,64 @@ export class Compiler {
   }
 
   /**
+   * The paths from each row of `left` (whose columns are `lt`) at its node `near` along these edge tables, in trail mode
+   * (no relationship twice), as the rows of `pathsFrom` exploded: the row, then where the path ends, its length and,
+   * with `hops`, its hops as `paths` gives them (else NULL: nothing reads them). In no particular order: smaltdb's
+   * `iterate`, whose rows are the row and the path so far, with a step per table and reading that joins the path's
+   * last node (`working`, which the planner reads a row at a time) with the edge table's `start` or `end` index, so it
+   * seeks for each path rather than running `paths` (its input twice, its paths sorted) in a subquery for each row, and
+   * a relationship already on the path (its identity, as `paths` makes it, in columns or a list) is not walked again. `both` reads
+   * a self-loop once (`paths` reads it both ways, the two paths the same, one kept). Its tables are read in the
+   * present, as `paths` reads them.
+   */
+  private walkFrom(left: PlanOp, lt: readonly PlanType[], near: number, names: readonly string[], dir: Direction, min: number, max: number | undefined, hops: boolean): PlanOp {
+    const id = ++this.iterates;
+    const w = lt.length;
+    const INTS: PlanType = 'list<int>';
+    // The relationships on the path, to walk none twice: for a short bounded search one column for each but the last
+    // hop's (the latest first, shifted along at each hop; NULL for none), else a list.
+    const slots = max !== undefined && max <= WALK_COLUMNS ? Math.max(0, max - 1) : -1;
+    // Columns: the row's, the path's last node, its length, its hops (NULL without `hops`), the relationships on it.
+    const [END, LEN, PATH, IDS] = [w, w + 1, w + 2, w + 3];
+    const iterTypes: PlanType[] = [...lt, 'int', 'int', HOPS, ...(slots < 0 ? [INTS] : Array.from({ length: slots }, (): PlanType => 'int'))];
+    const nearCol = colRef(near, 'int');
+    const init: PlanOp = {
+      op: 'project',
+      input: { op: 'filter', input: left, pred: isNotNull(nearCol) },
+      exprs: [...lt.map((t, i) => colRef(i, t)), nearCol, lit(0), hops ? call('list_of', [], HOPS) : lit(null, HOPS), ...(slots < 0 ? [call('list_of', [], INTS)] : Array.from({ length: slots }, () => lit(null, 'int')))],
+    };
+    const ways: boolean[] = dir === 'out' ? [false] : dir === 'in' ? [true] : [false, true];
+    const steps = names.flatMap((name, i) =>
+      ways.map((reverse): PlanOp => {
+        const table = this.t.types.get(name)!;
+        const b: Branch = { leaves: [{ op: 'working', id, types: iterTypes }], width: iterTypes.length, conds: [], out: [], keys: [] };
+        const e = addLeaf(b, { op: 'scan', table, columns: [-1, 0, 1], indexedBy: `${table}_${reverse ? 'end' : 'start'}` }, 3);
+        const [from, to] = reverse ? [colRef(e + 2, 'int'), colRef(e + 1, 'int')] : [colRef(e + 1, 'int'), colRef(e + 2, 'int')];
+        // A relationship's identity as `paths` makes it: its rowid, with its table's position when there are several.
+        const rel = names.length === 1 ? colRef(e, 'int') : call('add', [call('mul', [colRef(e, 'int'), lit(names.length)], 'int'), lit(i)], 'int');
+        b.conds.push(eq(from, colRef(END, 'int')));
+        if (slots < 0) b.conds.push(not(call('list_contains', [colRef(IDS, INTS), rel], 'int')));
+        else for (let k = 0; k < slots; k++) b.conds.push({ k: 'or', args: [isNull(colRef(IDS + k, 'int')), not(eq(colRef(IDS + k, 'int'), rel))] });
+        // `both`: the reverse reading of a self-loop is the same path.
+        if (dir === 'both' && reverse) b.conds.push(not(eq(from, to)));
+        const hop = call('struct_of', [lit(i), colRef(e, 'int'), from, to], HOP);
+        const joined = b.leaves.slice(1).reduce((l, x): PlanOp => ({ op: 'join', kind: 'cross', inputs: [l, x] }), b.leaves[0]!);
+        const exprs = [
+          ...lt.map((t, k) => colRef(k, t)),
+          to,
+          call('add', [colRef(LEN, 'int'), lit(1)], 'int'),
+          hops ? call('list_concat', [colRef(PATH, HOPS), call('list_of', [hop], HOPS)], HOPS) : lit(null, HOPS),
+          ...(slots < 0 ? [call('list_concat', [colRef(IDS, INTS), call('list_of', [rel], INTS)], INTS)] : Array.from({ length: slots }, (_, k) => (k === 0 ? rel : colRef(IDS + k - 1, 'int')))),
+        ];
+        return { op: 'project', input: { op: 'filter', input: joined, pred: and(...b.conds) }, exprs };
+      }),
+    );
+    let plan: PlanOp = { op: 'iterate', id, name: 'walk', init, steps, distinct: false, collations: iterTypes.map(() => 'binary'), ...(max !== undefined ? { maxDepth: max } : {}) };
+    if (min > 0) plan = { op: 'filter', input: plan, pred: call('cmp_ge', [colRef(LEN, 'int'), lit(min)], 'bool') };
+    return { op: 'project', input: plan, exprs: [...lt.map((t, i) => colRef(i, t)), colRef(END, 'int'), colRef(LEN, 'int'), colRef(PATH, HOPS)] };
+  }
+
+  /**
    * One shortest path from `from` to `to` (expressions of the row), in the pattern's direction, or NULL: a scalar
    * subquery of a breadth-first search from `from` (smaltdb's `iterate`, the first row reaching each node kept, so its
    * hops are a shortest path there), whose first row at `to` stops it (smaltdb runs an iterate's steps as its rows are
@@ -1637,35 +1760,64 @@ export class Compiler {
    * `labels`, into the node table by the other end (and the label index for each label); without, the props are NULL.
    * `bound`: the far end's column when it is bound (the step checks it); `before`: the row's relationships it must
    * differ from (Cypher's uniqueness, checked before the far end is read). `read`: whether the relationship's ends and
-   * props are read (else NULL). `both`'s reverse reading leaves self-loops out (one match). With `ordered`, rows come in
-   * the order of `left`, then of the choices, then of rowid.
+   * props are read (else NULL, and the edge table's index covers what the step reads). `both`'s reverse reading leaves
+   * self-loops out (one match). With `ordered`, rows come in the order of `left`, then of the choices, then of rowid.
    */
   private hopFrom(left: Rel, near: number, choices: readonly { type: string; reverse: boolean }[], dir: Direction, fromBound: boolean, bound: number | undefined, labels: readonly string[] | undefined, before: readonly RelBinding[], read: boolean, ordered: boolean): PlanOp {
     const id = ++this.iterates;
     const lt = left.frame.types;
-    const w = lt.length;
-    // Columns: the row's (numbered when the order is kept), the hop's, its choice's position, then the depth (0: a row of `left`).
-    const base: PlanType[] = ordered ? [...lt, 'int'] : [...lt];
-    const iterTypes: PlanType[] = [...base, ...ADJ_TYPES, 'int', 'int'];
+    // The iterate keeps a row for each hop found, so it carries only what varies: the row's columns that are not the
+    // same literal on every row (`constantsOf`: ends and properties nothing reads, a relationship's one type) and the
+    // hop's columns that differ between rows; the others are put back after it.
+    const consts = constantsOf(left.plan);
+    const carried = lt.flatMap((_, i) => (consts[i] ? [] : [i]));
+    const pos = new Map(carried.map((c, k) => [c, k]));
+    /** A column of the row, in the iterate. */
+    const rowCol = (i: number): PlanExpr => consts[i] ?? colRef(pos.get(i)!, lt[i]!);
     const nulls = (ts: readonly PlanType[]): PlanExpr[] => ts.map((t) => ({ k: 'lit', value: null, type: t }));
     const input = ordered ? this.numbered(left) : left.plan;
-    const init: PlanOp = { op: 'project', input, exprs: [...base.map((t, i) => colRef(i, t)), ...nulls(ADJ_TYPES), lit(null, 'int'), lit(0)] };
+    const base: PlanType[] = [...carried.map((i) => lt[i]!), ...(ordered ? ['int' as PlanType] : [])];
+    const w = carried.length;
+    const varying = (exprs: readonly PlanExpr[][]): boolean[] => exprs[0]!.map((e, j) => !exprs.every((x) => x[j]!.k === 'lit' && e.k === 'lit' && x[j]!.value === e.value));
+    // The hop's columns (`ADJ_TYPES`, then the choice's position) as each step gives them, the edge scan's at `e`.
+    const hopOf = (type: string, i: number, e: number, other: PlanExpr, props: PlanExpr): PlanExpr[] => {
+      const opt = (x: PlanExpr, t: PlanType): PlanExpr => (read ? x : { k: 'lit', value: null, type: t });
+      return [lit(type, 'text'), colRef(e, 'int'), opt(colRef(e + 1, 'int'), 'int'), opt(colRef(e + 2, 'int'), 'int'), opt(colRef(e + 3, PROPS), PROPS), other, props, lit(i)];
+    };
+    const hopTypes: PlanType[] = [...ADJ_TYPES, 'int'];
+    // The hop columns the iterate keeps: those the steps don't all give as the same literal (seen in the steps'
+    // expressions with any columns: a column varies).
+    const dry = choices.map(({ type }, i) => hopOf(type, i, 0, colRef(0, 'int'), labels ? colRef(0, PROPS) : { k: 'lit', value: null, type: PROPS }));
+    const keep = varying(dry).map((v, j) => v || dry.some((x) => x[j]!.k !== 'lit'));
+    // The choice's position orders rows (with `ordered`); else it is not needed.
+    keep[hopTypes.length - 1] = ordered;
+    const kept = hopTypes.flatMap((_, j) => (keep[j] ? [j] : []));
+    const iterTypes: PlanType[] = [...base, ...kept.map((j) => hopTypes[j]!)];
+    // The rowid (always kept: it varies) is NULL in a row of `left` and set in a hop's.
+    const ROWID = base.length + kept.indexOf(E_ROWID);
+    const init: PlanOp = { op: 'project', input, exprs: [...carried.map((i) => colRef(i, lt[i]!)), ...(ordered ? [colRef(lt.length, 'int')] : []), ...nulls(kept.map((j) => hopTypes[j]!))] };
     const steps = choices.map(({ type, reverse }, i): PlanOp => {
       const b: Branch = { leaves: [{ op: 'working', id, types: iterTypes }], width: iterTypes.length, conds: [], out: [], keys: [] };
       // The end that is bound: `start` when the pattern's bound end is its `from` end, read forward.
       const atStart = fromBound !== reverse;
       // Its index, by the name smaltdb's `addType` gives it: the planner estimates a seek by the average rows per value,
       // which for a type whose ends are few (people living in a few cities) is more than a scan costs, but a hop reads
-      // one node's.
+      // one node's. Its props only when read.
       const table = this.t.types.get(type)!;
-      const e = addLeaf(b, { op: 'scan', table, columns: [-1, 0, 1, 2], ...(this.asOf ? {} : { indexedBy: `${table}_${atStart ? 'start' : 'end'}` }) }, 4);
+      const e = addLeaf(b, { op: 'scan', table, columns: read ? [-1, 0, 1, 2] : [-1, 0, 1], ...(this.asOf ? {} : { indexedBy: `${table}_${atStart ? 'start' : 'end'}` }) }, read ? 4 : 3);
       const start = colRef(e + 1, 'int');
       const end = colRef(e + 2, 'int');
       const [seek, other] = atStart ? [start, end] : [end, start];
-      b.conds.push(eq(seek, colRef(near, 'int')));
+      b.conds.push(eq(seek, rowCol(near)));
       if (dir === 'both' && reverse) b.conds.push(not(eq(start, end)));
-      if (bound !== undefined) b.conds.push(eq(other, colRef(bound, 'int')));
-      for (const x of before) b.conds.push(not(and(eq(colRef(x.type, 'text'), lit(type, 'text')), eq(colRef(x.rowid, 'int'), colRef(e, 'int')))));
+      if (bound !== undefined) b.conds.push(eq(other, rowCol(bound)));
+      for (const x of before) {
+        // A relationship of one type has it as a literal: the same as this one's, or never the same relationship.
+        const t = rowCol(x.type);
+        const sameRow = eq(rowCol(x.rowid), colRef(e, 'int'));
+        if (t.k !== 'lit') b.conds.push(not(and(eq(t, lit(type, 'text')), sameRow)));
+        else if (t.value === type) b.conds.push(not(sameRow));
+      }
       let props: PlanExpr = { k: 'lit', value: null, type: PROPS };
       if (labels) {
         const n = addLeaf(b, { op: 'scan', table: this.t.nodes, columns: [0, 1] }, 2);
@@ -1673,18 +1825,20 @@ export class Compiler {
         props = colRef(n + 1, PROPS);
         this.labelEntries(b, other, labels);
       }
-      const opt = (x: PlanExpr, t: PlanType): PlanExpr => (read ? x : { k: 'lit', value: null, type: t });
+      const hop = hopOf(type, i, e, other, props);
       const joined = b.leaves.slice(1).reduce((l, x): PlanOp => ({ op: 'join', kind: 'cross', inputs: [l, x] }), b.leaves[0]!);
-      const exprs = [...base.map((t, k) => colRef(k, t)), lit(type, 'text'), colRef(e, 'int'), opt(start, 'int'), opt(end, 'int'), opt(colRef(e + 3, PROPS), PROPS), other, props, lit(i), lit(1)];
+      const exprs = [...base.map((t, k) => colRef(k, t)), ...kept.map((j) => hop[j]!)];
       return { op: 'project', input: { op: 'filter', input: joined, pred: and(...b.conds) }, exprs };
     });
     let plan: PlanOp = { op: 'iterate', id, name: HOP_ITERATE, init, steps, distinct: false, collations: iterTypes.map(() => 'binary'), maxDepth: 1 };
-    plan = { op: 'filter', input: plan, pred: eq(colRef(iterTypes.length - 1, 'int'), lit(1)) };
+    // The hops: not the rows of `left`, whose rowid is NULL.
+    plan = { op: 'filter', input: plan, pred: isNotNull(colRef(ROWID, 'int')) };
     if (ordered) {
       const key = (i: number) => ({ expr: colRef(i, 'int'), desc: false, nullsFirst: false, collation: 'binary' as const });
-      plan = { op: 'sort', input: plan, keys: [key(w), key(iterTypes.length - 2), key(w + 1 + E_ROWID)] };
+      plan = { op: 'sort', input: plan, keys: [key(w), key(iterTypes.length - 1), key(ROWID)] };
     }
-    return { op: 'project', input: plan, exprs: [...lt.map((t, i) => colRef(i, t)), ...ADJ_TYPES.map((t, i) => colRef(base.length + i, t))] };
+    const hopCol = (j: number): PlanExpr => (keep[j] ? colRef(base.length + kept.indexOf(j), hopTypes[j]!) : dry[0]![j]!);
+    return { op: 'project', input: plan, exprs: [...lt.map((_, i) => rowCol(i)), ...ADJ_TYPES.map((_, j) => hopCol(j))] };
   }
 
   /** A pattern's property map: each key equals its value (Cypher's `=`, true). */
