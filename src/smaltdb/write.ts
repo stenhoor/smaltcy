@@ -407,7 +407,11 @@ class Runner {
 
   // The statement.
 
+  /** Whether the statement deletes: a node or relationship a row holds may then be gone. */
+  private deleting = false;
+
   statement(gp: Extract<GraphPlan, { kind: 'query' }>): { columns: readonly string[]; rows: unknown[][] } {
+    this.deleting = deletes(gp.root);
     const s = this.stream(gp.root, false);
     for (const col of gp.columns) {
       // smaltcy's engine gives a deleted node or relationship in a path or list as an empty one; smaltdb's lists drop it.
@@ -592,7 +596,10 @@ class Runner {
     const n = frame.types.length;
     if (n === 0) return { plan: { op: 'values', rows: rows.map(() => []), types: [] }, frame };
     const types = frame.types.map((t) => (t === 'any' ? 'list<any>' : t));
-    const columns = frame.types.map((t, i) => rows.map((r) => (t === 'any' ? [r[i] ?? null] : (r[i] ?? null))));
+    // A node's or relationship's properties are read from its table below: the rows' own are not sent.
+    const live = new Set<number>();
+    for (const b of frame.slots.values()) if (b.k === 'node' || b.k === 'rel') live.add(b.props);
+    const columns = frame.types.map((t, i) => (live.has(i) ? rows.map(() => null) : rows.map((r) => (t === 'any' ? [r[i] ?? null] : (r[i] ?? null)))));
     const values = { op: 'values', rows: [], types, columns } as unknown as PlanOp;
     const exprs = frame.types.map((t, i) => (t === 'any' ? call('list_get', [colRef(i, 'list<any>'), lit(0)], 'any') : colRef(i, t)));
     for (const b of frame.slots.values()) {
@@ -1072,7 +1079,7 @@ class Runner {
           if (v.k === 'value' && v.v === null) this.setProps(target, (cur) => removeKeys(cur, [it.key]), 1, without(target.props, [it.key]));
           else {
             const value = propertyValue(v, 'SET');
-            this.setProps(target, (cur, given) => call('map_merge', [removeKeys(cur, [it.key]), call('map_of', [lit(it.key), given], PROPS)], PROPS), 1, { ...without(target.props, [it.key]), [it.key]: value }, value);
+            this.setProps(target, (cur, given) => call('map_merge', [cur, call('map_of', [lit(it.key), given], PROPS)], PROPS), 1, { ...without(target.props, [it.key]), [it.key]: value }, value);
           }
           break;
         }
@@ -1171,6 +1178,10 @@ class Runner {
         continue;
       }
       if (it.kind !== 'prop') return refuse('SET of a property map in a batch');
+      if (!this.deleting) {
+        this.setPropRows(it, frame, live);
+        continue;
+      }
       const targets = this.evaluateAll(frame, live, it.target);
       const values = 'value' in it ? this.evaluateAll(frame, live, it.value) : null;
       // By table: the rowids, and the value each gets (`null` removes the key).
@@ -1194,19 +1205,58 @@ class Runner {
       });
       for (const [table, w] of writes) {
         if (w.removed.length) this.updateProps(table, w.column, w.removed, null, (cur) => removeKeys(cur, [it.key]));
-        if (w.rowids.length) this.updateProps(table, w.column, w.rowids, w.given, (cur, g) => call('map_merge', [removeKeys(cur, [it.key]), call('map_of', [lit(it.key), g], PROPS)], PROPS));
+        // map_merge keeps the second map's value of a key both have: the key is set without removing it first.
+        if (w.rowids.length) this.updateProps(table, w.column, w.rowids, w.given, (cur, g) => call('map_merge', [cur, call('map_of', [lit(it.key), g], PROPS)], PROPS));
       }
     }
     return rows;
   }
 
-  /** Sets a property map column of the rows `rowids` of a table to `f` of what it is and of `given` (one per row). */
-  private updateProps(table: string, column: number, rowids: readonly number[], given: readonly unknown[] | null, f: (cur: PlanExpr, given: PlanExpr) => PlanExpr): void {
+  /**
+   * One property set (or removed) on the targets of rows that hold them, in a statement that deletes nothing (so each
+   * is there): its values read for all rows, then one update per table. Every row counts one property set, as
+   * smaltcy's engine counts.
+   */
+  private setPropRows(it: Extract<SetItem | RemoveItem, { kind: 'prop' }>, frame: Frame, rows: readonly Row[]): void {
+    const b = frame.slots.get((it.target as { i: number }).i)!;
+    const values = 'value' in it ? this.evaluateAll(frame, rows, it.value) : null;
+    const writes = new Map<string, { column: number; rowids: number[]; given: unknown[]; removed: number[] }>();
+    rows.forEach((row, i) => {
+      const [table, column, rowid] = b.k === 'node' ? [this.tables().nodes, 1, row[b.id] as number] : [this.types.get(row[(b as Extract<Binding, { k: 'rel' }>).type] as string)!, 2, row[(b as Extract<Binding, { k: 'rel' }>).rowid] as number];
+      const v = values?.[i];
+      const gone = !v || (v.k === 'value' && v.v === null);
+      let w = writes.get(table);
+      if (!w) writes.set(table, (w = { column, rowids: [], given: [], removed: [] }));
+      if (gone) w.removed.push(rowid);
+      else {
+        w.rowids.push(rowid);
+        w.given.push(propertyValue(v, 'SET'));
+      }
+      this.counts.propertiesSet++;
+    });
+    // With history, a row the write leaves as it was is not written: it would be a version that changes nothing.
+    // Without, writing it changes nothing anyone sees, and comparing would cost more than writing.
+    const changedOnly = this.t0.history !== undefined;
+    for (const [table, w] of writes) {
+      if (w.removed.length) this.updateProps(table, w.column, w.removed, null, (cur) => removeKeys(cur, [it.key]), changedOnly);
+      // map_merge keeps the second map's value of a key both have: the key is set without removing it first.
+      if (w.rowids.length) this.updateProps(table, w.column, w.rowids, w.given, (cur, g) => call('map_merge', [cur, call('map_of', [lit(it.key), g], PROPS)], PROPS), changedOnly);
+    }
+  }
+
+  /**
+   * Sets a property map column of the rows `rowids` of a table to `f` of what it is and of `given` (one per row); with
+   * `changedOnly`, only the rows that changes.
+   */
+  private updateProps(table: string, column: number, rowids: readonly number[], given: readonly unknown[] | null, f: (cur: PlanExpr, given: PlanExpr) => PlanExpr, changedOnly = false): void {
     // A value of `any` crosses as a one-element `list<any>`, which keeps its kind (smaltdb ADR 0039).
     const values = { op: 'values', rows: [], types: given ? ['int', 'list<any>'] : ['int'], columns: given ? [rowids, given.map((g) => [g])] : [rowids] } as unknown as PlanOp;
-    const input = filter({ op: 'join', kind: 'cross', inputs: [scan(table, [-1, column]), values] }, eq(colRef(0, 'int'), colRef(2, 'int')));
     const g = given ? call('list_get', [colRef(3, 'list<any>'), lit(0)], 'any') : NULL;
-    this.db.queryPlan(write({ op: 'update', table, db: 'main', input, rowid: 0, sets: [{ column, value: f(colRef(1, PROPS), g) }], from: true }));
+    const value = f(colRef(1, PROPS), g);
+    const match = eq(colRef(0, 'int'), colRef(2, 'int'));
+    // An UPDATE's input is its join region, so the comparison computes the new properties a second time.
+    const input = filter({ op: 'join', kind: 'cross', inputs: [scan(table, [-1, column]), values] }, changedOnly ? and(match, call('cmp_is_not', [value, colRef(1, PROPS)], 'bool')) : match);
+    this.db.queryPlan(write({ op: 'update', table, db: 'main', input, rowid: 0, sets: [{ column, value }], from: true }));
   }
 
   /** Adds (or with `remove`, removes) labels of the nodes `ids` (no two the same), counting those it changes. */

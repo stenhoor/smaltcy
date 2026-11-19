@@ -288,6 +288,13 @@ queries and the relationship cases run both with one join region per MATCH and w
 (`maxBranches`); the relationship cases include hops from a row from either end, to a bound node, after a label, before
 a hop of one type, in `collect()` and under a LIMIT, in the order smaltcy gives.
 
+## The bar for switching (smaltdb ADR 0033, step 9)
+
+The owner decided (2026-11-19): smaltcy moves onto smaltdb only when smaltdb is at least as fast as smaltcy's engine on
+every query and write of its benchmarks (`npm run bench:smaltdb`, `BENCH_ENTRY=bench/writes.ts npm run
+bench:smaltdb`), at 20,000 people. Where smaltdb stays slower, the case comes to the owner with the profile that says
+why, and the significant benefit other than speed that pays for it; the owner accepts or refuses each such case.
+
 ## Consequences
 
 - Reads compile now (58 of the 59 read cases); `keys()` (below) is refused. Writes run (all 14 write cases, and the
