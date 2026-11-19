@@ -8,6 +8,11 @@
  *   `values` plan), and each write one or more smaltdb write statements (`append`, `update`, `delete`).
  * - **Reading before writing.** Where the plan reads everything first (`eager`, `sort`, `aggregate`), or what it reads
  *   doesn't depend on the graph (no MATCH, EXISTS or pattern comprehension), its rows are one query.
+ * - **Writes in batches.** A CREATE, SET, REMOVE or DELETE whose rows are read before it (as above), with nothing after
+ *   it in its clause that reads the graph, writes or stops early (LIMIT), writes all its rows at once: a few smaltdb
+ *   statements, not a few per row. It does only where that writes what row by row would: a SET or REMOVE sets one
+ *   property or labels, of entities no two rows share, to values that read no other entity; a CREATE's properties read
+ *   no nested plan and no entity it creates; a DELETE of nodes detaches them. Anything else runs row by row.
  * - **Entities are read live.** A row holds a node's id and a relationship's type and rowid; every query over a row
  *   reads their properties from their tables again, so `SET n.x = 1 RETURN n.x` reads 1. Values computed before a
  *   write keep what they were. Nodes, relationships and paths in the results are read once the statement is done, as
@@ -33,8 +38,8 @@
  */
 import type { plan, PlanStatementInput } from 'smaltdb/engine';
 import { SmaltcyError } from '../errors.js';
-import type { Expr } from '../plan/expr.js';
-import type { GraphPlan, Op, Pattern, RemoveItem, SetItem } from '../plan/ops.js';
+import { forEachChild, slotsRead, type Expr } from '../plan/expr.js';
+import { exprsOf, type GraphPlan, type Op, type Pattern, type RemoveItem, type SetItem } from '../plan/ops.js';
 import type { GraphTables } from './schema.js';
 import { NODE_LABEL } from './schema.js';
 import {
@@ -431,40 +436,52 @@ class Runner {
    * An operation's rows, streamed. `above`: whether an operation above this one, before anything that reads all its
    * input first, writes (so the order rows reach it in matters).
    */
-  private stream(op: Op, above: boolean): Stream {
-    if (!writes(op) && (op.op === 'eager' || !readsGraph(op))) return this.query(op);
+  private stream(op: Op, above: boolean, quiet = true): Stream {
+    if (!writes(op) && settled(op)) return this.query(op);
     if (op.op !== 'delete' && op.op !== 'argument' && deletes(op) && readsDeleted(op)) refuse(AFTER_DELETE_FEATURE);
     const inputAbove = WRITES.has(op.op) || (above && op.op !== 'eager' && op.op !== 'sort' && op.op !== 'aggregate');
+    // `quiet`: nothing above this operation, up to one that reads all its rows first, reads the graph, writes or stops
+    // early, so a write here may write all its rows at once.
+    const inputQuiet = BARRIERS.has(op.op) || (quiet && !touches(op));
+    // Its rows are read before it writes (`stream` makes them one query), and it can write them all at once.
+    const batch = quiet && op.op !== 'argument' && op.op !== 'union' && settled(op.input);
     switch (op.op) {
       case 'argument':
         if (op.slots.length) return refuse('a nested plan with writes');
         return { frame: { types: [], slots: new Map() }, run: (sink) => sink([]) };
       case 'filter': case 'project': case 'unwind': case 'match':
-        return this.perRow(op, this.stream(op.input, inputAbove));
+        return this.perRow(op, this.stream(op.input, inputAbove, inputQuiet));
       case 'eager': case 'sort': case 'aggregate':
-        return this.allRows(op, this.stream(op.input, inputAbove));
+        return this.allRows(op, this.stream(op.input, inputAbove, inputQuiet));
       case 'distinct':
         // smaltcy's DISTINCT passes each row on as it comes: with writes on both sides, the order they run in matters.
         if (above) return refuse('DISTINCT between writes');
-        return this.allRows(op, this.stream(op.input, inputAbove));
+        return this.allRows(op, this.stream(op.input, inputAbove, inputQuiet));
       case 'limit':
-        return this.limit(op, this.stream(op.input, inputAbove));
+        return this.limit(op, this.stream(op.input, inputAbove, inputQuiet));
       case 'union':
         return refuse('UNION with writes');
-      case 'create':
-        return this.create(op, this.stream(op.input, inputAbove));
-      case 'merge':
-        return this.merge(op, this.stream(op.input, inputAbove));
+      case 'create': {
+        const input = this.stream(op.input, inputAbove, inputQuiet);
+        return this.create(op, input, batch && this.createInBatch(op.pattern, input.frame));
+      }
+      case 'merge': {
+        const input = this.stream(op.input, inputAbove, inputQuiet);
+        return this.merge(op, input, batch && this.mergeInBatch(op, input.frame));
+      }
       case 'set': {
-        const input = this.stream(op.input, inputAbove);
+        const input = this.stream(op.input, inputAbove, inputQuiet);
+        if (batch && this.setInBatch(op.items, input.frame)) return this.batched(input, (rows) => this.setRows(op.items, input.frame, rows, false));
         return { frame: input.frame, run: (sink) => input.run((row) => (this.setItems(op.items, input.frame, row), sink(row))) };
       }
       case 'remove': {
-        const input = this.stream(op.input, inputAbove);
+        const input = this.stream(op.input, inputAbove, inputQuiet);
+        if (batch && this.setInBatch(op.items, input.frame)) return this.batched(input, (rows) => this.setRows(op.items, input.frame, rows, true));
         return { frame: input.frame, run: (sink) => input.run((row) => (this.removeItems(op.items, input.frame, row), sink(row))) };
       }
       case 'delete': {
-        const input = this.stream(op.input, inputAbove);
+        const input = this.stream(op.input, inputAbove, inputQuiet);
+        if (batch && this.deleteInBatch(op, input.frame)) return this.batched(input, (rows) => this.deleteRows(op, input.frame, rows));
         return {
           frame: input.frame,
           run: (sink) =>
@@ -485,6 +502,19 @@ class Runner {
       frame: r.frame,
       run: (sink) => {
         for (const row of this.rowsOf(c, r)) if (!sink(row)) return false;
+        return true;
+      },
+    };
+  }
+
+  /** A write over all its input's rows at once (`apply` writes and gives the rows it passes on), then those rows passed on. */
+  private batched(input: Stream, apply: (rows: Row[]) => Row[], frame: Frame = input.frame): Stream {
+    return {
+      frame,
+      run: (sink) => {
+        const rows: Row[] = [];
+        input.run((row) => (rows.push(row), true));
+        for (const out of apply(rows)) if (!sink(out)) return false;
         return true;
       },
     };
@@ -616,6 +646,37 @@ class Runner {
     return decode(v, out);
   }
 
+  /** An expression's value for each of the rows, as one query. */
+  private evaluateAll(frame: Frame, rows: readonly Row[], x: Expr): Value[] {
+    if (!rows.length) return [];
+    if (x.k === 'lit' || x.k === 'param' || rows.length === 1) return rows.map((row) => this.evaluate(frame, row, x));
+    const c = this.compiler();
+    const leaf = this.leaf(frame, rows);
+    const v = c.expr(x, leaf.frame);
+    const [exprs, types] = columnsOf(v);
+    return this.exec(c, { kind: 'query', plan: project(leaf.plan, exprs), columns: types.map((type, i) => ({ name: `c${i}`, type })) }).map((out) => decode(v, out));
+  }
+
+  /** `propertyMap` for each of the rows: a map literal's entries evaluated for all of them in one query. */
+  private propertyMaps(frame: Frame, rows: readonly Row[], x: Expr, what: string): { props: Props; nulls: string[]; isMap: boolean }[] {
+    if (x.k !== 'map' || rows.length < 2) return rows.map((row) => this.propertyMap(frame, row, x, what));
+    const c = this.compiler();
+    const leaf = this.leaf(frame, rows);
+    const vals = x.entries.map(([, e]) => c.expr(e, leaf.frame));
+    const cols = vals.map(columnsOf);
+    const outs = vals.length ? this.exec(c, { kind: 'query', plan: project(leaf.plan, cols.flatMap(([e]) => e)), columns: cols.flatMap(([, t]) => t).map((type, i) => ({ name: `c${i}`, type })) }) : rows.map(() => []);
+    return outs.map((out) => {
+      const raw: Record<string, Value> = {};
+      let at = 0;
+      x.entries.forEach(([k], i) => {
+        const n = cols[i]![1].length;
+        raw[k] = decode(vals[i]!, out.slice(at, at + n));
+        at += n;
+      });
+      return toProps(raw, true, what);
+    });
+  }
+
   /** A property map's entries (a map literal's evaluated together, a parameter's or a node's as they are), NULLs dropped. */
   private propertyMap(frame: Frame, row: Row, x: Expr, what: string): { props: Props; nulls: string[]; isMap: boolean } {
     let raw: Record<string, Value>;
@@ -646,13 +707,7 @@ class Runner {
         throw new SmaltcyError('SMALTCY_TYPE', `${what}: properties must be a map, not ${valueTypeName(v)}`);
       }
     }
-    const props: Props = {};
-    const nulls: string[] = [];
-    for (const [k, v] of Object.entries(raw)) {
-      if (v.k === 'value' && v.v === null) nulls.push(k);
-      else props[k] = propertyValue(v, what);
-    }
-    return { props, nulls, isMap };
+    return toProps(raw, isMap, what);
   }
 
   private typeNames(): string[] {
@@ -661,7 +716,7 @@ class Runner {
 
   // CREATE and MERGE.
 
-  private create(op: Extract<Op, { op: 'create' }>, input: Stream): Stream {
+  private create(op: Extract<Op, { op: 'create' }>, input: Stream, batch = false): Stream {
     const types = [...input.frame.types];
     const slots = new Map(input.frame.slots);
     for (const n of op.pattern.nodes) {
@@ -680,7 +735,109 @@ class Runner {
       types.push(HOPS);
     }
     const frame: Frame = { types, slots };
+    if (batch) return this.batched(input, (rows) => this.createRows(op.pattern, input.frame, frame, rows), frame);
     return { frame, run: (sink) => input.run((row) => sink(this.createRow(op.pattern, input.frame, frame, row))) };
+  }
+
+  /**
+   * Whether a CREATE can create all its rows' patterns at once: its properties read no nested plan (which could see
+   * what earlier rows created) and nothing the pattern creates (they are evaluated for all rows first).
+   */
+  private createInBatch(p: Pattern, inFrame: Frame): boolean {
+    const props = [...p.nodes.filter((n) => !inFrame.slots.has(n.slot)), ...p.rels].flatMap((x) => (x.props ? [x.props] : []));
+    return props.every((x) => !readsGraph(x) && [...slotsRead(x)].every((slot) => inFrame.slots.has(slot)));
+  }
+
+  /**
+   * `createRow` for all the rows at once: the same checks, ids and counts, in the same order, with one append per
+   * table. The properties are evaluated for all rows first (`createInBatch` says when that reads the same).
+   */
+  private createRows(p: Pattern, inFrame: Frame, out: Frame, rows: readonly Row[]): Row[] {
+    if (!rows.length) return [];
+    const nodeOf = (slot: number) => out.slots.get(slot) as Extract<Binding, { k: 'node' }>;
+    const created: Pattern['nodes'][number][] = [];
+    const seen = new Set<number>();
+    for (const n of p.nodes) {
+      const bound = inFrame.slots.get(n.slot);
+      if (bound) {
+        if (bound.k !== 'node') refuse('CREATE with a node held in a value');
+        continue;
+      }
+      if (!seen.has(n.slot)) created.push(n);
+      seen.add(n.slot);
+    }
+    for (const row of rows) {
+      for (const n of p.nodes) {
+        const bound = inFrame.slots.get(n.slot) as Extract<Binding, { k: 'node' }> | undefined;
+        if (bound && row[bound.id] === null) throw new SmaltcyError('SMALTCY_TYPE', "Can't create a relationship to NULL");
+      }
+    }
+    for (const n of created) for (const l of n.labels) this.label(l);
+    for (const r of p.rels) {
+      if (r.types.length !== 1) throw new SmaltcyError('SMALTCY_SEMANTIC', 'A relationship to create needs exactly one type');
+      if (r.dir === 'both') throw new SmaltcyError('SMALTCY_SEMANTIC', 'A relationship to create needs a direction');
+      if (r.min !== undefined) throw new SmaltcyError('SMALTCY_SEMANTIC', "Can't create a variable-length relationship");
+    }
+    const nodeProps = created.map((n) => (n.props ? this.propertyMaps(inFrame, rows, n.props, 'CREATE').map((m) => m.props) : rows.map((): Props => ({}))));
+    const relProps = p.rels.map((r) => (r.props ? this.propertyMaps(inFrame, rows, r.props, 'CREATE').map((m) => m.props) : rows.map((): Props => ({}))));
+    const relTables = p.rels.map((r) => this.type(r.types[0]!));
+    const node = { ids: [] as number[], props: [] as Props[] };
+    const labels = { ids: [] as number[], labels: [] as string[] };
+    const rels = relTables.map(() => ({ rowids: [] as number[], starts: [] as number[], ends: [] as number[], props: [] as Props[] }));
+    const outRows = rows.map((row, i) => {
+      const next: Row = new Array(out.types.length).fill(null);
+      for (let j = 0; j < inFrame.types.length; j++) next[j] = row[j];
+      created.forEach((n, k) => {
+        const props = nodeProps[k]![i]!;
+        const id = this.newNodeId();
+        node.ids.push(id);
+        node.props.push(props);
+        for (const l of new Set(n.labels)) {
+          labels.ids.push(id);
+          labels.labels.push(l);
+        }
+        const b = nodeOf(n.slot);
+        next[b.id] = id;
+        next[b.props] = props;
+        this.counts.nodesCreated++;
+        this.counts.labelsAdded += n.labels.length;
+        this.counts.propertiesSet += Object.keys(props).length;
+      });
+      const hops = new Map<number, Hop>();
+      p.rels.forEach((r, k) => {
+        const type = r.types[0]!;
+        const a = next[nodeOf(p.nodes[r.from]!.slot).id] as number;
+        const z = next[nodeOf(p.nodes[r.to]!.slot).id] as number;
+        const [start, end] = r.dir === 'out' ? [a, z] : [z, a];
+        const props = relProps[k]![i]!;
+        const rowid = this.newRelId();
+        const t = rels[k]!;
+        t.rowids.push(rowid);
+        t.starts.push(start);
+        t.ends.push(end);
+        t.props.push(props);
+        const b = out.slots.get(r.slot) as Extract<Binding, { k: 'rel' }>;
+        next[b.type] = type;
+        next[b.rowid] = rowid;
+        next[b.start] = start;
+        next[b.end] = end;
+        next[b.props] = props;
+        hops.set(r.slot, { edge: this.typeNames().indexOf(type), rowid, from: a, to: z });
+        this.counts.relationshipsCreated++;
+        this.counts.propertiesSet += Object.keys(props).length;
+      });
+      for (const path of p.paths ?? []) {
+        const b = out.slots.get(path.slot) as Extract<Binding, { k: 'path' }>;
+        next[b.hops] = path.rels.map((j) => hops.get(p.rels[j]!.slot)!);
+      }
+      return next;
+    });
+    if (node.ids.length) this.db.queryPlan(this.append(this.tables().nodes, ['int', PROPS], [node.ids, node.props], [0, 1]));
+    if (labels.ids.length) this.db.queryPlan(this.append(this.tables().labels, ['int', 'text'], [labels.ids, labels.labels], [0, 1]));
+    rels.forEach((t, k) => {
+      if (t.rowids.length) this.db.queryPlan(this.append(relTables[k]!, ['int', 'int', 'int', PROPS], [t.rowids, t.starts, t.ends, t.props], [-1, 0, 1, 2]));
+    });
+    return outRows;
   }
 
   /**
@@ -688,9 +845,10 @@ class Runner {
    * passed on), or, when there is none, the pattern created (its unbound nodes and its relationships), through ON
    * CREATE. A row sees what earlier rows created.
    */
-  private merge(op: Extract<Op, { op: 'merge' }>, input: Stream): Stream {
+  private merge(op: Extract<Op, { op: 'merge' }>, input: Stream, batch = false): Stream {
     const match: Extract<Op, { op: 'match' }> = { op: 'match', input: op.input, pattern: op.pattern, optional: false };
     const { frame } = this.over(match, input.frame, []).r;
+    if (batch) return this.batched(input, (rows) => this.mergeRows(op, match, input.frame, frame, rows), frame);
     return {
       frame,
       run: (sink) =>
@@ -709,6 +867,72 @@ class Runner {
           return sink(created);
         }),
     };
+  }
+
+  /**
+   * Whether a MERGE can run all its rows at once: one node, not bound before, with properties that read no nested
+   * plan, and no ON CREATE or ON MATCH. A row then matches either nodes that were there before the statement, or the
+   * node an earlier row with the same properties created (`mergeRows`).
+   */
+  private mergeInBatch(op: Extract<Op, { op: 'merge' }>, inFrame: Frame): boolean {
+    const p = op.pattern;
+    if (op.onCreate.length || op.onMatch.length || p.rels.length || p.nodes.length !== 1 || (p.paths ?? []).length) return false;
+    if (inFrame.slots.has(p.nodes[0]!.slot)) return false;
+    return this.createInBatch(p, inFrame);
+  }
+
+  /**
+   * MERGE of one node for all the rows at once: one query matches every row (each numbered, so its matches come back
+   * to it); of the rows that match nothing, the first with each set of properties creates the node (one CREATE batch),
+   * and the later ones with the same properties match it, as they would row by row. A property that is NULL runs the
+   * rows one by one.
+   */
+  private mergeRows(op: Extract<Op, { op: 'merge' }>, match: Extract<Op, { op: 'match' }>, inFrame: Frame, out: Frame, rows: Row[]): Row[] {
+    if (!rows.length) return [];
+    const n = op.pattern.nodes[0]!;
+    const maps = n.props ? this.propertyMaps(inFrame, rows, n.props, 'MERGE') : rows.map(() => ({ props: {} as Props, nulls: [] as string[], isMap: true }));
+    if (maps.some((m) => m.nulls.length) || rows.length === 1) {
+      const outRows: Row[] = [];
+      this.merge(op, { frame: inFrame, run: (sink) => rows.every((r) => sink(r)) }).run((r) => (outRows.push(r), true));
+      return outRows;
+    }
+    // Every row's matches, in one query: the rows numbered (a last column), so each match names its row.
+    const w = inFrame.types.length;
+    const numbered: Frame = { types: [...inFrame.types, 'int'], slots: inFrame.slots };
+    const c = this.compiler();
+    c.given.set(match.input, this.leaf(numbered, rows.map((r, i) => [...r, i])));
+    const r = c.op(match);
+    const found = new Map<number, Row[]>();
+    for (const f of this.rowsOf(c, r)) {
+      const i = f[w] as number;
+      let list = found.get(i);
+      if (!list) found.set(i, (list = []));
+      list.push([...f.slice(0, w), ...f.slice(w + 1)]);
+    }
+    // The rows that match nothing: the first of each set of properties creates.
+    const key = (props: Props) => JSON.stringify(Object.keys(props).sort().map((k) => [k, props[k]]));
+    const creators = new Map<string, number>();
+    const toCreate: number[] = [];
+    rows.forEach((_row, i) => {
+      if (found.has(i)) return;
+      const k = key(maps[i]!.props);
+      if (!creators.has(k)) {
+        creators.set(k, i);
+        toCreate.push(i);
+      }
+    });
+    const created = new Map<number, Row>();
+    const made = this.createRows(op.pattern, inFrame, out, toCreate.map((i) => rows[i]!));
+    toCreate.forEach((i, j) => created.set(i, made[j]!));
+    return rows.flatMap((row, i) => {
+      const matches = found.get(i);
+      if (matches) return matches;
+      const mine = created.get(i);
+      if (mine) return [mine];
+      // A later row with the same properties: the node the first created, with this row's own columns.
+      const first = created.get(creators.get(key(maps[i]!.props))!)!;
+      return [[...row, ...first.slice(w)]];
+    });
   }
 
   /**
@@ -900,6 +1124,114 @@ class Runner {
     }
   }
 
+  /**
+   * Whether a SET or REMOVE can write all its rows at once: each item sets or removes one property or labels of a node
+   * or relationship its row holds, to a value that reads no nested plan and no other node or relationship (so no row
+   * reads what another writes). `setRows` checks that no two rows share a target.
+   */
+  private setInBatch(items: readonly (SetItem | RemoveItem)[], frame: Frame): boolean {
+    return items.every((it) => {
+      if (it.target.k !== 'slot') return false;
+      const b = frame.slots.get(it.target.i);
+      if (!b || (b.k !== 'node' && (b.k !== 'rel' || it.kind === 'labels'))) return false;
+      if (it.kind === 'labels') return true;
+      if (it.kind !== 'prop') return false;
+      if (!('value' in it)) return true;
+      const target = it.target.i;
+      return !readsGraph(it.value) && [...slotsRead(it.value)].every((slot) => slot === target || frame.slots.get(slot)?.k === 'value');
+    });
+  }
+
+  /**
+   * SET (`remove` false) or REMOVE for all the rows at once, item by item: each item's targets and values are read for
+   * all rows, then written in one statement. With no target in two rows, that is what row by row writes; when one is,
+   * the rows run one by one.
+   */
+  private setRows(items: readonly (SetItem | RemoveItem)[], frame: Frame, rows: Row[], remove: boolean): Row[] {
+    const idOf = (row: Row, slot: number): string | null => {
+      const b = frame.slots.get(slot)!;
+      if (b.k === 'node') return row[b.id] === null ? null : `n${row[b.id]}`;
+      const r = b as Extract<Binding, { k: 'rel' }>;
+      return row[r.rowid] === null ? null : `r${row[r.type]}:${row[r.rowid]}`;
+    };
+    const shared = items.some((it) => {
+      const ids = rows.map((row) => idOf(row, (it.target as { i: number }).i)).filter((x) => x !== null);
+      return new Set(ids).size !== ids.length;
+    });
+    if (shared || rows.length < 2) {
+      for (const row of rows) remove ? this.removeItems(items as RemoveItem[], frame, row) : this.setItems(items as SetItem[], frame, row);
+      return rows;
+    }
+    for (const it of items) {
+      const live = rows.filter((row) => idOf(row, (it.target as { i: number }).i) !== null);
+      if (!live.length) continue;
+      if (it.kind === 'labels') {
+        const b = frame.slots.get((it.target as { i: number }).i) as Extract<Binding, { k: 'node' }>;
+        this.labelRows(live.map((row) => row[b.id] as number), it.labels, remove);
+        continue;
+      }
+      if (it.kind !== 'prop') return refuse('SET of a property map in a batch');
+      const targets = this.evaluateAll(frame, live, it.target);
+      const values = 'value' in it ? this.evaluateAll(frame, live, it.value) : null;
+      // By table: the rowids, and the value each gets (`null` removes the key).
+      const writes = new Map<string, { column: number; rowids: number[]; given: unknown[]; removed: number[] }>();
+      targets.forEach((t, i) => {
+        const target = this.entity(t, "Can't set a property on a");
+        if (target.props === null) return;
+        const v = values?.[i];
+        const gone = !v || (v.k === 'value' && v.v === null);
+        const value = gone ? null : propertyValue(v, 'SET');
+        const next = gone ? without(target.props, [it.key]) : { ...without(target.props, [it.key]), [it.key]: value };
+        this.counts.propertiesSet++;
+        if (next !== null && sameProps(target.props, next)) return;
+        let w = writes.get(target.table);
+        if (!w) writes.set(target.table, (w = { column: target.column, rowids: [], given: [], removed: [] }));
+        if (gone) w.removed.push(target.rowid);
+        else {
+          w.rowids.push(target.rowid);
+          w.given.push(value);
+        }
+      });
+      for (const [table, w] of writes) {
+        if (w.removed.length) this.updateProps(table, w.column, w.removed, null, (cur) => removeKeys(cur, [it.key]));
+        if (w.rowids.length) this.updateProps(table, w.column, w.rowids, w.given, (cur, g) => call('map_merge', [removeKeys(cur, [it.key]), call('map_of', [lit(it.key), g], PROPS)], PROPS));
+      }
+    }
+    return rows;
+  }
+
+  /** Sets a property map column of the rows `rowids` of a table to `f` of what it is and of `given` (one per row). */
+  private updateProps(table: string, column: number, rowids: readonly number[], given: readonly unknown[] | null, f: (cur: PlanExpr, given: PlanExpr) => PlanExpr): void {
+    // A value of `any` crosses as a one-element `list<any>`, which keeps its kind (smaltdb ADR 0039).
+    const values = { op: 'values', rows: [], types: given ? ['int', 'list<any>'] : ['int'], columns: given ? [rowids, given.map((g) => [g])] : [rowids] } as unknown as PlanOp;
+    const input = filter({ op: 'join', kind: 'cross', inputs: [scan(table, [-1, column]), values] }, eq(colRef(0, 'int'), colRef(2, 'int')));
+    const g = given ? call('list_get', [colRef(3, 'list<any>'), lit(0)], 'any') : NULL;
+    this.db.queryPlan(write({ op: 'update', table, db: 'main', input, rowid: 0, sets: [{ column, value: f(colRef(1, PROPS), g) }], from: true }));
+  }
+
+  /** Adds (or with `remove`, removes) labels of the nodes `ids` (no two the same), counting those it changes. */
+  private labelRows(ids: readonly number[], labels: readonly string[], remove: boolean): void {
+    for (const l of labels) {
+      const given = { op: 'values', rows: [], types: ['int'], columns: [ids] } as unknown as PlanOp;
+      // The label index's entries for these nodes and this label.
+      const entries = filter({ op: 'join', kind: 'cross', inputs: [given, scan(this.tables().labels, [-1, 0, 1])] }, and(eq(colRef(0, 'int'), colRef(2, 'int')), eq(colRef(3, 'text'), lit(l, 'text'))));
+      if (remove) {
+        if (!this.labelTables.has(l)) continue;
+        const rowids = this.lookup(project(entries, [colRef(1, 'int')]), ['int']).map((r) => r[0]);
+        if (!rowids.length) continue;
+        const del = filter(scan(this.tables().labels, [-1]), call('in_list', [colRef(0, 'int'), ...rowids.map((r) => lit(r))], 'bool'));
+        this.counts.labelsRemoved += this.deleted(this.tables().labels, del);
+        continue;
+      }
+      const has = this.labelTables.has(l) ? new Set(this.lookup(project(entries, [colRef(0, 'int')]), ['int']).map((r) => r[0] as number)) : new Set<number>();
+      const missing = ids.filter((id) => !has.has(id));
+      if (!missing.length) continue;
+      this.label(l);
+      this.db.queryPlan(this.append(this.tables().labels, ['int', 'text'], [missing, missing.map(() => l)], [0, 1]));
+      this.counts.labelsAdded += missing.length;
+    }
+  }
+
   private hasLabel(id: number, l: string): boolean {
     const entries = filter(scan(this.tables().labels, [0, 1]), and(eq(colRef(0, 'int'), lit(id)), eq(colRef(1, 'text'), lit(l, 'text'))));
     return this.lookup(project(ONE_ROW, [exists(entries)]), ['bool'])[0]![0] === true;
@@ -961,6 +1293,69 @@ class Runner {
     }
   }
 
+  /**
+   * Whether a DELETE can delete all its rows' targets at once: each target is a node, relationship or path its row
+   * holds, and nodes are detached (a node's check for relationships left would see what later rows delete).
+   */
+  private deleteInBatch(op: Extract<Op, { op: 'delete' }>, frame: Frame): boolean {
+    return op.targets.every((t) => {
+      if (t.k !== 'slot') return false;
+      const k = frame.slots.get(t.i)?.k;
+      if (k === 'rel' || k === 'rels') return true;
+      return op.detach && (k === 'node' || k === 'nodes' || k === 'path');
+    });
+  }
+
+  /** DELETE for all the rows at once: their relationships, then (detached) their nodes, one statement per table. */
+  private deleteRows(op: Extract<Op, { op: 'delete' }>, frame: Frame, rows: Row[]): Row[] {
+    const rels = new Map<string, Set<number>>();
+    const nodes = new Set<number>();
+    const rel = (type: string, rowid: number) => {
+      let set = rels.get(type);
+      if (!set) rels.set(type, (set = new Set()));
+      set.add(rowid);
+    };
+    const names = this.typeNames();
+    for (const row of rows) {
+      for (const t of op.targets) {
+        const b = frame.slots.get((t as { i: number }).i)!;
+        switch (b.k) {
+          case 'rel': if (row[b.rowid] !== null) rel(row[b.type] as string, row[b.rowid] as number); break;
+          case 'rels': for (const h of (row[b.hops] as Hop[] | null) ?? []) rel(names[h.edge]!, h.rowid); break;
+          case 'node': if (row[b.id] !== null) nodes.add(row[b.id] as number); break;
+          case 'nodes': for (const id of (row[b.ids] as (number | null)[] | null) ?? []) if (id !== null) nodes.add(id); break;
+          case 'path': {
+            const hops = row[b.hops] as Hop[] | null;
+            if (hops === null || row[b.start] === null) break;
+            for (const h of hops) rel(names[h.edge]!, h.rowid);
+            for (const id of [row[b.start] as number, ...hops.map((h) => h.to)]) nodes.add(id);
+            break;
+          }
+          default: refuse('DELETE of a value');
+        }
+      }
+    }
+    for (const [type, rowids] of rels) {
+      const table = this.types.get(type)!;
+      this.counts.relationshipsDeleted += this.deleted(table, filter(scan(table, [-1]), call('in_list', [colRef(0, 'int'), ...[...rowids].map((r) => lit(r))], 'bool')));
+    }
+    if (nodes.size) {
+      const ids = [...nodes];
+      for (const table of this.types.values()) {
+        for (const end of [0, 1]) {
+          const given = { op: 'values', rows: [], types: ['int'], columns: [ids] } as unknown as PlanOp;
+          // Each end on its own, so each is a seek on the edge table's index; a self-loop's second finds it gone.
+          const touching = project(filter({ op: 'join', kind: 'cross', inputs: [given, scan(table, [-1, end])] }, eq(colRef(0, 'int'), colRef(2, 'int'))), [colRef(1, 'int')]);
+          const rowids = this.lookup(touching, ['int']).map((r) => r[0] as number);
+          if (rowids.length) this.counts.relationshipsDeleted += this.deleted(table, filter(scan(table, [-1]), call('in_list', [colRef(0, 'int'), ...rowids.map((r) => lit(r))], 'bool')));
+        }
+      }
+      // Their entries in the label index go with them (smaltdb's rules on a graph's tables).
+      this.counts.nodesDeleted += this.deleted(this.tables().nodes, filter(scan(this.tables().nodes, [0]), call('in_list', [colRef(0, 'int'), ...ids.map((r) => lit(r))], 'bool')));
+    }
+    return rows;
+  }
+
   private deleteRel(type: string, rowid: number): void {
     const table = this.types.get(type)!;
     const rows = filter(scan(table, [-1]), eq(colRef(0, 'int'), lit(rowid)));
@@ -974,18 +1369,58 @@ class Runner {
 
   private deleteNode(id: number, detach: boolean): void {
     const node = filter(scan(this.tables().nodes, [0]), eq(colRef(0, 'int'), lit(id)));
-    const touching = (table: string) => filter(scan(table, [-1, 0, 1]), or(eq(colRef(1, 'int'), lit(id)), eq(colRef(2, 'int'), lit(id))));
+    // Each end on its own, so each is a seek on the edge table's index (an OR of the two would scan the table).
+    const touching = (table: string, end: 1 | 2) => filter(scan(table, [-1, 0, 1]), eq(colRef(end, 'int'), lit(id)));
     const tables = [...this.types.values()];
-    const [here, connected] = this.lookup(project(ONE_ROW, [exists(node), tables.length ? or(...tables.map((t) => exists(touching(t)))) : lit(false)]), ['bool', 'bool'])[0]!;
+    const ends = tables.flatMap((t) => [exists(touching(t, 1)), exists(touching(t, 2))]);
+    const [here, connected] = this.lookup(project(ONE_ROW, [exists(node), ends.length ? or(...ends) : lit(false)]), ['bool', 'bool'])[0]!;
     if (here !== true) return;
     if (connected === true) {
       if (!detach) throw new SmaltcyError('SMALTCY_CONSTRAINT', `Cannot delete node ${id}: it still has relationships (use DETACH DELETE)`);
-      for (const t of tables) this.counts.relationshipsDeleted += this.deleted(t, touching(t));
+      // A self-loop starts and ends here: the second delete finds it gone.
+      for (const t of tables) this.counts.relationshipsDeleted += this.deleted(t, touching(t, 1)) + this.deleted(t, touching(t, 2));
     }
     // Its entries in the label index go with it (smaltdb's rules on a graph's tables).
     this.deleted(this.tables().nodes, node);
     this.counts.nodesDeleted++;
   }
+}
+
+/** A property map's entries as properties: NULLs dropped (their keys in `nulls`), the rest checked. */
+function toProps(raw: Record<string, Value>, isMap: boolean, what: string): { props: Props; nulls: string[]; isMap: boolean } {
+  const props: Props = {};
+  const nulls: string[] = [];
+  for (const [k, v] of Object.entries(raw)) {
+    if (v.k === 'value' && v.v === null) nulls.push(k);
+    else props[k] = propertyValue(v, what);
+  }
+  return { props, nulls, isMap };
+}
+
+/** Operations that read all their rows before passing any on (`allRows`): writes above them wait for them. */
+const BARRIERS = new Set(['eager', 'sort', 'aggregate', 'distinct']);
+
+/** Whether a plan's rows are one query: it writes nothing and reads all it reads first (EAGER), or reads no graph. */
+function settled(op: Op): boolean {
+  return !writes(op) && (op.op === 'eager' || !readsGraph(op));
+}
+
+/** Whether an expression reads only its row's values: no properties, labels, functions or nested plans. */
+function plainExpr(x: Expr): boolean {
+  if (x.k === 'lit' || x.k === 'param' || x.k === 'slot') return true;
+  if (!['list', 'map', 'and', 'or', 'xor', 'not', 'isNull', 'case'].includes(x.k)) return false;
+  let ok = true;
+  forEachChild(x, (c) => void (ok &&= plainExpr(c)));
+  return ok;
+}
+
+/**
+ * Whether an operation, above a write in the same clause, would see that write's rows differ written one at a time
+ * or all at once: it writes, matches, stops early, or reads more than its rows' values.
+ */
+function touches(op: Op): boolean {
+  if (WRITES.has(op.op) || op.op === 'match' || op.op === 'limit' || op.op === 'union') return true;
+  return exprsOf(op).some((x) => !plainExpr(x));
 }
 
 /** Properties without some keys (NULL: gone). */

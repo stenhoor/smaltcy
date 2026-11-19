@@ -108,6 +108,46 @@ describe('the write cases on smaltdb', () => {
 
 /** More statements in sequence, compared on both engines after each. */
 const SEQUENCES: readonly [string, 'empty' | 'social', readonly string[]][] = [
+  // A write whose rows are read before it, with nothing after it in its clause that reads the graph, runs all its rows
+  // at once (write.ts, "Writes in batches"): these compare that with smaltcy's engine, row by row.
+  ['writes in batches: CREATE', 'social', [
+    "UNWIND [1, 2, 3] AS i CREATE q = (:A {i: i, t: i > 1, l: [i, 'x']})-[:R {i: i}]->(:B:C) RETURN q",
+    "MATCH (p:Person) WITH p ORDER BY p.name CREATE (p)-[r:WROTE {by: p.name}]->(b:Book {by: p.name, n: size(p.name)})<-[:ABOUT]-(p) RETURN count(*) AS n",
+    'MATCH (a:A), (b:B) WHERE a.i = 2 CREATE (a)-[:S]->(b), (b)-[:S]->(a) RETURN count(*) AS n',
+    "MATCH (p:Person) OPTIONAL MATCH (p)-[:NOPE]->(q) CREATE (p)-[:R]->(q) RETURN count(*) AS n",
+    'UNWIND [] AS i CREATE (:Never {i: i}) RETURN count(*) AS n',
+  ]],
+  ['writes in batches: SET and REMOVE', 'social', [
+    "MATCH (p:Person) SET p.k = p.name + '!' RETURN count(*) AS n",
+    'MATCH (p:Person) SET p.born = null RETURN count(*) AS n',
+    'MATCH (p:Person) SET p.k = p.k RETURN count(*) AS n',
+    'MATCH ()-[r:KNOWS]->() SET r.w = [1, true] RETURN count(*) AS n',
+    'MATCH ()-[r:KNOWS]->() REMOVE r.w, r.since RETURN count(*) AS n',
+    // A city two people live in: a target in two rows, so the rows run one by one.
+    'MATCH (p:Person)-[:LIVES_IN]->(c) SET c.v = 1 RETURN count(*) AS n',
+    'MATCH (p:Person)-[:LIVES_IN]->(c) REMOVE c:City RETURN count(*) AS n',
+    "MATCH (p:Person) SET p:Tagged:Person, p:Tagged RETURN count(*) AS n",
+    'MATCH (p:Tagged) WHERE p.k STARTS WITH \'A\' REMOVE p:Tagged, p:Nope RETURN count(*) AS n',
+    'MATCH (n) RETURN labels(n) AS l, properties(n) AS p ORDER BY id(n)',
+  ]],
+  ['writes in batches: MERGE', 'social', [
+    'UNWIND [1, 2, 1, 3, 2] AS i MERGE (n:M {i: i}) RETURN n',
+    "CREATE (:M {i: 3}), (:M {i: 4, x: true})",
+    'UNWIND [3, 4, 5, 5, 6] AS i MERGE (n:M {i: i}) RETURN n',
+    "UNWIND ['Ada', 'Nobody', 'Nobody', 'Grace'] AS name MERGE (p:Person {name: name}) RETURN p",
+    'UNWIND [1, 2, 3] AS i MERGE (n:Solo) RETURN n',
+    'UNWIND [1, null, 1] AS i MERGE (n:M {i: i, j: 1}) RETURN n',
+    'UNWIND [] AS i MERGE (n:M {i: i}) RETURN count(*) AS n',
+    'MATCH (n:M) RETURN n.i AS i, n.j AS j, n.x AS x ORDER BY id(n)',
+  ]],
+  ['writes in batches: DELETE', 'social', [
+    "MATCH (a:Person {name: 'Ada'}) CREATE (a)-[:SELF]->(a)",
+    'MATCH (a)-[r:KNOWS]-(b) DELETE r RETURN count(*) AS n',
+    'MATCH p = (:Person)-[:LIVES_IN]->(:City) WITH p LIMIT 2 DETACH DELETE p RETURN count(*) AS n',
+    "MATCH (a:Person {name: 'Ada'}) DETACH DELETE a RETURN count(*) AS n",
+    'MATCH (c:City) DELETE c RETURN count(*) AS n',
+    'MATCH (n) DETACH DELETE n RETURN count(*) AS n',
+  ]],
   ['created nodes, relationships and paths in results', 'empty', [
     "CREATE p = (a:X {k: 1, f: true, l: [1, 'a', false]})-[r:T {w: 2.5, b: false}]->(b:Y:Z) RETURN p, r, a, b, id(a) AS ia, id(r) AS ir",
     'CREATE (n) RETURN n, labels(n) AS l, properties(n) AS p',
