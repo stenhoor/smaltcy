@@ -31,6 +31,7 @@
     "test:browser:quick": "node test/browser/run.mjs --quick",
     "test:quick": "npm run check && npm run test:browser:quick",
     "bench": "node scripts/bench.mjs",
+    "bench:smaltdb": "node scripts/bench-smaltdb.mjs",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs"
