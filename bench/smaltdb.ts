@@ -1,8 +1,9 @@
 /**
  * The same queries as bench/run.ts on smaltcy's MemoryStore and on smaltdb (the compiler to smaltdb plans, ADR 0004;
  * smaltdb ADR 0033 step 8), over the same generated network. Rows must agree; times are medians and include compiling
- * the Cypher, as Graph.run's include parsing and planning. `npm run bench:smaltdb`; BENCH_PEOPLE, BENCH_RUNS and
- * BENCH_BRANCHES (the compiler's `maxBranches`) size and shape it. Method: docs/research/benchmarks.md.
+ * the Cypher, as Graph.run's include parsing and planning. `npm run bench:smaltdb`; BENCH_PEOPLE, BENCH_RUNS,
+ * BENCH_BRANCHES (the compiler's `maxBranches`) and BENCH_INDEXES (smaltcy's property indexes on smaltdb too) size and
+ * shape it. Method: docs/research/benchmarks.md.
  */
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { Database } from 'smaltdb-src/engine/database.js';
@@ -12,6 +13,7 @@ import { dumpGraph } from '../src/engine/io.js';
 import { open } from '../src/index.js';
 import { graphTablesFor, loadStatements, schemaStatements } from '../src/smaltdb/schema.js';
 import { compileQuery } from '../src/smaltdb/compile.js';
+import { indexStatement } from '../src/smaltdb/write.js';
 import { QUERIES } from './queries.js';
 
 const PEOPLE = Number(process.env.BENCH_PEOPLE ?? 20000);
@@ -42,6 +44,9 @@ const data = { ...raw, relationships: raw.relationships.map((r, i) => ({ ...r, i
 const tables = graphTablesFor(data);
 const db = Database.openMemory();
 for (const st of [...schemaStatements(tables), ...loadStatements(data, tables)]) db.queryPlan(st);
+// BENCH_INDEXES=1: the property indexes smaltcy's store has (the network's on :Person(name)) on smaltdb too.
+const INDEXES = !!process.env.BENCH_INDEXES;
+if (INDEXES) for (const ix of raw.indexes ?? []) db.queryPlan(indexStatement({ kind: 'createIndex', label: ix.label, key: ix.key } as never, tables));
 const dbLoadMs = performance.now() - t0;
 
 const st = mem.store.stats();
@@ -76,5 +81,5 @@ for (const [name, q] of QUERIES) {
 }
 mkdirSync('bench/results', { recursive: true });
 const file = `bench/results/${new Date().toISOString().slice(0, 10)}.smaltdb.local.json`;
-writeFileSync(file, JSON.stringify({ date: new Date().toISOString(), node: process.version, people: PEOPLE, nodes: st.nodes, rels: st.rels, runs: RUNS, memLoadMs, dbLoadMs, results }, null, 2));
+writeFileSync(file, JSON.stringify({ date: new Date().toISOString(), node: process.version, people: PEOPLE, indexes: INDEXES, nodes: st.nodes, rels: st.rels, runs: RUNS, memLoadMs, dbLoadMs, results }, null, 2));
 console.log(`\nwrote ${file}`);

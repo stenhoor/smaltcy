@@ -284,6 +284,14 @@ const REL_CASES: [string, string][] = [
   ['counts by type', 'MATCH ()-[r]->() RETURN type(r) AS t, count(*) AS n, sum(r.w) AS s ORDER BY t'],
   ['degree', "MATCH (x) RETURN x.k AS x, degree(x) AS d, degree(x, 'out') AS o, degree(x, 'in', 'R') AS i ORDER BY x"],
   ['WITH, then a hop from the bound node', 'MATCH (x:N) WITH x ORDER BY x.k LIMIT 2 MATCH (x)-[r:R]->(y) RETURN x.k AS x, y.k AS y ORDER BY x, y'],
+  ['a hop from the far end, whose property map is the selective part', "MATCH (x)-[r]-(y {k: 'b'}) RETURN x.k AS x, r.w AS w"],
+  ['a hop from the end WHERE finds', "MATCH (x)-[r:R|S]-(y) WHERE y.k = 'c' RETURN x.k AS x, r.w AS w"],
+  ['a hop from the far end, counted', "MATCH (x)-[r]-(y {k: 'b'}) RETURN count(*) AS n, count(DISTINCT x) AS d, count(DISTINCT id(r)) AS r"],
+  ['a hop from the end WHERE finds, counted', "MATCH (x:N)-[r:R|S]-(y) WHERE y.k = 'c' RETURN count(x) AS n, count(DISTINCT id(r)) AS r"],
+  ['hops from a row, a label, then a hop of one type', "MATCH (x {k: 'a'})-[r1]-(y:N)-[r2:R]->(z {k: 'c'}) RETURN r1.w AS a, y.k AS y, r2.w AS b"],
+  ['a hop from a row to a bound node', "MATCH (x {k: 'a'}), (y {k: 'b'}) MATCH (x)-[r]-(y) RETURN r.w AS w"],
+  ['a hop from a row, collected', "MATCH (x {k: 'b'})-[r:R]-(y) RETURN collect(r.w) AS ws, collect(y.k) AS ys"],
+  ['a hop from a row, the rows a LIMIT keeps', "MATCH (x {k: 'c'})-[r]-(y)-[q]-(z) RETURN r.w AS a, q.w AS b, z.k AS z LIMIT 4"],
   ['variable length from zero', "MATCH (x {k: 'd'})-[*0..3]-(y) RETURN y.k AS y"],
   ['variable length with properties', 'MATCH (x)-[rs:R*1..3 {w: 2}]->(y) RETURN x.k AS x, y.k AS y, size(rs) AS n ORDER BY x, y'],
   ['variable length of a type the graph lacks', 'MATCH (x)-[:NOPE*0..1]->(y) RETURN x.k AS x, y.k AS y ORDER BY x'],
@@ -540,6 +548,9 @@ describe('a generated network: both engines give the same rows', () => {
     ['a named path', 'MATCH p = (a:Person {community: 3})-[:KNOWS]->(b)-[:LIVES_IN]->(c) RETURN [n IN nodes(p) | id(n)] AS ns'],
     ['type alternatives', 'MATCH (a)-[:KNOWS|LIVES_IN]->(b) RETURN id(a) AS a, id(b) AS b'],
     ['type alternatives, both ways, then a label', 'MATCH (a:Person)-[:KNOWS|LIVES_IN]-(b)-[:LIVES_IN]-(c:City) RETURN id(a) AS a, id(b) AS b, id(c) AS c'],
+    ['a hop from a person, then a hop of one type', "MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-(f)-[:LIVES_IN]->(c) RETURN f.name AS f, c.name AS c"],
+    ['a hop from the far end', "MATCH (a)-[:KNOWS]-(b:Person {name: 'Bo 1'}) RETURN a.name AS a"],
+    ['every type, both ways, from a node WHERE finds', "MATCH (p:Person)-[r]-(x) WHERE p.name = 'Bo 1' RETURN type(r) AS t, id(r) AS r, id(x) AS x"],
   ])('%s', (_name, cypher) => {
     const rows = g.query(cypher);
     expect(rows.length).toBeGreaterThan(0);

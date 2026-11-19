@@ -110,7 +110,8 @@ export const COMMITS_TABLE = 'smalt_commits';
 /**
  * A compiled plan reading the past: every scan of the graph's tables (in subqueries too) reads them as of `asOf`.
  * smaltdb's `paths` reads its edge tables as they are now, so variable-length relationships and shortest paths are
- * refused (a shortest path's search, an `iterate`, too: it is compared with `paths` only in the present).
+ * refused (a shortest path's search, an `iterate`, too: it is compared with `paths` only in the present). A hop from a
+ * row (`HOP_ITERATE`, also an `iterate`) reads its tables with the other scans.
  */
 function readAsOf<T>(x: T, t: GraphTables, asOf: AsOf): T {
   const graph = new Set([t.nodes, t.labels, ...t.labelTables.values(), ...t.types.values()].map((n) => n.toLowerCase()));
@@ -119,7 +120,7 @@ function readAsOf<T>(x: T, t: GraphTables, asOf: AsOf): T {
     if (Array.isArray(v)) return v.map(walk);
     if (v === null || typeof v !== 'object') return v;
     const o = v as Record<string, unknown>;
-    if (o.op === 'paths' || o.op === 'iterate') unsupported('variable-length relationships and shortest paths with AT VERSION or AT TIME (smaltdb reads them in the present)');
+    if (o.op === 'paths' || (o.op === 'iterate' && o.name !== HOP_ITERATE)) unsupported('variable-length relationships and shortest paths with AT VERSION or AT TIME (smaltdb reads them in the present)');
     const out = Object.fromEntries(Object.entries(o).map(([k, e]) => [k, walk(e)]));
     if (o.op === 'scan' && graph.has(String(o.table).toLowerCase())) out.asOf = at;
     return out;
@@ -315,6 +316,10 @@ const E_PROPS = 4;
 const E_FROM = 5;
 /** The end at the pattern's `to` node. */
 const E_TO = 6;
+/** The columns a hop from a row adds (`Compiler.hopFrom`): the relationship's, then its other end and that node's props. */
+const ADJ_TYPES: readonly PlanType[] = ['text', 'int', 'int', 'int', PROPS, 'int', PROPS];
+/** The name of a hop's `iterate` (`Compiler.hopFrom`), which reads its tables as of a version as any scan does. */
+const HOP_ITERATE = 'hop';
 
 /**
  * One way a pattern matches, as a smaltdb join region: its FROM items (bare scans, and the input first), its
@@ -359,6 +364,8 @@ function inline(e: PlanExpr, out: readonly PlanExpr[]): PlanExpr {
 
 /** A condition's conjuncts. */
 const conjuncts = (e: PlanExpr): PlanExpr[] => (e.k === 'and' ? e.args.flatMap(conjuncts) : [e]);
+/** A Cypher condition's conjuncts. */
+const conjunctsOf = (e: Expr | undefined): Expr[] => (!e ? [] : e.k === 'and' ? e.args.flatMap(conjunctsOf) : [e]);
 
 /** Functions that never raise an error: a condition of only these can be evaluated on any row, in any order. */
 const SAFE_FNS = new Set(['cmp_eq', 'cmp_ne', 'cmp_lt', 'cmp_le', 'cmp_gt', 'cmp_ge', 'map_get', 'any_type', 'in_list', 'starts_with', 'ends_with', 'struct_field', 'coalesce']);
@@ -1068,8 +1075,10 @@ export class Compiler {
    * table (and of the label index for each of its labels), for each relationship a scan of its type's edge table, all
    * joined by conditions on their columns; the row's columns are one projection over them. A relationship that can be
    * one of several types, or read both ways, splits the region into one per type and reading (a union, `branches`),
-   * up to `maxBranches`; past that its edge source is the union of the edge tables, one FROM item. A
-   * variable-length relationship is smaltdb's `paths` in trail mode (no relationship twice) over the region so far,
+   * up to `maxBranches`; past that, from a bound end, it is a hop from each row of the region so far (`hopFrom`: smaltdb
+   * seeks into the edge tables' indexes for each row), which starts a region of its own, as does every hop after it
+   * from a node it reached; from a node scanned without a property condition (or reached from one), or with neither
+   * end bound, its edge source is the union of the edge tables, one FROM item. A variable-length relationship is smaltdb's `paths` in trail mode (no relationship twice) over the region so far,
    * and a shortest path a breadth-first search once both its ends are bound; each starts a region of its own.
    * Relationships are distinct within the pattern (Cypher's uniqueness): two relationships whose types can be the same
    * must differ in type or rowid, and a variable-length relationship's hops must not hold the others. The pattern's
@@ -1141,7 +1150,19 @@ export class Compiler {
       done[i] = true;
       check(n.props, () => colRef(id + 1, PROPS));
     };
-    const scanNode = (i: number) => bindNew(i, () => undefined);
+    // How selective a node's scan is: 2 with a property map or an equality in WHERE on its properties, 1 with labels.
+    const whereEq = new Set(conjunctsOf(where).flatMap((c) => (c.k === 'call' && c.fn === 'eq' ? c.args : [])).flatMap((a) => (a.k === 'prop' && a.of.k === 'slot' ? [a.of.i] : [])));
+    const score = (i: number) => {
+      const n = p.nodes[i]!;
+      return (n.props && n.props.k === 'map' && n.props.entries.length) || whereEq.has(n.slot) ? 2 : n.labels.length ? 1 : 0;
+    };
+    // Nodes scanned without a property condition, and those the region reaches from them: a hop from each of their rows
+    // would cost more than a join of the union of the edge tables.
+    const weak = new Set<number>();
+    const scanNode = (i: number) => {
+      if (score(i) < 2) weak.add(i);
+      bindNew(i, () => undefined);
+    };
     /** Whether node `i` is only a relationship's end: anonymous (nothing reads it), with no labels or properties. */
     const endOnly = (i: number) => {
       const n = p.nodes[i]!;
@@ -1158,19 +1179,30 @@ export class Compiler {
     /** Binds node `i` to where a relationship ends: its id only when nothing reads it, else a scan of the node table. */
     const bindAt = (i: number, id: (b: Branch) => PlanExpr) => (endOnly(i) ? bindEnd(i, id) : bindNew(i, id));
 
+    /** Each type of a relationship, read as the pattern reads it (`both`: forward, then backward), in smaltcy's order. */
+    const choicesOf = (r: PatternRel) => (r.dir === 'both' ? [false, true] : [r.dir === 'in']).flatMap((reverse) => this.typeNames(r.types).map((type) => ({ type, reverse })));
+    const typeSet = (r: PatternRel) => new Set(this.typeNames(r.types));
+    const overlap = (a: PatternRel, b: PatternRel) => {
+      const t = typeSet(b);
+      return [...typeSet(a)].some((x) => t.has(x));
+    };
     const fixed: { r: PatternRel; b: RelBinding }[] = [];
+    // Relationships a hop from a row (`expand`) is distinct from already (its step checks them): the pairs need no check.
+    const distinct = new Set<PatternRel>();
     const lists: { r: PatternRel; hops: number }[] = [];
     /**
      * One hop: a scan of an edge table for each type and reading (a branch each), joined on the end that is bound, then
      * the node table at the far end unless it is bound.
      */
     const hop = (r: PatternRel) => {
-      // Each type, read as the pattern reads it (`both`: forward, then backward; a self-loop once), in smaltcy's order.
-      const readings = r.dir === 'both' ? [false, true] : [r.dir === 'in'];
-      const choices = readings.flatMap((reverse) => this.typeNames(r.types).map((type) => ({ type, reverse })));
-      // A scan of an edge table per branch; else the union of the edge tables, a FROM item whose rows smaltdb's planner
-      // doesn't know (it assumes 1,000), so its ends are joined with the node table, whose rows it knows.
+      const choices = choicesOf(r);
+      // A scan of an edge table per branch; else a hop from each row of the region before it (`expand`), or, with
+      // neither end bound, the union of the edge tables, a FROM item whose rows smaltdb's planner doesn't know (it
+      // assumes 1,000), so its ends are joined with the node table, whose rows it knows.
       const scans = choices.length > 0 && branches.length * choices.length <= this.maxBranches;
+      // A hop from a row: of several types or readings, or any hop from a node a hop from a row reached (the region's
+      // input is then a plan whose rows smaltdb's planner doesn't know, so it would scan an edge table whole).
+      const fromRow = choices.length > 0 && ((!scans && choices.length > 1) || (expanded && (nodeAt(r.from) !== undefined || nodeAt(r.to) !== undefined)));
       if (!nodeAt(r.from) && !nodeAt(r.to) && !(scans && endOnly(r.from))) scanNode(r.from);
       // Neither end bound: the relationship's scan comes first, and its `from` end is the node.
       const free = !nodeAt(r.from) && !nodeAt(r.to);
@@ -1179,6 +1211,7 @@ export class Compiler {
       const far = fromBound ? r.to : r.from;
       const nearId = free ? -1 : nodeAt(near)!.id;
       const farNode = nodeAt(far);
+      if (fromRow && !free && !weak.has(near)) return expand(r, choices, fromBound, nearId, far, farNode);
       // The ends at the pattern's `from` and `to` nodes, in each branch.
       const ends = new Map<Branch, { from: PlanExpr; to: PlanExpr }>();
       if (scans) {
@@ -1218,7 +1251,38 @@ export class Compiler {
         if (farNode) b.conds.push(eq(outOf(b, farNode.id), fromBound ? e.to : e.from));
       }
       if (free) bindEnd(near, (b) => ends.get(b)!.from);
-      if (!farNode) (scans ? bindAt : bindNew)(far, (b) => (fromBound ? ends.get(b)!.to : ends.get(b)!.from));
+      if (!farNode) {
+        (scans ? bindAt : bindNew)(far, (b) => (fromBound ? ends.get(b)!.to : ends.get(b)!.from));
+        if (free || weak.has(near)) weak.add(far);
+      }
+      check(r.props, () => colRef(rb.props, PROPS));
+    };
+    /**
+     * A hop from a row (`hopFrom`): the region so far, run once, then for each of its rows the relationships at the
+     * bound end, sought in the edge tables' `start` and `end` indexes, with the far end's node; a new region starts from
+     * them. `expanded`: a hop from a row has been made in this pattern.
+     */
+    let expanded = false;
+    const expand = (r: PatternRel, choices: readonly { type: string; reverse: boolean }[], fromBound: boolean, nearId: number, far: number, farNode: NodeBinding | undefined) => {
+      expanded = true;
+      // The far end's node, read where the hop is (its props, its labels checked there) unless it is bound or only an end.
+      const farNew = !farNode && !endOnly(far) ? p.nodes[far]! : undefined;
+      const w = types.length;
+      // Uniqueness with the relationships before it, checked as it is found (before the far end is read).
+      const before = fixed.filter((f) => overlap(f.r, r)).map((f) => f.b);
+      const plan = this.hopFrom({ plan: finish(), frame: frame() }, nearId, choices, r.dir, fromBound, farNode?.id, farNew?.labels, before, !this.unread.has(r.slot) || r.props !== undefined, ordered);
+      distinct.add(r);
+      types.push(...ADJ_TYPES);
+      restart(plan);
+      const rb: RelBinding = { k: 'rel', type: w + E_TYPE, rowid: w + E_ROWID, start: w + E_START, end: w + E_END, props: w + E_PROPS };
+      slots.set(r.slot, rb);
+      fixed.push({ r, b: rb });
+      if (!farNode) {
+        // Its id and props (NULL when only an end: nothing reads them).
+        slots.set(p.nodes[far]!.slot, { k: 'node', id: w + E_PROPS + 1, props: w + E_PROPS + 2 });
+        done[far] = true;
+        if (farNew) check(farNew.props, () => colRef(w + E_PROPS + 2, PROPS));
+      }
       check(r.props, () => colRef(rb.props, PROPS));
     };
     /**
@@ -1275,6 +1339,7 @@ export class Compiler {
       // A node only this relationship reaches; else the node table, whose rows the planner knows, joins it to the others.
       else if (p.rels.every((x) => x === r || (x.from !== far && x.to !== far))) bindAt(far, (b) => outOf(b, last));
       else bindNew(far, (b) => outOf(b, last));
+      if (!farNode && weak.has(near)) weak.add(far);
       const hops = addColumn(HOPS, (b) => this.hopsInPatternOrder(outOf(b, w + 2), names, !fromBound));
       slots.set(r.slot, { k: 'rels', hops });
       lists.push({ r, hops });
@@ -1286,9 +1351,29 @@ export class Compiler {
       }
     };
 
-    for (const r of p.rels) {
+    // Relationships in the pattern's order, except that a hop from a row (`expand`) starts where the pattern is bound,
+    // or at its most selective node: a relationship with a bound end first, else a scan of the node with a property
+    // map or an equality in WHERE on its properties, else with labels, else the first relationship's `from` node. Not
+    // where the order shows: rows then come in the order of the pattern's first node, as before.
+    for (const r of p.rels) if (r.shortest && slots.has(r.slot)) unsupported('a relationship pattern on a variable that is already bound');
+    const rest = p.rels.filter((r) => !r.shortest);
+    const isBound = (r: PatternRel) => nodeAt(r.from) !== undefined || nodeAt(r.to) !== undefined;
+    while (rest.length) {
+      let r = rest[0]!;
+      if (!ordered && r.min === undefined && !isBound(r) && choicesOf(r).length > 1 && branches.length * choicesOf(r).length > this.maxBranches) {
+        const next = rest.find(isBound);
+        if (next) r = next;
+        else {
+          const ends = rest.filter((x) => x.min === undefined).flatMap((x) => [x.from, x.to]);
+          const best = ends.reduce((a, b) => (score(b) > score(a) ? b : a), r.from);
+          if (best !== r.from) {
+            scanNode(best);
+            r = rest.find(isBound)!;
+          }
+        }
+      }
+      rest.splice(rest.indexOf(r), 1);
       if (slots.has(r.slot)) unsupported('a relationship pattern on a variable that is already bound');
-      if (r.shortest) continue;
       if (r.min !== undefined) walk(r);
       else hop(r);
     }
@@ -1305,14 +1390,9 @@ export class Compiler {
     for (const r of shortest) walk(r);
 
     // Uniqueness: relationships whose types can't be the same are distinct already.
-    const typeSet = (r: PatternRel) => new Set(this.typeNames(r.types));
-    const overlap = (a: PatternRel, b: PatternRel) => {
-      const t = typeSet(b);
-      return [...typeSet(a)].some((x) => t.has(x));
-    };
     fixed.forEach(({ r, b }, i) => {
       for (const { r: r2, b: b2 } of fixed.slice(i + 1)) {
-        if (!overlap(r, r2)) continue;
+        if (!overlap(r, r2) || distinct.has(r2)) continue;
         for (const br of branches) {
           const [t1, t2] = [outOf(br, b.type), outOf(br, b2.type)];
           const sameRow = eq(outOf(br, b.rowid), outOf(br, b2.rowid));
@@ -1547,6 +1627,64 @@ export class Compiler {
     if (!parts.length) return { op: 'values', rows: [], types: columns };
     const collations = columns.map(() => 'binary' as const);
     return parts.reduce((a, b) => ({ op: 'setop', kind: 'unionAll', inputs: [a, b], collations }));
+  }
+
+  /**
+   * One hop from each row of `left` (the region before it, run once): the row, then a relationship at its node `near`
+   * of one of `choices` (`ADJ_TYPES`: the relationship's columns, its other end, that node's props). smaltdb's
+   * `iterate` with one step per choice: a step joins the rows (`working`, which the planner reads a row at a time) with
+   * the type's edge table on the end that is bound, so it seeks into its `start` or `end` index for each row, then, with
+   * `labels`, into the node table by the other end (and the label index for each label); without, the props are NULL.
+   * `bound`: the far end's column when it is bound (the step checks it); `before`: the row's relationships it must
+   * differ from (Cypher's uniqueness, checked before the far end is read). `read`: whether the relationship's ends and
+   * props are read (else NULL). `both`'s reverse reading leaves self-loops out (one match). With `ordered`, rows come in
+   * the order of `left`, then of the choices, then of rowid.
+   */
+  private hopFrom(left: Rel, near: number, choices: readonly { type: string; reverse: boolean }[], dir: Direction, fromBound: boolean, bound: number | undefined, labels: readonly string[] | undefined, before: readonly RelBinding[], read: boolean, ordered: boolean): PlanOp {
+    const id = ++this.iterates;
+    const lt = left.frame.types;
+    const w = lt.length;
+    // Columns: the row's (numbered when the order is kept), the hop's, its choice's position, then the depth (0: a row of `left`).
+    const base: PlanType[] = ordered ? [...lt, 'int'] : [...lt];
+    const iterTypes: PlanType[] = [...base, ...ADJ_TYPES, 'int', 'int'];
+    const nulls = (ts: readonly PlanType[]): PlanExpr[] => ts.map((t) => ({ k: 'lit', value: null, type: t }));
+    const input = ordered ? this.numbered(left) : left.plan;
+    const init: PlanOp = { op: 'project', input, exprs: [...base.map((t, i) => colRef(i, t)), ...nulls(ADJ_TYPES), lit(null, 'int'), lit(0)] };
+    const steps = choices.map(({ type, reverse }, i): PlanOp => {
+      const b: Branch = { leaves: [{ op: 'working', id, types: iterTypes }], width: iterTypes.length, conds: [], out: [], keys: [] };
+      // The end that is bound: `start` when the pattern's bound end is its `from` end, read forward.
+      const atStart = fromBound !== reverse;
+      // Its index, by the name smaltdb's `addType` gives it: the planner estimates a seek by the average rows per value,
+      // which for a type whose ends are few (people living in a few cities) is more than a scan costs, but a hop reads
+      // one node's.
+      const table = this.t.types.get(type)!;
+      const e = addLeaf(b, { op: 'scan', table, columns: [-1, 0, 1, 2], ...(this.asOf ? {} : { indexedBy: `${table}_${atStart ? 'start' : 'end'}` }) }, 4);
+      const start = colRef(e + 1, 'int');
+      const end = colRef(e + 2, 'int');
+      const [seek, other] = atStart ? [start, end] : [end, start];
+      b.conds.push(eq(seek, colRef(near, 'int')));
+      if (dir === 'both' && reverse) b.conds.push(not(eq(start, end)));
+      if (bound !== undefined) b.conds.push(eq(other, colRef(bound, 'int')));
+      for (const x of before) b.conds.push(not(and(eq(colRef(x.type, 'text'), lit(type, 'text')), eq(colRef(x.rowid, 'int'), colRef(e, 'int')))));
+      let props: PlanExpr = { k: 'lit', value: null, type: PROPS };
+      if (labels) {
+        const n = addLeaf(b, { op: 'scan', table: this.t.nodes, columns: [0, 1] }, 2);
+        b.conds.push(eq(colRef(n, 'int'), other));
+        props = colRef(n + 1, PROPS);
+        this.labelEntries(b, other, labels);
+      }
+      const opt = (x: PlanExpr, t: PlanType): PlanExpr => (read ? x : { k: 'lit', value: null, type: t });
+      const joined = b.leaves.slice(1).reduce((l, x): PlanOp => ({ op: 'join', kind: 'cross', inputs: [l, x] }), b.leaves[0]!);
+      const exprs = [...base.map((t, k) => colRef(k, t)), lit(type, 'text'), colRef(e, 'int'), opt(start, 'int'), opt(end, 'int'), opt(colRef(e + 3, PROPS), PROPS), other, props, lit(i), lit(1)];
+      return { op: 'project', input: { op: 'filter', input: joined, pred: and(...b.conds) }, exprs };
+    });
+    let plan: PlanOp = { op: 'iterate', id, name: HOP_ITERATE, init, steps, distinct: false, collations: iterTypes.map(() => 'binary'), maxDepth: 1 };
+    plan = { op: 'filter', input: plan, pred: eq(colRef(iterTypes.length - 1, 'int'), lit(1)) };
+    if (ordered) {
+      const key = (i: number) => ({ expr: colRef(i, 'int'), desc: false, nullsFirst: false, collation: 'binary' as const });
+      plan = { op: 'sort', input: plan, keys: [key(w), key(iterTypes.length - 2), key(w + 1 + E_ROWID)] };
+    }
+    return { op: 'project', input: plan, exprs: [...lt.map((t, i) => colRef(i, t)), ...ADJ_TYPES.map((t, i) => colRef(base.length + i, t))] };
   }
 
   /** A pattern's property map: each key equals its value (Cypher's `=`, true). */
