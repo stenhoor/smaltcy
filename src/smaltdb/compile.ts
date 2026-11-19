@@ -292,6 +292,9 @@ const entity = (v: Exclude<Val, { k: 'value' }>) =>
  */
 export const HOP: PlanType = 'struct<edge int, rowid int, from int, to int>';
 export const HOPS: PlanType = `list<${HOP}>`;
+
+/** Prototype switch: variable-length searches compile to `walkFrom` (smaltcy's iterate) rather than smaltdb's `paths`. */
+const WALKFROM = !!(globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env?.SMALTCY_WALKFROM;
 /** A relationship as a list element: `RelBinding`'s columns. */
 const REL: PlanType = `struct<type text, rowid int, start int, end int, props map<text, any>>`;
 /** A node as a list element. */
@@ -1147,7 +1150,60 @@ export class Compiler {
    * filter its rows. With `ordered`, rows come in the order of the input, then of each scan (smaltdb's `ordered`
    * joins' order), by a sort of the region's rows.
    */
-  private pattern(input: Rel, p: Pattern, where: Expr | undefined, ordered: boolean): Rel {
+  /**
+   * Prototype: a chain of single hops through anonymous nodes, `()-[:T]-()-[:T]-()`, as one variable-length
+   * relationship of fixed length (`*2..2`), which smaltdb's `paths` walks natively. The same matches: a pattern's
+   * relationships are all different, as a trail's are. Only where the middle nodes and the relationships are read by
+   * nothing (no labels, properties or variables), the hops are of the same types and direction, the pattern names no
+   * path and has no cycle, and the rows' order doesn't show.
+   */
+  private foldChains(p: Pattern, bound: ReadonlySet<number>, ordered: boolean): Pattern {
+    // A pattern with a cycle (as many relationships as nodes or more, as a triangle's) is joined, not walked.
+    if (ordered || (p.paths ?? []).length || WALKFROM || p.rels.length >= p.nodes.length) return p;
+    let nodes = [...p.nodes];
+    let rels = [...p.rels];
+    const plain = (r: PatternRel) => !r.props && !r.shortest && this.unread.has(r.slot);
+    const sameTypes = (a: PatternRel, b: PatternRel) => a.types.length === b.types.length && a.types.every((t) => b.types.includes(t));
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (let m = 0; m < nodes.length && !changed; m++) {
+        const n = nodes[m]!;
+        if (n.labels.length || n.props || !this.unread.has(n.slot) || bound.has(n.slot)) continue;
+        const touching = rels.filter((r) => r.from === m || r.to === m);
+        if (touching.length !== 2) continue;
+        let [a, b] = touching as [PatternRel, PatternRel];
+        if (!plain(a) || !plain(b) || !sameTypes(a, b) || a.from === a.to || b.from === b.to) continue;
+        // Read as a chain x -a-> m -b-> y: a ends at m, b starts at m (flipping a relationship flips its direction).
+        const flip = (r: PatternRel): PatternRel => ({ ...r, from: r.to, to: r.from, dir: r.dir === 'out' ? 'in' : r.dir === 'in' ? 'out' : 'both' });
+        if (a.to !== m) a = flip(a);
+        if (b.from !== m) b = flip(b);
+        if (a.dir !== b.dir) continue;
+        // Each end of the chain selective (properties, labels, bound) or read for its identity only: an end that more
+        // of the query matches against (a cycle closed by another part) is better joined than walked to.
+        const endOk = (i: number) => {
+          const e = nodes[i]!;
+          return !!e.props || e.labels.length > 0 || bound.has(e.slot) || this.idOnly.has(e.slot);
+        };
+        if (!endOk(a.from) || !endOk(b.to)) continue;
+        const lo = (r: PatternRel) => r.min ?? 1;
+        const hi = (r: PatternRel) => (r.min === undefined ? 1 : r.max);
+        if (hi(a) === undefined || hi(b) === undefined) continue;
+        const joined: PatternRel = { ...a, to: b.to, min: lo(a) + lo(b), max: hi(a)! + hi(b)! };
+        // In the place of the first of the two: the relationships keep the pattern's order.
+        const first = Math.min(rels.indexOf(touching[0]!), rels.indexOf(touching[1]!));
+        rels = rels.flatMap((r, i) => (i === first ? [joined] : r === touching[0] || r === touching[1] ? [] : [r]));
+        // Node m goes: the indexes after it move down one.
+        nodes = nodes.filter((_, i) => i !== m);
+        const at = (i: number) => (i > m ? i - 1 : i);
+        rels = rels.map((r) => ({ ...r, from: at(r.from), to: at(r.to) }));
+        changed = true;
+      }
+    }
+    return rels.length === p.rels.length ? p : { ...p, nodes, rels };
+  }
+
+  private pattern(input: Rel, p0: Pattern, where: Expr | undefined, ordered: boolean): Rel {
+    const p = this.foldChains(p0, new Set(input.frame.slots.keys()), ordered);
     const types = [...input.frame.types];
     const slots = new Map(input.frame.slots);
     const frame = (): Frame => ({ types, slots });
@@ -1360,7 +1416,7 @@ export class Compiler {
         // goes; smaltdb's selectors choose among paths of at least minHops. Kept to what both mean alike.
         if (r.props) unsupported('shortest paths with relationship properties');
         if (min > 1) unsupported('shortest paths with a minimum length above 1');
-      } else if (!nodeAt(r.from) && !nodeAt(r.to)) scanNode(r.from);
+      } else if (!nodeAt(r.from) && !nodeAt(r.to)) scanNode(!ordered && score(r.to) > score(r.from) ? r.to : r.from);
       const fromBound = nodeAt(r.from) !== undefined;
       const near = fromBound ? r.from : r.to;
       const far = fromBound ? r.to : r.from;
@@ -1386,8 +1442,25 @@ export class Compiler {
         plan = { op: 'project', input: min === 0 ? plan : { op: 'filter', input: plan, pred: FALSE }, exprs: [...types.map((t, i) => colRef(i, t)), colRef(start, 'int'), lit(0), call('list_of', [], HOPS)] };
         types.push('int', 'int', HOPS);
       } else if (!ordered && !shortest) {
-        // Where the order doesn't show: a search from each row (`walkFrom`), its rows the paths found.
-        plan = this.walkFrom(plan, types, start, names, dir, min, r.max, !this.unread.has(r.slot) || r.props !== undefined || p.rels.length > 1);
+        // Where the order doesn't show: smaltdb's `paths` from each row (run natively over the in-memory copies of the
+        // edge tables' indexes), its rows the paths found; `both` reads a self-loop once, as smaltcy does. Prototype:
+        // SMALTCY_WALKFROM compiles the search from each row (`walkFrom`) instead, to compare.
+        plan = WALKFROM
+          ? this.walkFrom(plan, types, start, names, dir, min, r.max, !this.unread.has(r.slot) || r.props !== undefined || p.rels.length > 1)
+          : ({
+              op: 'paths',
+              input: plan,
+              start,
+              edges: names.map((t) => ({ table: this.t.types.get(t)!, start: 0, end: 1 })),
+              direction: dir,
+              minHops: min,
+              ...(r.max !== undefined ? { maxHops: r.max } : {}),
+              mode: 'trail',
+              selector: 'all',
+              ...(dir === 'both' ? { loopsOnce: true } : {}),
+              // Its hops only where something reads them (the relationship list, its props, uniqueness with another).
+              ...(!this.unread.has(r.slot) || r.props !== undefined || p.rels.length > 1 ? {} : { path: false }),
+            } as PlanOp);
         types.push('int', 'int', HOPS);
       } else {
         // Each row's paths, from a subquery (smaltdb's `paths` from that row's node), one row each.

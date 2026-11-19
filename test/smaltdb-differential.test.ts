@@ -584,8 +584,9 @@ describe('a generated network: both engines give the same rows', () => {
 
   test("a variable-length relationship whose order shows nowhere is a search from each row, and a node only counted isn't read", () => {
     const walk = JSON.stringify(compileQuery(compile("MATCH (p:Person {name: 'Bo 1'})-[:KNOWS*1..3]-(f) RETURN count(DISTINCT f) AS n").plan, tables).statement);
-    expect(walk).toContain('"name":"walk"');
-    expect(walk).not.toContain('"op":"paths"');
+    // smaltdb's `paths`, run natively over the in-memory copies of the edge indexes (prototype; was `walkFrom`).
+    expect(walk).toContain('"op":"paths"');
+    expect(walk).toContain('"path":false');
     expect(walk).not.toContain('"sort"');
     // Its far node is only counted: the node table is read once, for the person found by name.
     expect(walk.split(`"table":"${tables.nodes}"`).length - 1).toBe(1);
