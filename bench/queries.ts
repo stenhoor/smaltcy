@@ -4,6 +4,11 @@ export const QUERIES: [string, string][] = [
   ['1 hop', "MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-(f) RETURN count(f)"],
   ['2 hops', "MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-()-[:KNOWS]-(f) RETURN count(f)"],
   ['3 hops', "MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-()-[:KNOWS]-()-[:KNOWS]-(f) RETURN count(f)"],
+  // Hops as they are more often written: with a direction, to a label, with a condition on the relationship.
+  ['1 hop, directed', "MATCH (p:Person {name: 'Bo 1'})<-[:KNOWS]-(f) RETURN count(f)"],
+  ['3 hops, directed', "MATCH (p:Person {name: 'Bo 1'})<-[:KNOWS]-()<-[:KNOWS]-()<-[:KNOWS]-(f) RETURN count(f)"],
+  ['2 hops to a label', "MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-()-[:KNOWS]-(f:Person) RETURN count(f)"],
+  ['2 hops, relationship filter', "MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-()-[r:KNOWS]-(f) WHERE r.since >= 2013 RETURN count(f)"],
   ['var-length 1..3, distinct', "MATCH (p:Person {name: 'Bo 1'})-[:KNOWS*1..3]-(f) RETURN count(DISTINCT f)"],
   ['shortest path', "MATCH (a:Person {name: 'Bo 1'}), (b:Person {name: 'Gus 6'}) MATCH p = shortestPath((a)-[:KNOWS*]-(b)) RETURN length(p)"],
   ['shortest path, 5 hops', "MATCH (a:Person {name: 'Bo 1'}), (b:Person {name: 'Wen 1172'}) MATCH p = shortestPath((a)-[:KNOWS*]-(b)) RETURN length(p)"],

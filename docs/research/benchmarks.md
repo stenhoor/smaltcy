@@ -457,3 +457,24 @@ What it says:
   - merge existing, 0.33: the match 0.06; nothing planned anew.
 
   The scans for ids and the statements that hold the runner's rows are the write path's own, and step 4.
+
+## More hop cases, and their baseline (2026-11-20)
+
+The hops above all go either way, to a node of any label, and read nothing of the relationship. smaltdb's ADR 0040
+(stenhoor/smaltdb#274, step 2b) measured that a hop with a direction is compiled differently and fetches each
+relationship's row, so the queries now have hops as they are more often written: with a direction (`1 hop, directed`,
+`3 hops, directed`), to a label (`2 hops to a label`) and with a condition on the relationship (`2 hops, relationship
+filter`), the last three among the statements that differ too. They count for the bar as the others do.
+
+Their baseline, smaltcy `51f6b80` and smaltdb `1c2fce8`, the same machine and method. A ratio is smaltdb's time over
+smaltcy's.
+
+| Query | smaltcy (ms) | smaltdb (ms) | The same text | A literal, a parameter |
+|---|---|---|---|---|
+| 1 hop, directed | 0.028 | 0.068 | 2.59x | |
+| 3 hops, directed | 2.232 | 7.636 | 3.62x | 1.82x, 1.52x |
+| 2 hops to a label | 0.734 | 3.839 | 5.17x | 2.50x, 2.36x |
+| 2 hops, relationship filter | 0.583 | 2.478 | 4.18x | 1.76x, 1.74x |
+
+In the same run the hops that go either way were at 1.50x (1 hop), 2.62x (2 hops) and 3.20x (3 hops): the new cases
+are further from the bar than the ones the benchmark had.
