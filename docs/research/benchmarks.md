@@ -713,3 +713,77 @@ What it says:
   - **Seek by name** (1.05x; 1.20x and 1.11x), a statement of under 0.1 ms: its time is finding the kept statement,
     as measured in "smaltdb's graph index, and shortest paths to a target".
 - **Writes did not change:** they are the issue's step 4.
+
+## Comparisons within one kind (2026-11-20)
+
+Step 5a of stenhoor/smaltdb#274 (smaltdb's ADR 0041, section 1). smaltdb `166c6cd` has four comparisons that are NULL
+unless both operands are numbers or both are strings (`cmp_lt_kind` and the others, stenhoor/smaltdb#283), and where
+it scans a table it decides one on a property map's stored bytes. `<`, `<=`, `>` and `>=` of a property with a number
+or a string are now that one operation here, where they were a CASE over the value's kind around smaltdb's `cmp_lt`,
+which read the property three times for every row that passed.
+
+The same machine and method. "Before" is the section above (smaltdb `57f0e94`). A ratio is smaltdb's time over
+smaltcy's.
+
+**The same text every run** (`BENCH_INDEXES=1 npm run bench:smaltdb`):
+
+| Query | Before | Now | smaltcy, smaltdb now (ms) |
+|---|---|---|---|
+| seek by name | 1.05x | 1.08x | 0.018, 0.020 |
+| 1 hop | 0.76x | 0.72x | 0.060, 0.045 |
+| 2 hops | 0.36x | 0.35x | 0.351, 0.123 |
+| 3 hops | 0.33x | 0.29x | 4.281, 1.269 |
+| 1 hop, directed | 0.80x | 0.82x | 0.029, 0.024 |
+| 3 hops, directed | 0.28x | 0.27x | 2.283, 0.618 |
+| 2 hops to a label | 0.26x | 0.27x | 0.764, 0.206 |
+| 2 hops, relationship filter | 2.64x | 1.87x | 0.644, 1.171 |
+| var-length 1..3, distinct | 0.61x | 0.62x | 12.044, 7.466 |
+| shortest path | 0.84x | 0.82x | 0.046, 0.038 |
+| shortest path, 5 hops | 0.18x | 0.17x | 29.320, 5.193 |
+| shortest path, none (out) | 1.16x | 1.16x | 0.030, 0.035 |
+| shortest path, none (all) | 0.25x | 0.24x | 30.788, 7.628 |
+| label scan + filter | 1.01x | 0.57x | 2.143, 1.230 |
+| group by city | 1.72x | 1.85x | 18.271, 35.922 |
+| all relationships | 0.17x | 0.17x | 15.778, 2.823 |
+| triangles (bounded) | 0.79x | 0.81x | 12.258, 10.397 |
+
+**Statements that differ** (`BENCH_ENTRY=bench/vary.ts npm run bench:smaltdb`; a literal, a parameter):
+
+| Statement | Before | Now |
+|---|---|---|
+| seek by name | 1.20x, 1.11x | 1.09x, 1.09x |
+| 1 hop | 0.66x, 0.72x | 0.63x, 0.72x |
+| 2 hops | 0.45x, 0.48x | 0.49x, 0.47x |
+| 3 hops | 0.33x, 0.36x | 0.31x, 0.35x |
+| 3 hops, directed | 0.41x, 0.54x | 0.41x, 0.56x |
+| 2 hops to a label | 0.36x, 0.32x | 0.31x, 0.34x |
+| 2 hops, relationship filter | 1.40x, 1.45x | 1.05x, 1.09x |
+| var-length 1..3, distinct | 0.58x, 0.59x | 0.58x, 0.63x |
+| shortest path | 0.12x, 0.15x | 0.12x, 0.14x |
+| shortest path, directed | 1.05x, 0.97x | 1.01x, 0.85x |
+| shortest path, none | 0.26x, 0.27x | 0.24x, 0.22x |
+| label scan + filter | 2.63x, 1.64x | 0.95x, 0.67x |
+| create 1 node | 38.6x, 45.5x | 43.2x, 53.6x |
+| create 1,000 nodes | 14.3x, 14.1x | 13.9x, 14.9x |
+| create 1 relationship | 69.0x, 78.5x | 61.6x, 77.8x |
+| create 1,000 relationships | 9.91x, 8.93x | 9.58x, 9.96x |
+| set 1 property by name | 23.1x, 27.2x | 23.6x, 25.1x |
+| set 1,000 properties | 14.4x, 15.0x | 14.2x, 14.4x |
+| merge existing node | 4.87x, 4.79x | 5.24x, 5.03x |
+| merge 1,000 new nodes | 0.97x, 0.93x | 0.90x, 0.96x |
+| delete 1 node | 112x, 120x | 112x, 131x |
+| delete 1,000 nodes | 22.3x, 23.2x | 23.5x, 22.4x |
+
+What it says:
+
+- **The label scan and filter is under smaltcy's time** in the three ways it is measured (0.57x; 0.95x and 0.67x).
+  With a literal smaltdb's time went from 10.4 to 4.3 ms, with a parameter from 5.9 to 2.7: the scan no longer runs
+  the comparison for the rows that pass its check of the stored bytes.
+- **The relationship filter got faster and is still over** (2.64x to 1.87x; 1.05x and 1.09x). Its comparison is one
+  read of the property where it was three. What is left is each relationship's row fetched for that property, 0.81
+  of its 1.80 ms when profiled before this: smaltdb's ADR 0041, section 2 (step 5b).
+- **Group by city did not change** (smaltdb's 36.4 and 35.9 ms; smaltcy's own time moved from 20.1 to 18.3): it has
+  no such comparison. What it needs is in ADR 0041, sections 2 and 3.
+- **The writes hold no such comparison,** and moved as they move between runs: creating 1 node took smaltdb 0.74
+  and 0.66 ms before, 0.85 and 0.83 in this run, and 0.75 to 0.83 in two more runs of that case alone on this pin,
+  with smaltcy's own time between 0.015 and 0.028 ms.
