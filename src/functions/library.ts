@@ -520,12 +520,18 @@ function stdev(population: boolean): AggregateDef {
 export function registerFunction(name: string, def: ScalarDef): void {
   if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(name)) throw new SmaltcyError('SMALTCY_UNSUPPORTED', `Bad function name ${JSON.stringify(name)}`);
   scalarFunctions.set(name, def);
+  registered++;
 }
+
+/** How many functions were registered so far: what was compiled before the last one may bind differently now. */
+let registered = 0;
+export const functionsRegistered = (): number => registered;
 
 /** Adds an aggregate function, as `registerFunction` does for scalars. */
 export function registerAggregate(name: string, def: AggregateDef): void {
   if (!/^[A-Za-z_][A-Za-z0-9_.]*$/.test(name)) throw new SmaltcyError('SMALTCY_UNSUPPORTED', `Bad aggregate name ${JSON.stringify(name)}`);
   aggregateFunctions.set(name, def);
+  registered++;
 }
 
 export const aggregateFunctions = new Map<string, AggregateDef>(

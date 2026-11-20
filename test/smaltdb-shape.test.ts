@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest';
 import type { Database } from 'smaltdb-src/engine/database.js';
 import { compile } from '../src/cypher/index.js';
 import { open, type Graph } from '../src/index.js';
+import { registerFunction } from '../src/functions/index.js';
 import { Unsupported } from '../src/smaltdb/compile.js';
 import type { GraphTables } from '../src/smaltdb/schema.js';
 import { runOnSmaltdb, type SmaltdbDatabase } from '../src/smaltdb/write.js';
@@ -168,6 +169,50 @@ describe('a query with other values runs the statement kept for its shape', () =
   test('a database that can only run statements: the same rows', () => {
     const plain: SmaltdbDatabase = { queryPlan: (stmt, params) => b.db.queryPlan(stmt, params as never) };
     for (const name of ['Ada', 'Alan', 'Nobody']) same(plain, `MATCH (p:Person {name: '${name}'})-[:KNOWS]->(q) RETURN q.name AS name ORDER BY name`);
+  });
+});
+
+describe('a text run again: its plan is kept, and its shape with it', () => {
+  test('the same text is the same plan, until a function is registered', () => {
+    const text = "MATCH (p:Person {name: 'Ada'}) RETURN p.born AS born";
+    const first = compile(text);
+    expect(compile(text)).toBe(first);
+    expect(compile(`${text} `)).not.toBe(first);
+    registerFunction('kept_text_probe', { arity: [0, 0], fn: () => 1 });
+    const again = compile(text);
+    expect(again).not.toBe(first);
+    expect(again.plan).toEqual(first.plan);
+    // A text that fails is compiled, and fails, each time; a very long one is not kept.
+    expect(() => compile('MATCH (p RETURN p')).toThrow();
+    expect(() => compile('MATCH (p RETURN p')).toThrow();
+    const long = `RETURN ${Array.from({ length: 1200 }, (_, i) => i).join(' + ')} AS n`;
+    expect(compile(long)).not.toBe(compile(long));
+  });
+
+  test('one text on two databases, in turns, and after one of them changes', () => {
+    const ga = social();
+    const gb = social();
+    const a = both(ga);
+    const b = both(gb);
+    const text = 'MATCH (p:Person) WHERE p.born > $year RETURN count(p) AS n';
+    let tablesB = b.tables;
+    for (let i = 0; i < 3; i++) {
+      expect(onSmaltdb(a.db, a.tables, text, { year: 1900 })).toEqual(ga.query(text, { year: 1900 }));
+      expect(onSmaltdb(b.db, tablesB, text, { year: 1900 })).toEqual(gb.query(text, { year: 1900 }));
+      const more = "CREATE (:Person {name: 'New', born: 2000})";
+      gb.run(more);
+      tablesB = runOnSmaltdb(b.db, compile(more).plan, tablesB).tables;
+    }
+    expect(onSmaltdb(b.db, tablesB, text, { year: 1900 })[0]!.n).toBe((onSmaltdb(a.db, a.tables, text, { year: 1900 })[0]!.n as number) + 3);
+  });
+
+  test('one text with parameters of other kinds, and with one missing', () => {
+    const g = social();
+    const b = both(g);
+    const text = 'MATCH (p:Person) WHERE p.name = $v OR p.born = $v RETURN p.name AS name ORDER BY name';
+    for (const v of ['Ada', 1815, 1815.5, 'Ada', null, true, 1912]) expect(onSmaltdb(b.db, b.tables, text, { v }), String(v)).toEqual(g.query(text, { v }));
+    expect(() => onSmaltdb(b.db, b.tables, text, {})).toThrow();
+    expect(onSmaltdb(b.db, b.tables, text, { v: 'Ada' })).toEqual(g.query(text, { v: 'Ada' }));
   });
 });
 

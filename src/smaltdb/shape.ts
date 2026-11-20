@@ -99,12 +99,19 @@ function literal(x: { readonly k: 'lit'; readonly v: unknown }): unknown {
 /** A parameter: its name and the kind of its value, and with `pinned` the value. */
 function parameter(x: { readonly k: 'param'; readonly name: string }, pinned: boolean): void {
   const v = given[x.name];
-  key += `$${x.name.length}:${x.name}:${x.name in given ? paramKind(v) : 'missing'}`;
+  const kind = x.name in given ? paramKind(v) : 'missing';
+  key += `$${x.name.length}:${x.name}:${kind}`;
+  read.push(x.name, kind);
   if (pinned) {
+    pins = true;
     key += '=';
     plain(v);
   }
 }
+
+/** The parameters the walk read, each followed by the kind of its value, and whether it wrote one's value into the shape. */
+let read: string[] = [];
+let pins = false;
 
 /** A value that stays in the shape as it is. */
 function plain(v: unknown): void {
@@ -188,15 +195,47 @@ function walk(x: unknown): unknown {
 }
 
 /** A query's shape as text, and the values taken out of it. */
-function shapeOf(gp: QueryPlan, tables: GraphTables, params: Readonly<Record<string, unknown>>): { key: string; values: unknown[] } {
+interface Shape {
+  readonly key: string;
+  readonly values: readonly unknown[];
+}
+
+/**
+ * The shape a plan had the last time it ran: the same plan object (a text compiled once, `compile` in
+ * cypher/index.ts) over the same tables has it again while its parameters are of the kinds they were, so it isn't
+ * walked again. A plan that writes a parameter's value into its shape (SKIP and LIMIT) is walked each time.
+ */
+interface Seen extends Shape {
+  readonly tables: GraphTables;
+  /** The parameters it reads, each followed by its kind then. */
+  readonly read: readonly string[];
+  /** The statement kept for it in the database it last ran on. */
+  db: object | null;
+  kept: Kept | null | undefined;
+}
+const seen = new WeakMap<object, Seen>();
+
+function shapeOf(gp: QueryPlan, tables: GraphTables, params: Readonly<Record<string, unknown>>): Shape | Seen {
+  const before = seen.get(gp);
+  if (before !== undefined && before.tables === tables) {
+    const r = before.read;
+    let same = true;
+    for (let i = 0; i < r.length && same; i += 2) same = (r[i]! in params ? paramKind(params[r[i]!]) : 'missing') === r[i + 1];
+    if (same) return before;
+  }
   key = `${signature(tables)}|`;
   values = [];
   given = params;
   build = false;
   building = 0;
   conditions = false;
+  read = [];
+  pins = false;
   walk(gp);
-  return { key, values };
+  if (pins) return { key, values };
+  const now: Seen = { key, values, tables, read, db: null, kept: undefined };
+  seen.set(gp, now);
+  return now;
 }
 
 /** A query with a parameter where each value was taken out: `shapeOf`'s values, under the names `HOLE` and their number. */
@@ -220,13 +259,22 @@ function withHoles(gp: QueryPlan, params: Readonly<Record<string, unknown>>): Qu
  * where the compiler needs one of its values written out, or it holds more values than a statement takes.
  */
 export function valuesOut(gp: QueryPlan, params: Readonly<Record<string, unknown>>): { plan: QueryPlan; params: Readonly<Record<string, unknown>> } {
-  const plan = withHoles(gp, params);
-  const taken = values;
-  if (asWritten || taken.length === 0 || taken.length > MAX_HOLES) return { plan: gp, params };
+  // Which values are taken out depends on the plan alone: a plan that comes again (a text run again) is not walked again.
+  let out = takenOut.get(gp);
+  if (out === undefined) {
+    const plan = withHoles(gp, params);
+    const taken = values;
+    out = asWritten || taken.length === 0 || taken.length > MAX_HOLES ? null : { plan, taken };
+    takenOut.set(gp, out);
+  }
+  if (out === null) return { plan: gp, params };
   const all: Record<string, unknown> = { ...params };
-  for (let i = 0; i < taken.length; i++) all[HOLE + i] = taken[i];
-  return { plan, params: all };
+  for (let i = 0; i < out.taken.length; i++) all[HOLE + i] = out.taken[i];
+  return { plan: out.plan, params: all };
 }
+
+/** A written statement with its values taken out, and the values; `null` for one that is run as it is. */
+const takenOut = new WeakMap<object, { readonly plan: QueryPlan; readonly taken: readonly unknown[] } | null>();
 
 /**
  * Runs a query that only reads by its shape: the statement kept for the shape, compiled and prepared the first time.
@@ -237,13 +285,20 @@ export function runByShape(db: ShapeDatabase, gp: QueryPlan, tables: GraphTables
   if (gp.asOf) return undefined;
   const shape = shapeOf(gp, tables, params);
   if (shape.values.length > MAX_HOLES) return undefined;
-  let mine = shapes.get(db);
-  if (!mine) shapes.set(db, (mine = new Map()));
-  let kept = mine.get(shape.key);
+  let kept: Kept | null | undefined = 'db' in shape && shape.db === db ? shape.kept : undefined;
   if (kept === undefined) {
-    kept = keep(db, gp, tables, params, shape.values);
-    mine.set(shape.key, kept);
-    if (mine.size > MAX_SHAPES) mine.delete(mine.keys().next().value!);
+    let mine = shapes.get(db);
+    if (!mine) shapes.set(db, (mine = new Map()));
+    kept = mine.get(shape.key);
+    if (kept === undefined) {
+      kept = keep(db, gp, tables, params, shape.values);
+      mine.set(shape.key, kept);
+      if (mine.size > MAX_SHAPES) mine.delete(mine.keys().next().value!);
+    }
+    if ('db' in shape) {
+      shape.db = db;
+      shape.kept = kept;
+    }
   }
   if (kept === null) return undefined;
   const order = kept.order;
