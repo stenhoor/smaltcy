@@ -1,26 +1,16 @@
 /**
  * Storage and traversal benchmarks in Node: the same queries on MemoryStore and CsrStore over a generated social
- * network. `npm run bench`; results go to bench/results/<date>.json. Method: docs/research/benchmarks.md.
+ * network. `npm run bench`; BENCH_PEOPLE and BENCH_ROUNDS (bench/timing.ts) size it, BENCH_RUNS the history steps'
+ * runs; results go to bench/results/<date>.local.json. Method: docs/research/benchmarks.md.
  */
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { network } from '../src/datasets/index.js';
-import { CsrStore, open, type Graph } from '../src/index.js';
+import { CsrStore, open } from '../src/index.js';
 import { QUERIES } from './queries.js';
+import { METHOD, ROUNDS, rounds, timed } from './timing.js';
 
 const PEOPLE = Number(process.env.BENCH_PEOPLE ?? 20000);
 const RUNS = Number(process.env.BENCH_RUNS ?? 7);
-
-function time(g: Graph, q: string): number {
-  g.run(q); // warm up
-  const ts: number[] = [];
-  for (let i = 0; i < RUNS; i++) {
-    const t0 = performance.now();
-    g.run(q);
-    ts.push(performance.now() - t0);
-  }
-  ts.sort((a, b) => a - b);
-  return ts[Math.floor(ts.length / 2)]!;
-}
 
 const t0 = performance.now();
 const data = network(PEOPLE);
@@ -32,21 +22,21 @@ const csr = open({ store: CsrStore.from(mem.store) });
 const csrMs = performance.now() - t1;
 const st = mem.store.stats();
 console.log(`network(${PEOPLE}): ${st.nodes} nodes, ${st.rels} relationships; generate+load ${loadMs.toFixed(0)} ms, CSR build ${csrMs.toFixed(0)} ms`);
-console.log(`median of ${RUNS} runs, ms\n`);
-console.log('query'.padEnd(28), 'memory'.padStart(10), 'csr'.padStart(10), 'rows');
-const results: Record<string, { memory: number; csr: number }> = {};
+console.log(`${METHOD}\n`);
+console.log('query'.padEnd(28), 'memory'.padStart(10), 'csr'.padStart(10), 'ratio'.padStart(8), ' rows');
+const results: Record<string, { memory: number; csr: number; ratio: number }> = {};
 for (const [name, q] of QUERIES) {
   const a = mem.run(q).rows;
   const b = csr.run(q).rows;
   if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`stores disagree on ${name}`);
-  const m = time(mem, q);
-  const c = time(csr, q);
-  results[name] = { memory: +m.toFixed(3), csr: +c.toFixed(3) };
-  console.log(name.padEnd(28), m.toFixed(2).padStart(10), c.toFixed(2).padStart(10), JSON.stringify(a[0]));
+  const t = rounds([() => timed(() => mem.run(q)), () => timed(() => csr.run(q))]);
+  const [m, c] = t.ms as [number, number];
+  results[name] = { memory: +m.toFixed(3), csr: +c.toFixed(3), ratio: +t.ratio[1]!.toFixed(2) };
+  console.log(name.padEnd(28), m.toFixed(3).padStart(10), c.toFixed(3).padStart(10), `${t.ratio[1]!.toFixed(2)}x`.padStart(8), ` ${JSON.stringify(a[0])}`);
 }
 mkdirSync('bench/results', { recursive: true });
 const file = `bench/results/${new Date().toISOString().slice(0, 10)}.local.json`;
-writeFileSync(file, JSON.stringify({ date: new Date().toISOString(), node: process.version, people: PEOPLE, nodes: st.nodes, rels: st.rels, runs: RUNS, loadMs, csrMs, results }, null, 2));
+writeFileSync(file, JSON.stringify({ date: new Date().toISOString(), node: process.version, people: PEOPLE, nodes: st.nodes, rels: st.rels, rounds: ROUNDS, loadMs, csrMs, results }, null, 2));
 console.log(`\nwrote ${file}`);
 
 // History: the network loaded with its growth, a commit per person.

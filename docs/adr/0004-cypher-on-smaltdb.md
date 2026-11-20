@@ -295,6 +295,13 @@ every query and write of its benchmarks (`npm run bench:smaltdb`, `BENCH_ENTRY=b
 bench:smaltdb`), at 20,000 people. Where smaltdb stays slower, the case comes to the owner with the profile that says
 why, and the significant benefit other than speed that pays for it; the owner accepts or refuses each such case.
 
+The owner added (2026-11-20, stenhoor/smaltdb#274): statements that differ each time count too
+(`BENCH_ENTRY=bench/vary.ts npm run bench:smaltdb`: every query and write that has a value to differ in, with the
+value as a literal and as a parameter). The first two benchmarks run one text again and again, which smaltdb answers
+from the statement it kept; an application's statements differ, and there smaltdb was furthest behind. smaltcy's
+engine on its `MemoryStore` stays the bar; its `CsrStore`'s times are reported beside it. How a time and a ratio are
+taken, and the baseline before that work: docs/research/benchmarks.md, "Method" and "Statements that differ".
+
 ## Consequences
 
 - Reads compile now (58 of the 59 read cases); `keys()` (below) is refused. Writes run (all 14 write cases, and the
