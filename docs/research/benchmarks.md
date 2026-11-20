@@ -425,8 +425,9 @@ What it says:
   smaltdb's work on each row (3 hops 2.02 and 2.00, a shortest path that isn't there 2.29 and 2.81): steps 2 and 3.
 - **When the text repeats**, the short queries no longer compile their Cypher to a plan and find their statement by
   the plan's text on every run: the seek 2.52 to 1.04, the shortest path 3.14 to 0.95, 1 hop 3.33 to 1.89, no path
-  (directed) 4.92 to 1.91. The other queries are unchanged: over three runs of this change their ratios fall on both
-  sides of the baseline's (3 hops 2.73, 3.06 and 2.94 against 2.89; the label scan 2.15, 2.07 and 2.31 against 2.17).
+  (directed) 4.92 to 1.91, 2 hops 3.22 to 2.58. The other queries are unchanged: over three runs of this change
+  their ratios fall on both sides of the baseline's (3 hops 2.73, 3.06 and 2.94 against 2.89; the label scan 2.15,
+  2.07 and 2.31 against 2.17).
 - **A write that finds its rows by a parameter** lost its 55 ms scan: create 1 relationship 63.8 to 2.67 ms, set 1
   property 56.7 to 0.68, merge existing 60.6 to 0.10.
 - **A write whose values differ** plans fewer statements: merge existing 28.3 to 6.62 times smaltcy's time (0.529
