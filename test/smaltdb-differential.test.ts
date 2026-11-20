@@ -530,6 +530,55 @@ describe('comparisons with literals: both engines give the same rows', () => {
 });
 
 /**
+ * A parameter is compared as a literal of its kind is (a string, a whole number, a float): the same rows as smaltcy's
+ * engine for a value of every kind, and a seek with an index on the property.
+ */
+describe('comparisons with parameters: both engines give the same rows', () => {
+  const g = open();
+  g.run(KINDS);
+  const { db, tables } = both(g);
+  const values: [string, unknown][] = [
+    ['1', 1],
+    ['0', 0],
+    ['-0.0', -0],
+    ['1.5', 1.5],
+    ["'1'", '1'],
+    ["'a'", 'a'],
+    ["'true'", 'true'],
+    ['the largest whole number held exactly', 9007199254740991],
+    ['a whole number past it', 1e300],
+    ['NaN', NaN],
+    ['infinity', Infinity],
+    ['true', true],
+    ['null', null],
+  ];
+  const cases: [string, string][] = [
+    ['=, <> and the orderings', 'MATCH (n:T) RETURN n.k AS k, n.v = $x AS a, $x = n.v AS b, n.v <> $x AS c, n.v < $x AS d, n.v >= $x AS e, $x < n.v AS f ORDER BY k'],
+    ['= in WHERE', 'MATCH (n:T) WHERE n.v = $x RETURN n.k AS k ORDER BY k'],
+    ['a property map', 'MATCH (n:T {v: $x}) RETURN n.k AS k ORDER BY k'],
+    ['> in WHERE', 'MATCH (n:T) WHERE n.v > $x RETURN n.k AS k ORDER BY k'],
+    ['<= in WHERE', 'MATCH (n:T) WHERE $x >= n.v RETURN n.k AS k ORDER BY k'],
+  ];
+  const all = values.flatMap(([name, x]) => cases.map(([what, cypher]): [string, string, unknown] => [`${what}, with ${name}`, cypher, x]));
+  test.each(all)('%s', (_name, cypher, x) => {
+    expect(onSmaltdb(db, tables, cypher, { x })).toEqual(g.query(cypher, { x }));
+  });
+  test('with an index on the property: the same rows, and smaltdb seeks with it', () => {
+    const h = open();
+    h.run(KINDS);
+    h.run("UNWIND range(1, 500) AS i CREATE (:U {k: 'filler', v: i + 1000})");
+    const { db: idb, tables: it } = both(h);
+    runOnSmaltdb(idb, compile('CREATE INDEX FOR (n:T) ON (n.v)').plan, it);
+    for (const [name, cypher, x] of all) expect(onSmaltdb(idb, it, cypher, { x }), name).toEqual(h.query(cypher, { x }));
+    for (const x of [1, 1.5, 'a']) {
+      const q = compileQuery(compile('MATCH (n:T) WHERE n.v = $x RETURN n.k AS k').plan, it, { params: { x } });
+      const explained = idb.queryPlan({ kind: 'explain', mode: 'plan', query: q.statement } as never, [x]).rows.map((r) => r.join(' '));
+      expect(explained.some((line) => line.includes('USING INDEX graph_ix_')), String(x)).toBe(true);
+    }
+  });
+});
+
+/**
  * A generated network (`network(300)`): the compiled MATCHes (join regions, unions of edge tables, nodes only a
  * relationship reaches, paths from each row, shortest paths by a search) give smaltcy's rows. Cypher leaves the order
  * of rows open without ORDER BY, and the two engines' orders differ where groups or paths are found in another order,

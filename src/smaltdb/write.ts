@@ -44,7 +44,7 @@ import type { GraphTables } from './schema.js';
 import { NODE_LABEL } from './schema.js';
 import {
   and, asOfOf, call, caseWhen, colRef, COMMITS_TABLE, Compiler, compileQuery, eq, HOPS, IDS, isNull, lit, noHistory, NULL, or,
-  paramValues, PROPS, Unsupported, type AsOf, type Binding, type Frame, type Rel, type Val,
+  paramsRead, paramValues, PROPS, Unsupported, type AsOf, type Binding, type Frame, type Rel, type Val,
 } from './compile.js';
 
 type PlanOp = plan.PlanOp;
@@ -391,7 +391,7 @@ class Runner {
   }
 
   private exec(c: Compiler, stmt: PlanStatementInput): unknown[][] {
-    const r = this.db.queryPlan(stmt, paramValues({ statement: stmt, columns: [], params: c.paramNames }, this.params));
+    const r = this.db.queryPlan(stmt, paramValues({ statement: stmt, columns: [], params: paramsRead(stmt, c.paramNames) }, this.params));
     return r.rows.map((row) => [...row]);
   }
 
