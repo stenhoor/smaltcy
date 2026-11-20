@@ -26,5 +26,8 @@ export default defineConfig({
     // The tests share no state between files (each builds its own graphs), so one worker runs them all: about three
     // times faster than a fresh worker per file.
     isolate: false,
+    // smaltdb's test setting for graph indexes (its ADR 0040): every index is compared with its tables after each
+    // statement that writes, and every query that read one is run again without it and must give the same rows.
+    env: { SMALT_GRAPH_INDEX_CHECK: '1' },
   },
 });

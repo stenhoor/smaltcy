@@ -2,8 +2,7 @@
  * The same queries as bench/run.ts on smaltcy's MemoryStore and on smaltdb (the compiler to smaltdb plans, ADR 0004;
  * smaltdb ADR 0033 step 8), over the same generated network. Rows must agree; times are medians and include compiling
  * the Cypher, as Graph.run's include parsing and planning. `npm run bench:smaltdb`; BENCH_PEOPLE, BENCH_ROUNDS
- * (bench/timing.ts), BENCH_BRANCHES (the compiler's `maxBranches`) and BENCH_INDEXES (smaltcy's property indexes on
- * smaltdb too) size and shape it. Every query here is one text run again and again; bench/vary.ts runs statements that
+ * (bench/timing.ts) and BENCH_INDEXES (smaltcy's property indexes on smaltdb too) size and shape it. Every query here is one text run again and again; bench/vary.ts runs statements that
  * differ each time. Method: docs/research/benchmarks.md.
  */
 import { writeFileSync, mkdirSync } from 'node:fs';
@@ -13,7 +12,6 @@ import { network } from '../src/datasets/index.js';
 import { dumpGraph } from '../src/engine/io.js';
 import { open } from '../src/index.js';
 import { graphTablesFor, loadStatements, schemaStatements } from '../src/smaltdb/schema.js';
-import { compileQuery } from '../src/smaltdb/compile.js';
 import { indexStatement, runOnSmaltdb } from '../src/smaltdb/write.js';
 import { QUERIES } from './queries.js';
 import { METHOD, ROUNDS, rounds, timed } from './timing.js';
@@ -42,14 +40,8 @@ console.log(`network(${PEOPLE}): ${st.nodes} nodes, ${st.rels} relationships; sm
 console.log(`${METHOD} (each run includes compiling the Cypher)\n`);
 console.log('query'.padEnd(28), 'smaltcy'.padStart(10), 'smaltdb'.padStart(10), 'ratio'.padStart(8), ' rows');
 
-// As an application runs a query (`runOnSmaltdb`); with BENCH_BRANCHES, compiled here with the compiler's maxBranches
-// (how many join regions a pattern may split into).
-const branches = process.env.BENCH_BRANCHES ? { maxBranches: Number(process.env.BENCH_BRANCHES) } : undefined;
-const onDb = (cypher: string) => {
-  if (!branches) return [...runOnSmaltdb(db, compile(cypher).plan, tables).rows] as unknown[];
-  const q = compileQuery(compile(cypher).plan, tables, branches);
-  return [...db.queryPlan(q.statement).rows] as unknown[];
-};
+// As an application runs a query (`runOnSmaltdb`).
+const onDb = (cypher: string) => [...runOnSmaltdb(db, compile(cypher).plan, tables).rows] as unknown[];
 const results: Record<string, { smaltcy: number; smaltdb: number | null; ratio?: number; note?: string }> = {};
 for (const [name, q] of QUERIES) {
   const a = [...mem.run(q).rows] as unknown[];

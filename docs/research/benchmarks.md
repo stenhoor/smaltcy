@@ -478,3 +478,156 @@ smaltcy's.
 
 In the same run the hops that go either way were at 1.50x (1 hop), 2.62x (2 hops) and 3.20x (3 hops): the new cases
 are further from the bar than the ones the benchmark had.
+
+## smaltdb's graph index, and shortest paths to a target (2026-11-20)
+
+Step 2 of the work in stenhoor/smaltdb#274 (smaltdb's ADR 0040), in two parts, each measured before it was kept:
+
+- **2a, in smaltdb (`8904484`):** a property graph's relationships are kept in memory by node, and a plan that reads an
+  edge table by its start or end reads them there instead of descending the endpoint index. Nothing changed here.
+- **2c, in smaltdb (`95189f6`) and here:** smaltdb's `paths` takes a `target` and, over a property graph, is a
+  breadth-first search the engine runs itself. `shortestPath` here is now that, where it was an `iterate` of its own.
+
+The same machine and method as above; "step 1" is the section "Statements kept by shape". The smaltdb commits named are
+those measured; both changes were since rebased onto smaltdb's `main` (`ffdeacd`), unchanged. A ratio is smaltdb's time over smaltcy's.
+
+**The same text every run** (`BENCH_INDEXES=1 npm run bench:smaltdb`):
+
+| Query | Step 1 | With 2a | With 2c | smaltcy, smaltdb with 2c (ms) |
+|---|---|---|---|---|
+| seek by name | 1.04x | 1.07x | 1.04x | 0.017, 0.018 |
+| 1 hop | 1.89x | 1.28x | 1.32x | 0.032, 0.044 |
+| 2 hops | 2.58x | 1.51x | 1.58x | 0.313, 0.531 |
+| 3 hops | 2.94x | 1.68x | 1.59x | 3.889, 6.388 |
+| var-length 1..3, distinct | 1.05x | 0.58x | 0.63x | 10.990, 7.206 |
+| shortest path | 0.95x | 0.89x | 0.88x | 0.042, 0.038 |
+| shortest path, 5 hops | 1.36x | 0.86x | 0.16x | 28.892, 5.062 |
+| shortest path, none (out) | 1.91x | 1.55x | 1.20x | 0.029, 0.033 |
+| shortest path, none (all) | 2.53x | 1.25x | 0.25x | 30.554, 7.439 |
+| label scan + filter | 2.31x | 2.39x | 2.07x | 2.130, 4.473 |
+| group by city | 2.62x | 3.12x | 3.18x | 16.947, 58.388 |
+| all relationships | 0.41x | 0.46x | 0.49x | 13.117, 6.663 |
+| triangles (bounded) | 2.24x | 2.04x | 2.09x | 11.054, 25.822 |
+
+**Statements that differ** (`BENCH_ENTRY=bench/vary.ts npm run bench:smaltdb`; a literal, a parameter; with 2c only
+the path cases were run again):
+
+| Statement | Step 1 | With 2a | With 2c |
+|---|---|---|---|
+| seek by name | 1.15x, 1.04x | 1.19x, 1.10x | |
+| 1 hop | 0.91x, 0.84x | 0.81x, 0.93x | |
+| 2 hops | 1.22x, 1.29x | 0.91x, 0.82x | |
+| 3 hops | 2.02x, 2.00x | 1.15x, 1.41x | |
+| var-length 1..3, distinct | 0.96x, 0.97x | 0.61x, 0.62x | 0.65x, 0.68x |
+| shortest path | 0.62x, 0.96x | 0.49x, 0.67x | 0.13x, 0.18x |
+| shortest path, directed | 1.50x, 1.63x | 1.13x, 1.22x | 1.03x, 0.90x |
+| shortest path, none | 2.29x, 2.81x | 1.28x, 1.24x | 0.28x, 0.29x |
+
+**Writes: the index kept against no index** (two smaltdb databases taking turns, one opened with `graphIndexMem: 0`;
+the index built before the first write and still the first build after the last; ms):
+
+| Write | No index | The index kept | Ratio |
+|---|---|---|---|
+| create 1 node | 0.560 | 0.550 | 1.00x |
+| create 1,000 nodes | 10.574 | 10.474 | 1.04x |
+| create 1 relationship | 1.615 | 1.584 | 1.00x |
+| create 1,000 relationships | 18.315 | 17.554 | 0.98x |
+| set 1 property by name | 0.074 | 0.073 | 1.01x |
+| set 1,000 properties | 8.879 | 8.815 | 1.02x |
+| merge existing node | 0.060 | 0.060 | 1.00x |
+| delete 1 node | 0.142 | 0.142 | 0.99x |
+| delete 1,000 nodes | 16.736 | 14.165 | 0.84x |
+| delete 1,000 relationships and their nodes | 19.729 | 17.154 | 0.85x |
+
+What it says:
+
+- **Paths are under smaltcy's times** but for two statements of under 0.15 ms (shortest path, none (out) 1.20x; a
+  directed shortest path with a literal 1.03x). A search that finds nothing in the people's component went from 2.53
+  to 0.25 times smaltcy's time.
+- **Hops got 1.4 to 1.9 times faster and are still over** (1.3x to 1.6x with the same text). What is left is the
+  `iterate` this compiler puts around a hop that may go either way, and the row a directed hop fetches: smaltdb's ADR
+  0040 measures both and proposes a `relationships` operation for them (its step 2b).
+- **No write is slower with the index**, and deletes are faster: the check that a node has no relationships reads the
+  index.
+- **Group by city did not change**: its plan reads no graph index, and prepared it takes 65.9 ms with the index and
+  67.0 without. Its ratio moves between runs with smaltcy's own time (17 to 28 ms in these runs).
+- **Where a statement of a few hundredths of a millisecond spends its time** (µs, in turns): the directed search
+  with no path, smaltcy 30.8, smaltdb 32.0: 13.2 to turn the Cypher into its plan, which both engines do, and 20.2 to
+  find the kept statement by its shape and run it, of which the prepared statement is 9.4. The seek by name, smaltcy
+  11.4, smaltdb 15.7: 5.4 and 10.0, of which the prepared statement is 3.2. 1 hop, smaltcy 28.9, smaltdb 41.6: 7.4 and
+  33.4, of which the prepared statement is 24.6. So for the smallest statements, finding the statement by its shape
+  costs more than running it.
+- **Building the index** takes smaltdb 13.9 ms for the network's 60,025 relationships (191.5 ms for 599,834, a network
+  of 200,000 people), on the first statement that reads the graph. It takes 39 to 55 bytes per relationship.
+
+## Hops as relationships (2026-11-20)
+
+Step 2b of stenhoor/smaltdb#274 (smaltdb's ADR 0040, section 2.2). smaltdb has a `relationships` operation: a graph's
+relationships as a relation that is read from either end. A hop here is now one of them, a FROM item of the pattern's
+join region, where it was a union of edge tables, an `iterate` of one step from each row, or a scan that fetched every
+relationship's row. Two more changes came with it: a far node of which only labels are asked is no longer read from
+the node table, and the properties of a relationship nothing reads are not asked for.
+
+The same machine and method. smaltdb at `8cc47b3` (steps 2a, 2c and 2b on its `main`), and with stenhoor/smaltdb#278
+on top, which is the engine's own: a nested plan's projection leaves out the outputs nothing reads. "Before" is the
+section above (with 2c), and for the four cases added since, the run with 2a in "More hop cases". A ratio is smaltdb's
+time over smaltcy's.
+
+**The same text every run** (`BENCH_INDEXES=1 npm run bench:smaltdb`):
+
+| Query | Before | With 2b | With 2b and #278 | smaltcy, smaltdb with both (ms) |
+|---|---|---|---|---|
+| seek by name | 1.04x | 1.04x | 1.07x | 0.017, 0.019 |
+| 1 hop | 1.32x | 0.96x | 0.79x | 0.031, 0.026 |
+| 2 hops | 1.58x | 0.85x | 0.35x | 0.333, 0.120 |
+| 3 hops | 1.59x | 0.85x | 0.30x | 4.140, 1.231 |
+| 1 hop, directed | 2.39x | 1.03x | 0.86x | 0.028, 0.024 |
+| 3 hops, directed | 2.55x | 0.66x | 0.26x | 2.223, 0.576 |
+| 2 hops to a label | 4.44x | 2.26x | 2.09x | 0.717, 1.481 |
+| 2 hops, relationship filter | 3.44x | 2.86x | 2.57x | 0.548, 1.406 |
+| var-length 1..3, distinct | 0.63x | 0.64x | 0.69x | 10.667, 6.973 |
+| shortest path | 0.88x | 0.85x | 0.89x | 0.035, 0.034 |
+| shortest path, 5 hops | 0.16x | 0.16x | 0.17x | 27.250, 4.857 |
+| shortest path, none (out) | 1.20x | 1.20x | 1.25x | 0.025, 0.032 |
+| shortest path, none (all) | 0.25x | 0.24x | 0.23x | 30.293, 7.351 |
+| label scan + filter | 2.07x | 2.18x | 2.27x | 2.030, 4.561 |
+| group by city | 3.18x | 2.69x | 3.22x | 15.296, 50.800 |
+| all relationships | 0.49x | 0.28x | 0.18x | 13.293, 2.559 |
+| triangles (bounded) | 2.09x | 0.90x | 0.88x | 11.304, 9.922 |
+
+**Statements that differ** (`BENCH_ENTRY=bench/vary.ts npm run bench:smaltdb`; a literal, a parameter). "Before" is
+with 2a for the first three, and the baseline of "More hop cases" (before 2a) for the last three:
+
+| Statement | Before | With 2b | With 2b and #278 |
+|---|---|---|---|
+| 1 hop | 0.81x, 0.93x | 0.68x, 0.80x | 0.70x, 0.80x |
+| 2 hops | 0.91x, 0.82x | 0.68x, 0.67x | 0.46x, 0.50x |
+| 3 hops | 1.15x, 1.41x | 0.74x, 0.76x | 0.33x, 0.37x |
+| 3 hops, directed | 1.82x, 1.52x | 0.58x, 0.64x | 0.48x, 0.51x |
+| 2 hops to a label | 2.50x, 2.36x | 1.30x, 1.12x | 1.10x, 1.17x |
+| 2 hops, relationship filter | 1.76x, 1.74x | 1.38x, 1.36x | 1.49x, 1.51x |
+
+What it says:
+
+- **Hops and triangles are under smaltcy's times,** in the three ways they are measured. With 2b alone the two
+  smallest, 1 hop and 1 hop directed with the same text, are at the bar (0.96x and 1.03x: a microsecond either way
+  on 30); with #278 they are under it (0.79x and 0.86x).
+- **Most of a hop's time was the pattern's row.** The compiler projects every column of a pattern (each node's id
+  and properties, each relationship's five columns) and a query such as `count(f)` reads one. Prepared, 3 hops take
+  3.44 ms with 2b and 1.06 ms once smaltdb leaves the unread outputs out; 2 hops 0.263 and 0.085 ms.
+- **Two of the added cases are still over,** and for reasons the hop itself doesn't have:
+  - **A hop to a labelled node** (2.09x; 1.10x and 1.17x): each far node's label is one probe of the label index's
+    B+tree, about a microsecond, where smaltcy's store asks a set. Prepared, the query takes 1.84 ms with the label
+    and 0.26 ms without it, for 1,505 far nodes. smaltdb's ADR 0040 provides for this: the graph index also holds
+    each node's labels.
+  - **A hop filtered on a relationship's property** (2.57x; 1.49x and 1.51x): each of the 1,610 relationships at the
+    second hop has its row fetched for `since`, a B+tree seek and a read of its map. Prepared, 1.69 ms. That is the
+    subject of the issue's step 5 (properties kept in memory).
+- **All relationships got faster** (6.66 ms with 2c, 4.42 with 2b, 2.56 with #278): its scan no longer reads the
+  properties column, and its unread columns are no longer computed.
+- **Group by city, the label scan and the seek by name did not change** beyond what smaltcy's own time moves their
+  ratios between runs: smaltdb's group by city took 58.4, 53.7 and 50.8 ms in the three runs, smaltcy's 16.9, 18.4
+  and 15.3.
+- **A pattern bound at its far end** is read from that end: `MATCH (f)-[:KNOWS]->(p:Person {name: 'Bo 1'}) RETURN
+  f.name` finds `p` by name, then its relationships by their `other` column (`SEARCH RELATIONSHIPS OF graph
+  (other=?)` in smaltdb's EXPLAIN), then each `f` by id.
