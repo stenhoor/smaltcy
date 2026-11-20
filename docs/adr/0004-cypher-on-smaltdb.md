@@ -42,40 +42,31 @@ variable-length relationship's list one, its hops (`list<struct<edge int, rowid 
 `paths` type, with `edge` the type's position in the graph and the hops read in the pattern's direction); a path two
 (its first node and its hops); any other value is one column with a static type, or `any` when only the value knows.
 
-**Patterns.** A MATCH is one smaltdb join region: a flat join of bare table scans, which smaltdb's planner orders and
-can seek into with the tables' indexes (the edge tables' `start` and `end`, the node table's rowid, the label index),
-with all its conditions over their columns and the row's columns in one projection on top. Its FROM items are the
-input (when there is one: the first MATCH has none), a scan of the node table for each new node and of the label index
-for each of its labels (an inner join: the index is unique on label and node, so it never repeats a node), and a scan
-of an edge table for each relationship, joined on the end that is bound, then the node table on the other end. A
-relationship of several types (no type: all of them), or with no direction, is the union of its types' edge tables,
-each read as the pattern reads it (with no direction, both ways, a self-loop once, as smaltcy's stores expand it).
-smaltdb can't seek into a union, so where one end is bound such a relationship is a **hop from each row**: the region
-before it is finished (run once), then smaltdb's `iterate`, run for one step (`maxDepth` 1, the rows of the region its
-initial rows, dropped after), has a step per type and reading that joins the rows (`working`, which smaltdb's planner
-reads a row at a time) with the edge table on the bound end, so smaltdb seeks its `start` or `end` index for each row
-(the index named, `indexedBy`, outside `AT VERSION`: the planner estimates a seek by the rows per value, which for an
-end few relationships share, a city, is more than a scan); in the same step it checks the far end when it is bound,
-Cypher's uniqueness against the pattern's relationships before it, and reads the far node by id and its labels from
-the label index, unless only the relationship reaches it. A new region starts from those rows, and every later hop
-from a node a hop from a row reached is one too (smaltdb doesn't know how many rows such a region has, and would scan
-an edge table whole). Ends and properties of a relationship nothing reads are NULL, and then the step reads the edge
-table's index alone where it covers the other end (smaltdb's `(start, end)` and `(end, start)`). The `iterate` keeps a
-row for each hop, so it carries only the columns that differ between rows: those that are the same literal on every
-row (the NULL ends and properties, a relationship's one type) are put back after it. With the order kept, rows are
-sorted by the region's row, then the type and reading, then rowid, the order the union gave. Two exceptions keep the
-union as one FROM item: with neither end bound, and from a node scanned without a property condition (a property map,
-or an equality in WHERE on its properties), or reached from one, where seeking for each of 20,000 rows was slower
-than hashing the union (docs/research/benchmarks.md). When the first relationship has neither end bound and the order
-of rows doesn't show, the pattern starts at a relationship with a bound end, else scans its node with a property
-condition first (else with labels, else the first relationship's `from` node). The compiler can instead split the
-region into one per type and reading (`CompileOptions.maxBranches`), which smaltdb seeks into when the region's start is
-found by an index, but each region repeats the start, and a pattern of k hops read both ways is 2^k regions (below). An
-anonymous node that only a relationship reaches,
-with no labels or properties, that nothing else in the query reads (but its identity: `count(n)`, `id(n)`, which read
-its id), is that relationship's end, not a scan of the node
-table: smaltdb's graph keeps every end a node of the graph. Next to a union of edge tables it is still joined: the
-planner doesn't know a union's rows, and joined two unions with a nested loop in the 3-hop benchmark when it wasn't.
+**Patterns.** A MATCH is one smaltdb join region: a flat join of FROM items, which smaltdb's planner orders by cost
+and seeks into (the node table's rowid, the label index, a node's relationships), with all its conditions over their
+columns and the row's columns in one projection on top. Its FROM items are the input (when there is one: the first
+MATCH has none), a scan of the node table for each new node and of the label index for each of its labels (an inner
+join: the index is unique on label and node, so it never repeats a node), and one item for each relationship:
+smaltdb's `relationships` (its ADR 0040), the graph's relationships as a relation that is read from either end. It is
+given the relationship's types (no type: all of them) and its direction as read from the pattern's end that is bound
+(with no direction, both ways, a self-loop once, as smaltcy's stores expand it); its `node` column is that end and
+its `other` column the far end. So a hop is one join, whatever its direction and however many types it may be, and
+smaltdb reads the relationships at a node for each row before it, from whichever end those rows give, or all of them
+once, by cost. Two things are left out of it:
+
+- A relationship of one type read one way, with neither end bound, is a scan of its type's table, which smaltdb reads
+  whole faster (a count of 40,025 relationships filtered on a property, prepared: 5.6 ms against 17.6 ms).
+- The properties of a relationship nothing reads are NULL, so smaltdb doesn't read its row.
+
+With the order kept, rows are sorted by the region's row, then the reading (forward first), the type and the rowid,
+as smaltcy's stores give them. An anonymous node that only a relationship reaches, with no labels or properties, that
+nothing else in the query reads (but its identity: `count(n)`, `id(n)`, which read its id), is that relationship's
+end, not a scan of the node table: smaltdb's graph keeps every end a node of the graph. A node of which only labels
+are asked is that end and an entry of the label index for each label: smaltdb keeps the index's entries nodes of the
+graph too. Until 2026-11-20 a relationship of several types, or with no direction, was a union of its types' edge
+tables, or from a bound end an `iterate` of one step from each row, and `CompileOptions.maxBranches` could split a
+pattern into a region per type and reading; `relationships` replaced the three (docs/research/benchmarks.md, "Hops
+as relationships").
 Within one MATCH, relationships are distinct (Cypher's uniqueness): two relationships whose types can be the same must
 differ in type or rowid, and a variable-length relationship's hops must not hold the others' (a subquery over its
 hops); two variable-length relationships of types that can be the same in one MATCH are refused.
@@ -313,10 +304,9 @@ commit's moment with `AT TIME` on both, before and after `forget`. The index tes
 after an index exists and checks smaltdb's catalog. Two more sets compare rows on both engines: properties of every kind
 compared with string and number literals (with and without an index on the property, which EXPLAIN shows smaltdb seeks
 with), and a generated network (`network(300)`), on which the compiled patterns (unions of edge tables, hops from a row,
-anonymous ends, paths from each row, shortest paths by a search) give smaltcy's rows in any order. The network's
-queries and the relationship cases run both with one join region per MATCH and with a region per type and reading
-(`maxBranches`); the relationship cases include hops from a row from either end, to a bound node, after a label, before
-a hop of one type, in `collect()` and under a LIMIT, in the order smaltcy gives.
+anonymous ends, paths from each row, shortest paths by a search) give smaltcy's rows in any order. The relationship
+cases include hops from either end, to a bound node, after a label, before a hop of one type, in `collect()` and under
+a LIMIT, in the order smaltcy gives.
 
 ## The bar for switching (smaltdb ADR 0033, step 9)
 

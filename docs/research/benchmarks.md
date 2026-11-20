@@ -559,3 +559,75 @@ What it says:
   costs more than running it.
 - **Building the index** takes smaltdb 13.9 ms for the network's 60,025 relationships (191.5 ms for 599,834, a network
   of 200,000 people), on the first statement that reads the graph. It takes 39 to 55 bytes per relationship.
+
+## Hops as relationships (2026-11-20)
+
+Step 2b of stenhoor/smaltdb#274 (smaltdb's ADR 0040, section 2.2). smaltdb has a `relationships` operation: a graph's
+relationships as a relation that is read from either end. A hop here is now one of them, a FROM item of the pattern's
+join region, where it was a union of edge tables, an `iterate` of one step from each row, or a scan that fetched every
+relationship's row. Two more changes came with it: a far node of which only labels are asked is no longer read from
+the node table, and the properties of a relationship nothing reads are not asked for.
+
+The same machine and method. smaltdb at `8cc47b3` (steps 2a, 2c and 2b on its `main`), and with stenhoor/smaltdb#278
+on top, which is the engine's own: a nested plan's projection leaves out the outputs nothing reads. "Before" is the
+section above (with 2c), and for the four cases added since, the run with 2a in "More hop cases". A ratio is smaltdb's
+time over smaltcy's.
+
+**The same text every run** (`BENCH_INDEXES=1 npm run bench:smaltdb`):
+
+| Query | Before | With 2b | With 2b and #278 | smaltcy, smaltdb with both (ms) |
+|---|---|---|---|---|
+| seek by name | 1.04x | 1.04x | 1.07x | 0.017, 0.019 |
+| 1 hop | 1.32x | 0.96x | 0.79x | 0.031, 0.026 |
+| 2 hops | 1.58x | 0.85x | 0.35x | 0.333, 0.120 |
+| 3 hops | 1.59x | 0.85x | 0.30x | 4.140, 1.231 |
+| 1 hop, directed | 2.39x | 1.03x | 0.86x | 0.028, 0.024 |
+| 3 hops, directed | 2.55x | 0.66x | 0.26x | 2.223, 0.576 |
+| 2 hops to a label | 4.44x | 2.26x | 2.09x | 0.717, 1.481 |
+| 2 hops, relationship filter | 3.44x | 2.86x | 2.57x | 0.548, 1.406 |
+| var-length 1..3, distinct | 0.63x | 0.64x | 0.69x | 10.667, 6.973 |
+| shortest path | 0.88x | 0.85x | 0.89x | 0.035, 0.034 |
+| shortest path, 5 hops | 0.16x | 0.16x | 0.17x | 27.250, 4.857 |
+| shortest path, none (out) | 1.20x | 1.20x | 1.25x | 0.025, 0.032 |
+| shortest path, none (all) | 0.25x | 0.24x | 0.23x | 30.293, 7.351 |
+| label scan + filter | 2.07x | 2.18x | 2.27x | 2.030, 4.561 |
+| group by city | 3.18x | 2.69x | 3.22x | 15.296, 50.800 |
+| all relationships | 0.49x | 0.28x | 0.18x | 13.293, 2.559 |
+| triangles (bounded) | 2.09x | 0.90x | 0.88x | 11.304, 9.922 |
+
+**Statements that differ** (`BENCH_ENTRY=bench/vary.ts npm run bench:smaltdb`; a literal, a parameter). "Before" is
+with 2a for the first three, and the baseline of "More hop cases" (before 2a) for the last three:
+
+| Statement | Before | With 2b | With 2b and #278 |
+|---|---|---|---|
+| 1 hop | 0.81x, 0.93x | 0.68x, 0.80x | 0.70x, 0.80x |
+| 2 hops | 0.91x, 0.82x | 0.68x, 0.67x | 0.46x, 0.50x |
+| 3 hops | 1.15x, 1.41x | 0.74x, 0.76x | 0.33x, 0.37x |
+| 3 hops, directed | 1.82x, 1.52x | 0.58x, 0.64x | 0.48x, 0.51x |
+| 2 hops to a label | 2.50x, 2.36x | 1.30x, 1.12x | 1.10x, 1.17x |
+| 2 hops, relationship filter | 1.76x, 1.74x | 1.38x, 1.36x | 1.49x, 1.51x |
+
+What it says:
+
+- **Hops and triangles are under smaltcy's times,** in the three ways they are measured. With 2b alone the two
+  smallest, 1 hop and 1 hop directed with the same text, are at the bar (0.96x and 1.03x: a microsecond either way
+  on 30); with #278 they are under it (0.79x and 0.86x).
+- **Most of a hop's time was the pattern's row.** The compiler projects every column of a pattern (each node's id
+  and properties, each relationship's five columns) and a query such as `count(f)` reads one. Prepared, 3 hops take
+  3.44 ms with 2b and 1.06 ms once smaltdb leaves the unread outputs out; 2 hops 0.263 and 0.085 ms.
+- **Two of the added cases are still over,** and for reasons the hop itself doesn't have:
+  - **A hop to a labelled node** (2.09x; 1.10x and 1.17x): each far node's label is one probe of the label index's
+    B+tree, about a microsecond, where smaltcy's store asks a set. Prepared, the query takes 1.84 ms with the label
+    and 0.26 ms without it, for 1,505 far nodes. smaltdb's ADR 0040 provides for this: the graph index also holds
+    each node's labels.
+  - **A hop filtered on a relationship's property** (2.57x; 1.49x and 1.51x): each of the 1,610 relationships at the
+    second hop has its row fetched for `since`, a B+tree seek and a read of its map. Prepared, 1.69 ms. That is the
+    subject of the issue's step 5 (properties kept in memory).
+- **All relationships got faster** (6.66 ms with 2c, 4.42 with 2b, 2.56 with #278): its scan no longer reads the
+  properties column, and its unread columns are no longer computed.
+- **Group by city, the label scan and the seek by name did not change** beyond what smaltcy's own time moves their
+  ratios between runs: smaltdb's group by city took 58.4, 53.7 and 50.8 ms in the three runs, smaltcy's 16.9, 18.4
+  and 15.3.
+- **A pattern bound at its far end** is read from that end: `MATCH (f)-[:KNOWS]->(p:Person {name: 'Bo 1'}) RETURN
+  f.name` finds `p` by name, then its relationships by their `other` column (`SEARCH RELATIONSHIPS OF graph
+  (other=?)` in smaltdb's EXPLAIN), then each `f` by id.

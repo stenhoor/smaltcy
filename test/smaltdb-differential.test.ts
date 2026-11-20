@@ -335,12 +335,6 @@ describe('relationships: both engines give the same rows', () => {
     expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
   });
 
-  // A relationship of several types, or read both ways, as a join region per type and reading (a union of them)
-  // rather than one region joining the union of its edge tables: the same rows, in the same order.
-  test.each(REL_CASES)('%s, in a region per type and reading', (_name, cypher) => {
-    expect(onSmaltdb(db, tables, cypher, {}, { maxBranches: 16 })).toEqual(g.query(cypher));
-  });
-
   // Ordered by lists too (Cypher's order of lists, element by element).
   test.each([
     ['variable length: trails', "MATCH (x {k: 'a'})-[rs:R*]->(y) RETURN y.k AS y, [r IN rs | r.w] AS ws ORDER BY y, ws"],
@@ -632,7 +626,6 @@ describe('a generated network: both engines give the same rows', () => {
     const rows = g.query(cypher);
     expect(rows.length).toBeGreaterThan(0);
     expect(norm(onSmaltdb(db, tables, cypher))).toEqual(norm(rows));
-    expect(norm(onSmaltdb(db, tables, cypher, {}, { maxBranches: 16 }))).toEqual(norm(rows));
   });
 
   test('a match whose order shows nowhere asks smaltdb for none', () => {
@@ -640,6 +633,31 @@ describe('a generated network: both engines give the same rows', () => {
     expect(plan).not.toContain('"ordered"');
     expect(plan).not.toContain('"sort"');
     expect(plan).not.toContain('"window"');
+  });
+
+  test("a hop is one of smaltdb's relationships, whatever its direction and types", () => {
+    const planOf = (cypher: string) => JSON.stringify(compileQuery(compile(cypher).plan, tables).statement);
+    const count = (plan: string, part: string) => plan.split(part).length - 1;
+    // Either way, and of any type: one FROM item each, with no union of tables and no search around it.
+    for (const cypher of ["MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-()-[r]-(f) RETURN count(f) AS n", "MATCH (p:Person {name: 'Bo 1'})<-[:KNOWS|LIVES_IN]-()-[:KNOWS]->(f) RETURN count(f) AS n"]) {
+      const plan = planOf(cypher);
+      expect(count(plan, '"op":"relationships"')).toBe(2);
+      expect(plan).not.toContain('"op":"iterate"');
+      expect(plan).not.toContain('"op":"setop"');
+    }
+    expect(planOf("MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]->(f) RETURN count(f) AS n")).toContain(`"op":"relationships","graph":"${tables.graph}","direction":"out","types":["KNOWS"]`);
+    // Read from the end that is bound: here the pattern's `to` end, so the relationship is read as it comes in.
+    expect(planOf("MATCH (p:Person {name: 'Bo 1'}) MATCH (f)-[:KNOWS]->(p) RETURN count(f) AS n")).toContain('"direction":"in"');
+    // One type, one way, neither end bound: its table.
+    const all = planOf('MATCH ()-[r:KNOWS]->() RETURN count(r) AS n');
+    expect(all).not.toContain('"op":"relationships"');
+    expect(all).toContain(`"table":"${tables.types.get('KNOWS')}"`);
+    // A far node whose labels alone are asked for is an entry of the label index, not a row of the node table.
+    const labelled = planOf("MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-()-[:KNOWS]-(f:Person) RETURN count(f) AS n");
+    expect(count(labelled, `"table":"${tables.nodes}"`)).toBe(1);
+    expect(count(labelled, `"table":"${tables.labels}"`)).toBe(2);
+    // Read, it is a row of the node table.
+    expect(count(planOf("MATCH (p:Person {name: 'Bo 1'})-[:KNOWS]-(f:Person) RETURN f.name AS n"), `"table":"${tables.nodes}"`)).toBe(2);
   });
 
   test("a variable-length relationship whose order shows nowhere is a search from each row, and a node only counted isn't read", () => {
