@@ -14,7 +14,7 @@ import { dumpGraph } from '../src/engine/io.js';
 import { open } from '../src/index.js';
 import { graphTablesFor, loadStatements, schemaStatements } from '../src/smaltdb/schema.js';
 import { compileQuery } from '../src/smaltdb/compile.js';
-import { indexStatement } from '../src/smaltdb/write.js';
+import { indexStatement, runOnSmaltdb } from '../src/smaltdb/write.js';
 import { QUERIES } from './queries.js';
 import { METHOD, ROUNDS, rounds, timed } from './timing.js';
 
@@ -42,9 +42,11 @@ console.log(`network(${PEOPLE}): ${st.nodes} nodes, ${st.rels} relationships; sm
 console.log(`${METHOD} (each run includes compiling the Cypher)\n`);
 console.log('query'.padEnd(28), 'smaltcy'.padStart(10), 'smaltdb'.padStart(10), 'ratio'.padStart(8), ' rows');
 
-// BENCH_BRANCHES: the compiler's maxBranches (how many join regions a pattern may split into).
-const branches = process.env.BENCH_BRANCHES ? { maxBranches: Number(process.env.BENCH_BRANCHES) } : {};
+// As an application runs a query (`runOnSmaltdb`); with BENCH_BRANCHES, compiled here with the compiler's maxBranches
+// (how many join regions a pattern may split into).
+const branches = process.env.BENCH_BRANCHES ? { maxBranches: Number(process.env.BENCH_BRANCHES) } : undefined;
 const onDb = (cypher: string) => {
+  if (!branches) return [...runOnSmaltdb(db, compile(cypher).plan, tables).rows] as unknown[];
   const q = compileQuery(compile(cypher).plan, tables, branches);
   return [...db.queryPlan(q.statement).rows] as unknown[];
 };

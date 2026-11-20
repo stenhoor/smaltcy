@@ -42,6 +42,7 @@ import { forEachChild, slotsRead, type Expr } from '../plan/expr.js';
 import { exprsOf, type GraphPlan, type Op, type Pattern, type RemoveItem, type SetItem } from '../plan/ops.js';
 import type { GraphTables } from './schema.js';
 import { NODE_LABEL } from './schema.js';
+import { runByShape, valuesOut } from './shape.js';
 import {
   and, asOfOf, call, caseWhen, colRef, COMMITS_TABLE, Compiler, compileQuery, eq, HOPS, IDS, isNull, lit, noHistory, NULL, or,
   paramsRead, paramValues, PROPS, Unsupported, type AsOf, type Binding, type Frame, type Rel, type Val,
@@ -67,6 +68,8 @@ const emptyCounts = (): WriteCounts => ({ nodesCreated: 0, nodesDeleted: 0, rela
 /** What the runner needs of a smaltdb database: `Database.queryPlan` of `smaltdb/engine` (synchronous). */
 export interface SmaltdbDatabase {
   queryPlan(stmt: PlanStatementInput, params?: readonly unknown[]): { readonly rows: readonly (readonly unknown[])[] };
+  /** `Database.preparePlan`: with it, a query's statement is prepared once for its shape and kept (shape.ts). */
+  preparePlan?(stmt: PlanStatementInput): { result(params?: readonly never[]): { readonly rows: readonly (readonly unknown[])[] } };
   /** Whether a transaction is open (`Database.inTransaction`): a statement with an author or a message needs none. */
   readonly inTransaction?: boolean;
 }
@@ -138,14 +141,21 @@ export function runOnSmaltdb(db: SmaltdbDatabase, gp: GraphPlan, tables: GraphTa
     const asOf = asOfOf(gp, params);
     if (asOf && !tables.history) noHistory();
     const version = asOf ? versionRead(db, tables, asOf) : undefined;
-    const q = compileQuery(gp, tables, { params, ...(version !== undefined ? { asOf: { commit: version } } : {}) });
-    const r = db.queryPlan(q.statement, paramValues(q, params));
+    // By its shape, where it has one that is kept (shape.ts); else compiled as written.
+    let r = runByShape(db, gp, tables, params);
+    if (!r) {
+      const q = compileQuery(gp, tables, { params, ...(version !== undefined ? { asOf: { commit: version } } : {}) });
+      r = { columns: q.columns, rows: db.queryPlan(q.statement, paramValues(q, params)).rows };
+    }
     const read = version ?? (tables.history && !db.inTransaction ? latestVersion(db) : undefined);
-    return { columns: q.columns, rows: r.rows, counts: emptyCounts(), tables, ...(read !== undefined ? { version: read } : {}) };
+    return { columns: r.columns, rows: r.rows, counts: emptyCounts(), tables, ...(read !== undefined ? { version: read } : {}) };
   }
   if (gp.asOf) throw new Unsupported('AT VERSION and AT TIME');
   if (own && db.inTransaction) throw new Unsupported("an author or a message for a statement inside a transaction (give them to the transaction's begin or commit)");
-  const run = new Runner(db, tables, params, options.ids);
+  // The statement with its values as parameters (shape.ts): what the runner then makes of it differs from one
+  // statement of its shape to the next only in parameters and in the rows it writes.
+  const stated = valuesOut(gp, params);
+  const run = new Runner(db, tables, stated.params, options.ids);
   const transaction = (action: string, more: object = {}) => db.queryPlan({ kind: 'transaction', action, ...more } as PlanStatementInput);
   if (own) {
     transaction('begin', { mode: 'deferred', ...(options.author !== undefined ? { author: options.author } : {}), ...(options.message !== undefined ? { message: options.message } : {}) });
@@ -154,7 +164,7 @@ export function runOnSmaltdb(db: SmaltdbDatabase, gp: GraphPlan, tables: GraphTa
   }
   let out: { columns: readonly string[]; rows: unknown[][] };
   try {
-    out = run.statement(gp);
+    out = run.statement(stated.plan);
   } catch (e) {
     if (own) transaction('rollback');
     else {

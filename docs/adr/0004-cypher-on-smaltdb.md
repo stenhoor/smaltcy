@@ -207,6 +207,32 @@ label index, and a match by label stays a semi-join on it. Creating an index tha
 do nothing, as in smaltcy's stores. Indexes don't change results; on a graph that keeps history they don't change its
 versions.
 
+**Statements kept by shape** (`src/smaltdb/shape.ts`; smaltdb's issue 274, step 1). An application's queries differ
+from each other in their values, and a plan with a value written into it is planned by smaltdb from nothing: 0.74 ms
+for a seek that takes 0.06 ms when its text repeats (docs/research/benchmarks.md). So a query that only reads is
+compiled with its strings and numbers taken out, a parameter in each one's place. What is left is its shape. The
+statement smaltdb prepares for a shape (`Database.preparePlan`) is kept, 256 shapes a database, and run with each
+query's values.
+
+- **A parameter is compared as a literal of its kind is** (`paramKind`): a string, a whole number JavaScript holds
+  exactly, or a float that isn't whole or NaN compiles to the plain comparison, which smaltdb seeks with an index and
+  checks on a row's stored bytes before it decodes the row (for a parameter since smaltdb `1c2fce8`). The plan is then
+  for values of those kinds, so a shape holds the kind of every value taken out and of every parameter given: a value
+  of another kind is another statement.
+- **What stays in a shape:** NULL, booleans and every other literal; SKIP and LIMIT with their values, which the
+  compiler checks as it compiles; the graph's labels and types with their tables.
+- **Not kept:** a query that reads the past (its version is found before it is compiled), and one with more than 64
+  values. Where the compiler needs a value written out (the direction and type of `degree()`), it refuses the query
+  with its values taken out, and that shape is compiled as written from then on, as every query was before.
+- **Writes** run with their statement's values as parameters too (`valuesOut`), so the queries the runner makes for
+  one statement and for the next of its shape are the same to smaltdb, which keeps them by their text. The rows the
+  runner itself holds (the ids it found, the values it computed, the rows it appends) are still written into its
+  statements: each of those is planned again. That, and the scans that find the largest ids, are the write path's
+  own cost and step 4 of the issue's plan.
+- **A kept statement keeps its plan** until smaltdb plans it again (a schema change, or a table four times larger or
+  smaller). A statement planned anew each time follows the data more closely: one case measures slower for it
+  (docs/research/benchmarks.md, "Statements kept by shape").
+
 It keeps Cypher's meaning:
 
 - **Comparisons by kind:** `=` is NULL with a NULL and false across kinds (`true = 1` is false), `<` is NULL across
@@ -313,9 +339,10 @@ taken, and the baseline before that work: docs/research/benchmarks.md, "Method" 
   commit's id, time, author and message); variable-length relationships and shortest paths with `AT VERSION` or `AT
   TIME`, as smaltdb's `paths` reads its edge tables as they are now; an author or message for one statement inside a
   transaction.
-- **Indexes are used for equality with a literal.** A property map or a WHERE comparing a property with a string or
-  number literal is the plain `map_get(props, k) = v` an index's expression matches, and smaltdb seeks with it (a
-  test checks EXPLAIN). A range (`<`) is still a CASE on the value's kind, which smaltdb doesn't seek with.
+- **Indexes are used for equality with a literal or a parameter.** A property map or a WHERE comparing a property
+  with a string or a number, written in the query or given as a parameter, is the plain `map_get(props, k) = v` an
+  index's expression matches, and smaltdb seeks with it (tests check EXPLAIN). A range (`<`) is still a CASE on the
+  value's kind, which smaltdb doesn't seek with.
 - **Performance** (docs/research/benchmarks.md, "smaltdb": `npm run bench:smaltdb`, 20,000 people): the join regions,
   the order asked for only where it shows, the comparisons with literals, the paths searched from each row and the
   shortest path's search that stops at its end made the benchmark's queries 1.3 to 16 times faster (shortest path
@@ -365,6 +392,8 @@ taken, and the baseline before that work: docs/research/benchmarks.md, "Method" 
   - Integers are 64-bit on smaltdb: an overflow is an error, where smaltcy's numbers become inexact floats.
   - `%` of two integers whose remainder is 0 with a negative dividend (`-4 % 2`) is `-0` in smaltcy (JavaScript's
     `%`) and `0` on smaltdb, whose integers have no `-0`; Cypher has no `-0`. Floats give `-0` on both.
+  - A `-0.0` a write stores (`SET n.v = -0.0`, `CREATE (:T {v: $x})` with -0) is read back as `0` on smaltdb and as
+    `-0` on smaltcy (found 2026-11-20; a query that only reads gives `-0` on both). Not guarded.
   - Strings in lists and maps compare as strings do: by UTF-8 bytes on smaltdb (above).
   - The errors above have smaltcy's codes and messages, and so do the runner's own checks (deleting a node with
     relationships, a relationship to NULL, values that can't be properties); the tests compare them. Errors smaltdb
