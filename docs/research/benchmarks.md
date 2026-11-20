@@ -631,3 +631,85 @@ What it says:
 - **A pattern bound at its far end** is read from that end: `MATCH (f)-[:KNOWS]->(p:Person {name: 'Bo 1'}) RETURN
   f.name` finds `p` by name, then its relationships by their `other` column (`SEARCH RELATIONSHIPS OF graph
   (other=?)` in smaltdb's EXPLAIN), then each `f` by id.
+
+## Labels in smaltdb's graph index (2026-11-20)
+
+smaltdb's `main` at `57f0e94`, which this repository now pins. Since the section above it has two more changes, both
+the engine's, and nothing changed here but the pin:
+
+- **stenhoor/smaltdb#282:** the graph index also holds each node's labels, and a plan that asks whether one node has
+  one label is answered from it, where it probed the label index's B+tree. This is ADR 0040's provision for the hop
+  to a labelled node.
+- **stenhoor/smaltdb#278,** measured above on its branch and now merged.
+
+The same machine and method. "Before" is the section above with both of its changes (smaltdb `8cc47b3` and #278). A
+ratio is smaltdb's time over smaltcy's.
+
+**The same text every run** (`BENCH_INDEXES=1 npm run bench:smaltdb`):
+
+| Query | Before | Now | smaltcy, smaltdb now (ms) |
+|---|---|---|---|
+| seek by name | 1.07x | 1.05x | 0.024, 0.026 |
+| 1 hop | 0.79x | 0.76x | 0.034, 0.027 |
+| 2 hops | 0.35x | 0.36x | 0.335, 0.121 |
+| 3 hops | 0.30x | 0.33x | 4.176, 1.287 |
+| 1 hop, directed | 0.86x | 0.80x | 0.029, 0.025 |
+| 3 hops, directed | 0.26x | 0.28x | 2.274, 0.629 |
+| 2 hops to a label | 2.09x | 0.26x | 0.728, 0.197 |
+| 2 hops, relationship filter | 2.57x | 2.64x | 0.579, 1.593 |
+| var-length 1..3, distinct | 0.69x | 0.61x | 12.183, 7.442 |
+| shortest path | 0.89x | 0.84x | 0.045, 0.037 |
+| shortest path, 5 hops | 0.17x | 0.18x | 29.138, 5.155 |
+| shortest path, none (out) | 1.25x | 1.16x | 0.030, 0.035 |
+| shortest path, none (all) | 0.23x | 0.25x | 29.773, 7.672 |
+| label scan + filter | 2.27x | 1.01x | 2.151, 2.173 |
+| group by city | 3.22x | 1.72x | 20.115, 36.367 |
+| all relationships | 0.18x | 0.17x | 15.507, 2.847 |
+| triangles (bounded) | 0.88x | 0.79x | 12.724, 10.740 |
+
+**Statements that differ** (`BENCH_ENTRY=bench/vary.ts npm run bench:smaltdb`; a literal, a parameter):
+
+| Statement | Before | Now |
+|---|---|---|
+| seek by name | 1.10x, 1.05x | 1.20x, 1.11x |
+| 1 hop | 0.70x, 0.80x | 0.66x, 0.72x |
+| 2 hops | 0.46x, 0.50x | 0.45x, 0.48x |
+| 3 hops | 0.33x, 0.37x | 0.33x, 0.36x |
+| 3 hops, directed | 0.48x, 0.51x | 0.41x, 0.54x |
+| 2 hops to a label | 1.10x, 1.17x | 0.36x, 0.32x |
+| 2 hops, relationship filter | 1.49x, 1.51x | 1.40x, 1.45x |
+| var-length 1..3, distinct | 0.63x, 0.65x | 0.58x, 0.59x |
+| shortest path | 0.13x, 0.14x | 0.12x, 0.15x |
+| shortest path, directed | 1.12x, 0.94x | 1.05x, 0.97x |
+| shortest path, none | 0.26x, 0.24x | 0.26x, 0.27x |
+| label scan + filter | 4.52x, 2.68x | 2.63x, 1.64x |
+| create 1 node | 38.0x, 43.1x | 38.6x, 45.5x |
+| create 1,000 nodes | 14.7x, 14.8x | 14.3x, 14.1x |
+| create 1 relationship | 71.6x, 80.8x | 69.0x, 78.5x |
+| create 1,000 relationships | 10.9x, 10.4x | 9.91x, 8.93x |
+| set 1 property by name | 21.4x, 25.0x | 23.1x, 27.2x |
+| set 1,000 properties | 15.4x, 16.0x | 14.4x, 15.0x |
+| merge existing node | 5.35x, 5.57x | 4.87x, 4.79x |
+| merge 1,000 new nodes | 0.95x, 0.94x | 0.97x, 0.93x |
+| delete 1 node | 126x, 122x | 112x, 120x |
+| delete 1,000 nodes | 22.2x, 21.3x | 22.3x, 23.2x |
+
+What it says:
+
+- **The hop to a labelled node is under smaltcy's time** (2.09x to 0.26x; with a literal and a parameter 0.36x and
+  0.32x): its 1,505 label checks are asked of a set in memory.
+- **The label scan and group by city got faster too,** because smaltdb's planner now scans the label's nodes from the
+  node table and checks the label of each in memory, where it read the label's entries and fetched each node's row.
+  The label scan with the same text is at the bar (1.01x: 2.173 ms against 2.151); smaltdb's group by city went from
+  50.8 to 36.4 ms.
+- **Under smaltcy's time:** every hop but the one filtered on a relationship's property, the triangles, and every
+  path but the two smallest statements (a shortest path with a direction: 1.16x with the same text, where there is no
+  path, and 1.05x with a literal; 0.035 ms against 0.030).
+- **Still over the bar among the reads:**
+  - **2 hops filtered on a relationship's property** (2.64x; 1.40x and 1.45x) and **group by city** (1.72x).
+  - **The label scan with a literal or a parameter** (2.63x and 1.64x). Its values are lower than the same text's
+    (`p.age >` 22 to 42 with a literal and 44 to 64 with a parameter, against `> 70`, of ages from 18 to 77), so more
+    people pass, and smaltdb's time grows with the rows that pass (10.4 and 5.9 ms against 2.2).
+  - **Seek by name** (1.05x; 1.20x and 1.11x), a statement of under 0.1 ms: its time is finding the kept statement,
+    as measured in "smaltdb's graph index, and shortest paths to a target".
+- **Writes did not change:** they are the issue's step 4.
