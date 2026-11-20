@@ -50,7 +50,8 @@ export interface CompiledQuery {
 export interface CompileOptions {
   /**
    * The parameters the query will run with: their values type the plan's parameters (a boolean is a `bool`, a whole
-   * number an `int`). A parameter not given here is refused.
+   * number an `int`), and a string or a number among them is compared as a literal of its kind is. So the plan is for
+   * parameters of these kinds (`paramKind`), whatever their values. A parameter not given here is refused.
    */
   readonly params?: Readonly<Record<string, unknown>>;
   /**
@@ -179,11 +180,30 @@ export function compileQuery(gp: GraphPlan, tables: GraphTables, options: Compil
     }
   }
   const plan: PlanOp = { op: 'project', input: root, exprs };
-  return {
-    statement: { kind: 'query', plan: asOf ? readAsOf(plan, tables, asOf) : plan, columns },
-    columns: gp.columns.map((col) => col.name),
-    params: c.paramNames,
+  const statement: PlanStatementInput = { kind: 'query', plan: asOf ? readAsOf(plan, tables, asOf) : plan, columns };
+  return { statement, columns: gp.columns.map((col) => col.name), params: paramsRead(statement, c.paramNames) };
+}
+
+/**
+ * The parameters a statement takes, of those its compiler named: smaltdb counts a statement's parameters up to the
+ * highest one its plan reads, and the compiler may leave the last it named out of the plan (one compared with a NULL,
+ * which is NULL whatever it holds).
+ */
+export function paramsRead(statement: PlanStatementInput, names: readonly string[]): readonly string[] {
+  if (names.length === 0) return names;
+  let n = 0;
+  const walk = (x: unknown): void => {
+    if (n === names.length || x === null || typeof x !== 'object' || x instanceof Uint8Array) return;
+    if (Array.isArray(x)) {
+      for (const v of x) walk(v);
+      return;
+    }
+    const o = x as Record<string, unknown>;
+    if (o.k === 'param' && typeof o.index === 'number') n = Math.max(n, o.index + 1);
+    for (const k in o) walk(o[k]);
   };
+  walk(statement);
+  return n === names.length ? names : names.slice(0, n);
 }
 
 /** The values of a compiled query's parameters, in smaltdb's order. */
@@ -523,17 +543,28 @@ const isNumberType = (t: PlanType) => t === 'int' || t === 'real' || t === 'num'
 const mayBeNaN = (t: PlanType) => t !== 'int';
 
 /**
- * A string literal, or a number literal smaltdb holds as the number it is (an integer JavaScript holds exactly, or a
- * float that isn't whole or NaN): where a plain comparison with a value of any kind keeps Cypher's meaning.
+ * Whether a value is a string, or a number smaltdb holds as the number it is (an integer JavaScript holds exactly, or
+ * a float that isn't whole or NaN): where a plain comparison with a value of any kind keeps Cypher's meaning.
  */
-function scalarLiteral(v: Val): v is { k: 'value'; e: PlanExpr; t: PlanType } {
-  if (v.k !== 'value' || v.e.k !== 'lit') return false;
-  const { type, value } = v.e;
+function plainScalar(value: unknown, type: PlanType): boolean {
   return (
     (type === 'text' && typeof value === 'string') ||
     (type === 'int' && Number.isSafeInteger(value)) ||
     (type === 'real' && typeof value === 'number' && !Number.isInteger(value) && !Number.isNaN(value))
   );
+}
+
+/**
+ * The kind of a parameter's value, as far as a plan compiled with it depends on it: its type in the plan, and for a
+ * number whether it is one a plain comparison takes (`plainScalar`). A plan compiled with a parameter of one kind is
+ * run only with values of that kind.
+ */
+export function paramKind(v: unknown): string {
+  if (v === null || v === undefined) return 'null';
+  if (typeof v === 'boolean') return 'bool';
+  if (typeof v === 'string') return 'text';
+  if (typeof v === 'number') return Number.isSafeInteger(v) ? 'int' : !Number.isInteger(v) && !Number.isNaN(v) ? 'real' : 'real, whole or NaN';
+  return Array.isArray(v) ? 'list' : typeof v;
 }
 
 /** The kind of a value at run time, as one of the K_ codes (NULL: K_NULL; NaN: K_NUMBER). */
@@ -2500,6 +2531,17 @@ export class Compiler {
 
   // Cypher's comparisons.
 
+  /**
+   * A string or number that smaltdb compares as the value it is (`plainScalar`): a literal, or a parameter whose value
+   * is one. The plan made for such a parameter is for values of its kind (`paramKind`).
+   */
+  private scalar(v: Val): v is { k: 'value'; e: PlanExpr; t: PlanType } {
+    if (v.k !== 'value') return false;
+    if (v.e.k === 'lit') return plainScalar(v.e.value, v.e.type);
+    if (v.e.k === 'param') return plainScalar(this.params[this.paramNames[v.e.index]!], v.e.type);
+    return false;
+  }
+
   /** `a = b`: NULL when either is NULL, false across kinds, numbers by value (NaN equals nothing), lists and maps by their elements. */
   private equals(a: Val, b: Val): PlanExpr {
     if (a.k !== 'value' || b.k !== 'value') {
@@ -2507,10 +2549,10 @@ export class Compiler {
       if (a.k === 'rel' && b.k === 'rel') return and(eq(a.type, b.type), eq(a.rowid, b.rowid));
       return unsupported('comparing a node or relationship with another kind of value');
     }
-    // A value of any kind and a string or number literal: smaltdb's `cmp_eq` is Cypher's `=` there (NULL with a NULL;
-    // false for a value of another kind, booleans, lists and maps included; numbers by value, NaN equal to nothing), and
-    // a plain comparison lets smaltdb seek with an index on the property.
-    if ((a.t === 'any' && scalarLiteral(b)) || (b.t === 'any' && scalarLiteral(a))) return eq(a.e, b.e);
+    // A value of any kind and a string or number, a literal or a parameter: smaltdb's `cmp_eq` is Cypher's `=` there
+    // (NULL with a NULL; false for a value of another kind, booleans, lists and maps included; numbers by value, NaN
+    // equal to nothing), and a plain comparison lets smaltdb seek with an index on the property.
+    if ((a.t === 'any' && this.scalar(b)) || (b.t === 'any' && this.scalar(a))) return eq(a.e, b.e);
     const e = this.compareBy(a, b, (x, y, kind) => {
       if (kind === K_NUMBER) return mayBeNaN(x.t) || mayBeNaN(y.t) ? and(eq(x.e, y.e), not(isNaNExpr(x.e))) : eq(x.e, y.e);
       if (kind === K_BOOL) return eq(asBoolValue(x), asBoolValue(y));
@@ -2525,9 +2567,9 @@ export class Compiler {
    */
   private ordering(fn: string, a: Val, b: Val): PlanExpr {
     if (a.k !== 'value' || b.k !== 'value') return unsupported('ordering comparisons of nodes and relationships');
-    // A value of any kind and a string or number literal: smaltdb's comparison where the value is of the literal's kind
-    // (a number that isn't NaN), else NULL.
-    const literal = scalarLiteral(a) ? a : scalarLiteral(b) ? b : undefined;
+    // A value of any kind and a string or number, a literal or a parameter: smaltdb's comparison where the value is of
+    // that one's kind (a number that isn't NaN), else NULL.
+    const literal = this.scalar(a) ? a : this.scalar(b) ? b : undefined;
     const other = literal === a ? b : a;
     if (literal && other.t === 'any') {
       const kind = call('any_type', [other.e], 'text');

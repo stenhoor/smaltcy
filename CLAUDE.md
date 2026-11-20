@@ -44,6 +44,7 @@ Two more of the family's rules:
 | `npm run test:browser` | The playground, tech demo and runnable docs in headless Chromium with WebGPU (SwiftShader), a few minutes. What CI runs |
 | `npm run test:quick` | `check`, then the browser tests with `--quick` (smaller graphs, fewer steps), about a minute. While working on the playground or the demo |
 | `npm run bench` | The stores on a generated network; compare with docs/research/benchmarks.md |
+| `npm run bench:smaltdb` | The same queries on smaltcy's engine and on smaltdb. `BENCH_ENTRY=bench/writes.ts` runs the writes, `BENCH_ENTRY=bench/vary.ts` statements that differ each time. The three are the bar for switching (ADR 0004); read the ratio column (docs/research/benchmarks.md, "Method") |
 | `npm run docs:dev` / `docs:build` | The site with the playground |
 | `npm run build` | `dist/` and type declarations |
 

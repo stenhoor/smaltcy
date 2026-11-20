@@ -2,7 +2,8 @@
  * Cypher writes on smaltcy's MemoryStore and on smaltdb (`runOnSmaltdb`, ADR 0004), over the same generated network as
  * bench/smaltdb.ts. Each case is a setup (not timed), the write (timed) and a cleanup that undoes it (not timed), so
  * every run starts from the same graph. Both engines must report the same counts. `BENCH_ENTRY=bench/writes.ts npm run
- * bench:smaltdb`; BENCH_PEOPLE and BENCH_RUNS size it. The network's index on :Person(name) is on both engines.
+ * bench:smaltdb`; BENCH_PEOPLE and BENCH_ROUNDS (bench/timing.ts) size it. The network's index on :Person(name) is on
+ * both engines. Every case here writes the same values on every run; bench/vary.ts writes others each time.
  */
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { Database } from 'smaltdb-src/engine/database.js';
@@ -12,9 +13,9 @@ import { dumpGraph } from '../src/engine/io.js';
 import { open } from '../src/index.js';
 import { graphTablesFor, loadStatements, schemaStatements, type GraphTables } from '../src/smaltdb/schema.js';
 import { indexStatement, runOnSmaltdb } from '../src/smaltdb/write.js';
+import { METHOD, ROUNDS, rounds, timed } from './timing.js';
 
 const PEOPLE = Number(process.env.BENCH_PEOPLE ?? 20000);
-const RUNS = Number(process.env.BENCH_RUNS ?? 7);
 // BENCH_ONLY: run only the cases whose name contains it.
 
 interface Case {
@@ -55,25 +56,19 @@ const onDb = (cypher: string) => {
   return r.counts;
 };
 
-const time = (run: (c: string) => unknown, c: Case): number => {
-  const ts: number[] = [];
-  for (let i = 0; i <= RUNS; i++) {
-    if (c.setup) run(c.setup);
-    const t0 = performance.now();
-    run(c.write);
-    const t = performance.now() - t0;
-    if (c.cleanup) run(c.cleanup);
-    if (i > 0) ts.push(t); // the first run warms up
-  }
-  ts.sort((a, b) => a - b);
-  return ts[Math.floor(ts.length / 2)]!;
+/** One run of a case on an engine: its setup, the write, its cleanup. The time is the write's. */
+const once = (run: (c: string) => unknown, c: Case) => (): number => {
+  if (c.setup) run(c.setup);
+  const t = timed(() => run(c.write));
+  if (c.cleanup) run(c.cleanup);
+  return t;
 };
 
 const st = mem.store.stats();
 console.log(`network(${PEOPLE}): ${st.nodes} nodes, ${st.rels} relationships`);
-console.log(`median of ${RUNS} runs, ms (each includes compiling the Cypher)\n`);
+console.log(`${METHOD} (each run includes compiling the Cypher)\n`);
 console.log('write'.padEnd(28), 'smaltcy'.padStart(10), 'smaltdb'.padStart(10), 'ratio'.padStart(8), ' counts');
-const results: Record<string, { smaltcy: number; smaltdb: number }> = {};
+const results: Record<string, { smaltcy: number; smaltdb: number; ratio: number }> = {};
 const ONLY = process.env.BENCH_ONLY;
 for (const c of CASES.filter((c) => !ONLY || c.name.includes(ONLY))) {
   // Counts must agree: compare one run of each, then undo it.
@@ -84,13 +79,13 @@ for (const c of CASES.filter((c) => !ONLY || c.name.includes(ONLY))) {
   const keys = Object.keys(b);
   const diff = keys.filter((k) => (a[k] ?? 0) !== b[k]);
   if (diff.length) throw new Error(`engines disagree on ${c.name}: ${diff.map((k) => `${k} ${a[k]} vs ${b[k]}`).join(', ')}`);
-  const m = time(onMem, c);
-  const d = time(onDb, c);
-  results[c.name] = { smaltcy: +m.toFixed(3), smaltdb: +d.toFixed(3) };
+  const t = rounds([once(onMem, c), once(onDb, c)]);
+  const [m, d] = t.ms as [number, number];
+  results[c.name] = { smaltcy: +m.toFixed(3), smaltdb: +d.toFixed(3), ratio: +t.ratio[1]!.toFixed(2) };
   const shown = keys.filter((k) => b[k]).map((k) => `${k} ${b[k]}`).join(', ');
-  console.log(c.name.padEnd(28), m.toFixed(2).padStart(10), d.toFixed(2).padStart(10), `${(d / m).toFixed(1)}x`.padStart(8), ` ${shown}`);
+  console.log(c.name.padEnd(28), m.toFixed(3).padStart(10), d.toFixed(3).padStart(10), `${t.ratio[1]!.toFixed(2)}x`.padStart(8), ` ${shown}`);
 }
 mkdirSync('bench/results', { recursive: true });
 const file = `bench/results/${new Date().toISOString().slice(0, 10)}.smaltdb-writes.local.json`;
-writeFileSync(file, JSON.stringify({ date: new Date().toISOString(), node: process.version, people: PEOPLE, runs: RUNS, results }, null, 2));
+writeFileSync(file, JSON.stringify({ date: new Date().toISOString(), node: process.version, people: PEOPLE, rounds: ROUNDS, results }, null, 2));
 console.log(`\nwrote ${file}`);

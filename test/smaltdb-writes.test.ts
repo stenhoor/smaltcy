@@ -106,6 +106,31 @@ describe('the write cases on smaltdb', () => {
   });
 });
 
+/**
+ * A write that finds its rows by a parameter: the reads inside a write take the parameter as a literal of its kind
+ * (compile.ts, `paramKind`), and one compared with a NULL is left out of the statement smaltdb is given.
+ */
+describe('writes that read a parameter of every kind', () => {
+  const values: [string, unknown][] = [
+    ["'Ada'", 'Ada'],
+    ['1912', 1912],
+    ['1912.5', 1912.5],
+    ['NaN', NaN],
+    ['a whole number past the largest held exactly', 1e300],
+    ['true', true],
+    ['null', null],
+  ];
+  test.each(values)('%s', (_name, x) => {
+    const p = start('social');
+    p.run('MATCH (n:Person) WHERE n.name = $x OR n.born = $x SET n.seen = 1 RETURN count(*) AS n', { x });
+    p.run('MATCH (n:Person {born: $x}) SET n.exact = true RETURN count(*) AS n', { x });
+    p.run('MATCH (n:Person) WHERE n.born < $x SET n.before = $x RETURN count(*) AS n', { x });
+    p.run('MATCH (n:Person) WHERE n.name >= $x CREATE (n)-[:AFTER {x: $x}]->(:Mark) RETURN count(*) AS n', { x });
+    p.run('MERGE (n:Person {name: $x}) RETURN count(*) AS n', { x });
+    p.run('MATCH (n:Person) WHERE n.born = $x DETACH DELETE n', { x });
+  });
+});
+
 /** More statements in sequence, compared on both engines after each. */
 const SEQUENCES: readonly [string, 'empty' | 'social', readonly string[]][] = [
   // A write whose rows are read before it, with nothing after it in its clause that reads the graph, runs all its rows
