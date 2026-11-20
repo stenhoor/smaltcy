@@ -382,7 +382,7 @@ function inline(e: PlanExpr, out: readonly PlanExpr[]): PlanExpr {
 const conjuncts = (e: PlanExpr): PlanExpr[] => (e.k === 'and' ? e.args.flatMap(conjuncts) : [e]);
 
 /** Functions that never raise an error: a condition of only these can be evaluated on any row, in any order. */
-const SAFE_FNS = new Set(['cmp_eq', 'cmp_ne', 'cmp_lt', 'cmp_le', 'cmp_gt', 'cmp_ge', 'map_get', 'any_type', 'in_list', 'starts_with', 'ends_with', 'struct_field', 'coalesce']);
+const SAFE_FNS = new Set(['cmp_eq', 'cmp_ne', 'cmp_lt', 'cmp_le', 'cmp_gt', 'cmp_ge', 'cmp_lt_kind', 'cmp_le_kind', 'cmp_gt_kind', 'cmp_ge_kind', 'map_get', 'any_type', 'in_list', 'starts_with', 'ends_with', 'struct_field', 'coalesce']);
 
 /**
  * Whether evaluating a condition may raise an error (Cypher's type errors, arithmetic, a value the compiler refuses
@@ -2307,15 +2307,13 @@ export class Compiler {
    */
   private ordering(fn: string, a: Val, b: Val): PlanExpr {
     if (a.k !== 'value' || b.k !== 'value') return unsupported('ordering comparisons of nodes and relationships');
-    // A value of any kind and a string or number, a literal or a parameter: smaltdb's comparison where the value is of
-    // that one's kind (a number that isn't NaN), else NULL.
+    // A value of any kind and a string or number, a literal or a parameter: smaltdb's comparison within one kind
+    // (`cmp_lt_kind` and the others), which is the comparison where the value is of that one's kind (a number that
+    // isn't NaN, or text) and NULL where it isn't. One operation, so the value is read once, and smaltdb decides it
+    // on a property map's stored bytes where it scans a table.
     const literal = this.scalar(a) ? a : this.scalar(b) ? b : undefined;
     const other = literal === a ? b : a;
-    if (literal && other.t === 'any') {
-      const kind = call('any_type', [other.e], 'text');
-      const same = literal.t === 'text' ? eq(kind, lit('text')) : and(call('in_list', [kind, lit('int'), lit('real')], 'bool'), not(isNaNExpr(other.e)));
-      return caseWhen([[same, call(fn, [a.e, b.e], 'bool')]], NULL, 'bool');
-    }
+    if (literal && other.t === 'any') return call(`${fn}_kind`, [a.e, b.e], 'bool');
     const e = this.compareBy(a, b, (x, y, kind) => {
       const c = (p: PlanExpr, q: PlanExpr) => call(fn, [p, q], 'bool');
       if (kind === K_NUMBER) return mayBeNaN(x.t) || mayBeNaN(y.t) ? caseWhen([[or(isNaNExpr(x.e), isNaNExpr(y.e)), NULL]], c(x.e, y.e), 'bool') : c(x.e, y.e);

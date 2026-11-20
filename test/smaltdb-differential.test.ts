@@ -521,6 +521,26 @@ describe('comparisons with literals: both engines give the same rows', () => {
   test.each(cases)('%s', (_name, cypher) => {
     expect(onSmaltdb(db, tables, cypher)).toEqual(g.query(cypher));
   });
+  test("< and the others with a number or a string are one of smaltdb's comparisons within a kind, which reads the property once", () => {
+    const planOf = (cypher: string) => JSON.stringify(compileQuery(compile(cypher).plan, tables).statement);
+    const count = (plan: string, part: string) => plan.split(part).length - 1;
+    const ordered: [string, string][] = [
+      ['MATCH (n:T) WHERE n.v > 0 RETURN count(n) AS c', 'cmp_gt_kind'],
+      ['MATCH (n:T) WHERE 1.5 <= n.v RETURN count(n) AS c', 'cmp_le_kind'],
+      ["MATCH (n:T) WHERE n.v < 'b' RETURN count(n) AS c", 'cmp_lt_kind'],
+      ['MATCH (n:T) WHERE n.v >= 0 RETURN count(n) AS c', 'cmp_ge_kind'],
+    ];
+    for (const [cypher, fn] of ordered) {
+      const plan = planOf(cypher);
+      expect(plan, cypher).toContain(`"fn":"${fn}"`);
+      // No test of the value's kind around it, and the property read once.
+      expect(plan, cypher).not.toContain('"fn":"any_type"');
+      expect(count(plan, '"fn":"map_get"'), cypher).toBe(1);
+      expect(onSmaltdb(db, tables, cypher), cypher).toEqual(g.query(cypher));
+    }
+    // A value whose kind only the value shows on both sides is compared kind by kind, as before.
+    expect(planOf('MATCH (n:T) WHERE n.v > n.k RETURN count(n) AS c')).not.toContain('_kind"');
+  });
   test('with an index on the property: the same rows, and smaltdb seeks with it', () => {
     const h = open();
     h.run(KINDS);

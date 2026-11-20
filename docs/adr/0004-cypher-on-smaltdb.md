@@ -235,9 +235,13 @@ It keeps Cypher's meaning:
   (a property) compared with a string or number literal (an integer JavaScript holds exactly, or a float that isn't
   whole or NaN) is smaltdb's own comparison: `cmp_eq` has Cypher's `=` there (NULL with a NULL, false for a value of
   another kind, booleans, lists and maps included, NaN equal to nothing, `1 = 1.0`), and `<` and the others are
-  smaltdb's where `any_type` says the value is of the literal's kind (a number that isn't NaN), else NULL. So a
-  property map or a WHERE such as `{name: 'Ada'}` reads the property once a row, and smaltdb estimates it and seeks
-  with an index on the property (tested against smaltcy's engine on values of every kind, with and without one).
+  smaltdb's comparisons within one kind (`cmp_lt_kind` and the others, since smaltdb `166c6cd`): the comparison where
+  the value is of the literal's kind (a number that isn't NaN, or a string), else NULL. So a property map or a WHERE
+  such as `{name: 'Ada'}` or `p.age > 30` reads the property once a row; smaltdb estimates an `=` and seeks it with
+  an index on the property, and where it scans a table it decides either on the row's stored bytes (tested against
+  smaltcy's engine on values of every kind, with and without an index). Until 2026-11-20 `<` and the others were a
+  CASE over `any_type` around smaltdb's `cmp_lt`, which read the property three times for every row that passed
+  (docs/research/benchmarks.md, "Comparisons within one kind").
 - **Lists and maps** are compared element by element, as smaltcy's `equals` and `compare` do, where smaltdb compares
   their bytes: `=` of two lists is false for different lengths or a false element, else NULL for a NULL element
   (`[1, null] = [1, null]` is NULL), else true; of two maps, false for different keys, else their values in key order
