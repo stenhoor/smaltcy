@@ -1665,40 +1665,26 @@ export class Compiler {
 
   /**
    * One shortest path from `from` to `to` (expressions of the row), in the pattern's direction, or NULL: a scalar
-   * subquery of a breadth-first search from `from` (smaltdb's `iterate`, the first row reaching each node kept, so its
-   * hops are a shortest path there), whose first row at `to` stops it (smaltdb runs an iterate's steps as its rows are
-   * read). Its hops give each relationship's type as its position in the graph's types.
+   * subquery of smaltdb's `paths` to a `target` (its ADR 0040), a breadth-first search from `from` that stops when it
+   * reaches `to`. From no hops, so a node's path to itself is the empty one; a path shorter than `min` is none. Its
+   * hops give each relationship's type as its position in the graph's types.
    */
   private shortestPath(from: PlanExpr, to: PlanExpr, names: readonly string[], dir: Direction, min: number, max: number | undefined): PlanExpr {
-    const id = ++this.iterates;
-    const all = [...this.t.types.keys()];
-    const at = (input: 0 | 1, index: number, type: PlanType): PlanExpr => ({ k: 'col', input, index, depth: 0, type, collation: 'binary' });
-    // Columns: the node reached, its hops from `from`, the path.
-    const iterTypes: PlanType[] = ['int', 'int', HOPS];
-    const working: PlanOp = { op: 'working', id, types: iterTypes };
-    const steps = names.flatMap((name, i): PlanOp[] => {
-      const ways: [number, number][] = dir === 'out' ? [[0, 1]] : dir === 'in' ? [[1, 0]] : [[0, 1], [1, 0]];
-      return ways.map(([f, t]): PlanOp => {
-        const edge: PlanOp = { op: 'scan', table: this.t.types.get(name)!, columns: [f, t, -1] };
-        const joined: PlanOp = { op: 'join', kind: 'inner', inputs: [working, edge], on: eq(at(1, 0, 'int'), at(0, 0, 'int')) };
-        const hop = call('struct_of', [lit(all.indexOf(name)), at(0, 5, 'int'), at(0, 3, 'int'), at(0, 4, 'int')], HOP);
-        return { op: 'project', input: joined, exprs: [at(0, 4, 'int'), call('add', [at(0, 1, 'int'), lit(1)], 'int'), call('list_concat', [at(0, 2, HOPS), call('list_of', [hop], HOPS)], HOPS)] };
-      });
-    });
     const search: PlanOp = {
-      op: 'iterate',
-      id,
-      name: 'shortest',
-      init: { op: 'values', rows: [[deepen(from), lit(0), call('list_of', [], HOPS)]], types: iterTypes },
-      steps,
-      distinct: true,
-      collations: iterTypes.map(() => 'binary'),
-      key: [0],
-      ...(max !== undefined ? { maxDepth: max } : {}),
+      op: 'paths',
+      input: { op: 'values', rows: [[deepen(from), deepen(to)]], types: ['int', 'int'] },
+      start: 0,
+      target: 1,
+      edges: names.map((t) => ({ table: this.t.types.get(t)!, start: 0, end: 1 })),
+      direction: dir,
+      minHops: 0,
+      ...(max !== undefined ? { maxHops: max } : {}),
+      mode: 'walk',
+      selector: 'anyShortest',
     };
-    const found: PlanOp = { op: 'filter', input: search, pred: and(eq(colRef(0, 'int'), deepen(to)), call('cmp_ge', [colRef(1, 'int'), lit(min)], 'bool')) };
-    const first: PlanOp = { op: 'limit', input: { op: 'project', input: found, exprs: [colRef(2, HOPS)] }, count: lit(1) };
-    return { k: 'subquery', mode: 'scalar', plan: first, type: HOPS, collation: 'binary' };
+    // Columns: the two ends, where the path ends, its length, its hops.
+    const found: PlanOp = min > 0 ? { op: 'filter', input: search, pred: call('cmp_ge', [colRef(3, 'int'), lit(min)], 'bool') } : search;
+    return { k: 'subquery', mode: 'scalar', plan: { op: 'project', input: found, exprs: [this.hopsInPatternOrder(colRef(4, HOPS), names, false)] }, type: HOPS, collation: 'binary' };
   }
 
   /** A plan's rows numbered in order (a window's `row_number`), in a last column. */
@@ -1731,7 +1717,10 @@ export class Compiler {
     const el: PlanExpr = { k: 'element', part: 'value', depth: 0, type: HOP };
     const f = (i: number) => call('struct_field', [el, lit(i)], 'int');
     const all = [...this.t.types.keys()];
-    const edge = names.every((n, i) => all[i] === n) ? f(0) : caseWhen(names.map((n, i) => [eq(f(0), lit(i)), lit(all.indexOf(n))] as const), NULL, 'int');
+    const asGiven = names.every((n, i) => all[i] === n);
+    // As `paths` gives them already.
+    if (asGiven && !reverse) return path;
+    const edge = asGiven ? f(0) : caseWhen(names.map((n, i) => [eq(f(0), lit(i)), lit(all.indexOf(n))] as const), NULL, 'int');
     const body = call('struct_of', [edge, f(1), reverse ? f(3) : f(2), reverse ? f(2) : f(3)], HOP);
     return { k: 'each', mode: 'map', list: reverse ? call('list_reverse', [path], HOPS) : path, body, type: HOPS };
   }

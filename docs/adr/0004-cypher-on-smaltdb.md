@@ -102,10 +102,11 @@ hops); two variable-length relationships of types that can be the same in one MA
   values, not the plan before it. `paths` reads a self-loop both ways with direction `both`, two paths the same: each
   path is kept once. A relationship property map is checked on every hop (none may lack it); its values must not read
   variables.
-- **Shortest paths**, once both ends are bound: one shortest path (`shortestPath`) is a breadth-first search in a
-  correlated subquery, smaltdb's `iterate` keeping the first row that reaches each node, so its hops are a shortest
-  path there, with a LIMIT of one row at the far end: smaltdb runs an iterate's steps as its rows are read, so the
-  search stops there, where `paths` with `anyShortest` searched the whole graph first. All shortest paths are `paths`
+- **Shortest paths**, once both ends are bound: one shortest path (`shortestPath`) is smaltdb's `paths` to a `target`
+  (its ADR 0040), in a correlated subquery: a breadth-first search over the graph's index in memory that stops when it
+  reaches the far end. It searches from no hops, so a node's path to itself is the empty one, and a path shorter than
+  the minimum is none, as in smaltcy's engine. (Until smaltdb `95189f6` it was an `iterate` written here, with a LIMIT
+  of one row at the far end, because `paths` with `anyShortest` searched the whole graph first.) All shortest paths are `paths`
   with `allShortest` (acyclic), for each row as above, kept where they end at the other end. smaltcy's engine checks
   properties as it searches and gives nothing when the shortest path is shorter than the minimum, so a shortest path
   with properties, with a minimum above 1, or beside other relationships in its MATCH is refused.
