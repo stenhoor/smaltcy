@@ -25,10 +25,21 @@ const UNSUPPORTED = new Map<string, string>([
   ['labels and keys', 'keys() (a smaltdb map keeps its keys sorted)'],
 ]);
 
-/** Runs a Cypher query on smaltdb: its rows as objects keyed by column, as `Graph.query` gives them. */
+/**
+ * Runs a Cypher query on smaltdb: its rows as objects keyed by column, as `Graph.query` gives them. Compiled as
+ * written, and then as an application's query runs (`runOnSmaltdb`: by its shape, src/smaltdb/shape.ts), twice, the
+ * second time with the statement kept: the same rows each way.
+ */
 function onSmaltdb(db: Database, tables: GraphTables, cypher: string, params: Record<string, unknown> = {}, options: CompileOptions = {}) {
   const q = compileQuery(compile(cypher).plan, tables, { ...options, params });
   const r = db.queryPlan(q.statement, paramValues(q, params) as never);
+  if (Object.keys(options).length === 0) {
+    for (let i = 0; i < 2; i++) {
+      const s = runOnSmaltdb(db, compile(cypher).plan, tables, { params });
+      expect(s.columns, `${cypher}: by its shape`).toEqual(q.columns);
+      expect(s.rows, `${cypher}: by its shape`).toEqual(r.rows);
+    }
+  }
   return r.rows.map((row) => Object.fromEntries(q.columns.map((c, i) => [c, row[i]])));
 }
 

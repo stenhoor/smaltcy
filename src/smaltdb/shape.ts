@@ -10,7 +10,10 @@
  *
  * - **The plan**, without the strings and numbers smaltdb compares as the values they are (`paramKind`: a string, a
  *   whole number JavaScript holds exactly, a float that isn't whole or NaN), and **the kind of each** of those, which the
- *   compiler types the plan by. Any other literal (NULL, a boolean, a list or map of values) stays in the shape.
+ *   compiler types the plan by. Any other literal (NULL, a boolean) stays in the shape, and so does every value inside
+ *   a list or a map the query builds (`[1, 2]`, `{a: 1}`): smaltdb makes such a list once when all of it is written
+ *   out (an `IN` over one is then a lookup), and types its elements by what is written. A pattern's property map
+ *   (`{name: 'Ada'}`) is conditions, not a value: its values are taken out.
  * - **The kind of each parameter** the query was given, for the same reason.
  * - **SKIP and LIMIT with their values.** The compiler checks them when it compiles (a whole number, not negative).
  * - **The graph's tables**: its labels and types and the tables they are, which a plan names.
@@ -74,11 +77,15 @@ let given: Readonly<Record<string, unknown>> = {};
 let build = false;
 /** Set by the walk when the plan holds a value the compiler needs written out (`degree()`'s direction and type). */
 let asWritten = false;
+/** How many lists and maps the query builds the walk is inside: their values stay written. */
+let building = 0;
+/** Set for the map the walk reaches next when it is a pattern's property map. */
+let conditions = false;
 
 /** A value written in the query: taken out if smaltdb compares it as the value it is, else part of the shape. */
 function literal(x: { readonly k: 'lit'; readonly v: unknown }): unknown {
   const v = x.v;
-  const kind = typeof v === 'string' || typeof v === 'number' ? paramKind(v) : '';
+  const kind = building === 0 && (typeof v === 'string' || typeof v === 'number') ? paramKind(v) : '';
   if (kind === 'text' || kind === 'int' || kind === 'real') {
     key += kind === 'text' ? '?t' : kind === 'int' ? '?i' : '?r';
     values.push(v);
@@ -155,6 +162,10 @@ function walk(x: unknown): unknown {
   }
   const limit = o.op === 'limit';
   if (o.k === 'call' && o.fn === 'degree' && Array.isArray(o.args) && o.args.length > 1) asWritten = true;
+  // A list, or a map that isn't a pattern's property map: a value the query builds.
+  const built = o.k === 'list' || (o.k === 'map' && !conditions);
+  conditions = false;
+  if (built) building++;
   key += '{';
   let out: Record<string, unknown> | undefined;
   for (const k in o) {
@@ -163,12 +174,16 @@ function walk(x: unknown): unknown {
     key += `${k}=`;
     if (limit && (k === 'count' || k === 'skip')) written(v);
     else {
+      // The property map of a pattern's node or relationship (`Pattern` in plan/ops.ts: both have a `slot`).
+      conditions = k === 'props' && typeof o.slot === 'number';
       const w = walk(v);
+      conditions = false;
       if (build && w !== v) (out ??= { ...o })[k] = w;
     }
     key += ';';
   }
   key += '}';
+  if (built) building--;
   return out ?? x;
 }
 
@@ -178,6 +193,8 @@ function shapeOf(gp: QueryPlan, tables: GraphTables, params: Readonly<Record<str
   values = [];
   given = params;
   build = false;
+  building = 0;
+  conditions = false;
   walk(gp);
   return { key, values };
 }
@@ -189,6 +206,8 @@ function withHoles(gp: QueryPlan, params: Readonly<Record<string, unknown>>): Qu
   given = params;
   build = true;
   asWritten = false;
+  building = 0;
+  conditions = false;
   const out = walk(gp) as QueryPlan;
   build = false;
   return out;

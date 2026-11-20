@@ -363,84 +363,88 @@ baseline's ratio. Milliseconds; a ratio is smaltdb's time over smaltcy's.
 
 | Statement | literal: before | smaltcy | smaltdb | ratio | parameter: before | smaltcy | smaltdb | ratio |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Seek a person by name | 14.1x | 0.047 | 0.054 | 1.14x | 913x | 0.045 | 0.050 | 1.09x |
-| 1 hop | 9.81x | 0.099 | 0.089 | 0.88x | 827x | 0.078 | 0.073 | 0.80x |
-| 2 hops | 6.29x | 0.344 | 0.444 | 1.21x | 290x | 0.176 | 0.194 | 1.15x |
-| 3 hops | 3.42x | 1.22 | 2.41 | 1.88x | 56.2x | 0.753 | 1.47 | 2.03x |
-| Variable length 1..3, distinct | 1.31x | 2.51 | 2.45 | 0.99x | 29.7x | 1.65 | 1.54 | 0.92x |
-| Shortest path | 1.34x | 4.91 | 3.37 | 0.76x | 11.9x | 7.12 | 6.33 | 0.88x |
-| Shortest path, directed | 25.2x | 0.069 | 0.091 | 1.38x | 1,483x | 0.066 | 0.099 | 1.53x |
-| Shortest path, none | 2.85x | 43.1 | 109.5 | 2.77x | 4.72x | 41.6 | 122.8 | 3.06x |
-| Label scan and filter | 4.68x | 5.02 | 20.8 | 4.51x | 7.43x | 4.16 | 10.8 | 2.78x |
-| Create 1 node | 46.6x | 0.019 | 0.754 | 39.8x | 53.4x | 0.017 | 0.761 | 47.7x |
-| Create 1,000 nodes | 16.1x | 1.04 | 14.0 | 13.9x | 15.1x | 0.904 | 14.4 | 16.3x |
-| Create 1 relationship | 85.8x | 0.053 | 2.81 | 64.2x | 1,719x | 0.050 | 2.75 | 75.1x |
-| Create 1,000 relationships | 9.46x | 2.90 | 25.4 | 8.28x | 10.9x | 2.45 | 23.3 | 8.53x |
-| Set 1 property by name | 31.0x | 0.037 | 0.825 | 24.1x | 2,136x | 0.026 | 0.659 | 24.1x |
-| Set 1,000 properties | 15.2x | 0.911 | 12.4 | 13.7x | 16.2x | 0.831 | 12.4 | 15.2x |
-| Merge existing node | 28.3x | 0.026 | 0.191 | 7.86x | 3,175x | 0.026 | 0.197 | 7.53x |
-| Merge 1,000 new nodes | 1.01x | 16.8 | 16.3 | 0.97x | 0.94x | 17.2 | 16.2 | 0.94x |
-| Delete 1 node | 71.3x | 0.032 | 3.57 | 122x | 101x | 0.030 | 3.64 | 126x |
-| Delete 1,000 nodes | 28.0x | 0.772 | 20.9 | 28.0x | 33.4x | 0.772 | 21.3 | 27.2x |
+| Seek a person by name | 14.1x | 0.057 | 0.061 | 1.15x | 913x | 0.051 | 0.053 | 1.04x |
+| 1 hop | 9.81x | 0.104 | 0.101 | 0.91x | 827x | 0.072 | 0.064 | 0.84x |
+| 2 hops | 6.29x | 0.282 | 0.342 | 1.22x | 290x | 0.293 | 0.352 | 1.29x |
+| 3 hops | 3.42x | 1.25 | 2.54 | 2.02x | 56.2x | 0.823 | 1.65 | 2.00x |
+| Variable length 1..3, distinct | 1.31x | 2.44 | 2.22 | 0.96x | 29.7x | 1.41 | 1.31 | 0.97x |
+| Shortest path | 1.34x | 4.71 | 2.94 | 0.62x | 11.9x | 7.21 | 7.14 | 0.96x |
+| Shortest path, directed | 25.2x | 0.116 | 0.166 | 1.50x | 1,483x | 0.095 | 0.138 | 1.63x |
+| Shortest path, none | 2.85x | 42.0 | 107.4 | 2.29x | 4.72x | 35.8 | 99.1 | 2.81x |
+| Label scan and filter | 4.68x | 4.45 | 18.9 | 4.33x | 7.43x | 4.27 | 10.9 | 2.58x |
+| Create 1 node | 46.6x | 0.022 | 0.792 | 38.4x | 53.4x | 0.018 | 0.790 | 45.0x |
+| Create 1,000 nodes | 16.1x | 0.997 | 14.8 | 15.3x | 15.1x | 0.926 | 13.9 | 14.8x |
+| Create 1 relationship | 85.8x | 0.053 | 2.88 | 69.3x | 1,719x | 0.049 | 2.67 | 61.2x |
+| Create 1,000 relationships | 9.46x | 2.12 | 23.1 | 10.6x | 10.9x | 2.73 | 22.7 | 8.90x |
+| Set 1 property by name | 31.0x | 0.050 | 1.04 | 21.9x | 2,136x | 0.025 | 0.681 | 26.8x |
+| Set 1,000 properties | 15.2x | 0.737 | 12.5 | 17.5x | 16.2x | 0.720 | 12.5 | 17.1x |
+| Merge existing node | 28.3x | 0.018 | 0.111 | 6.62x | 3,175x | 0.016 | 0.098 | 6.15x |
+| Merge 1,000 new nodes | 1.01x | 18.3 | 18.0 | 0.97x | 0.94x | 18.4 | 17.2 | 0.99x |
+| Delete 1 node | 71.3x | 0.032 | 3.77 | 116x | 101x | 0.033 | 3.73 | 115x |
+| Delete 1,000 nodes | 28.0x | 0.771 | 22.0 | 29.0x | 33.4x | 0.813 | 22.6 | 26.9x |
 
 **The same text every run: queries** (`BENCH_INDEXES=1 npm run bench:smaltdb`, which now runs a query as an
 application does, through `runOnSmaltdb`):
 
 | Query | before | smaltcy | smaltdb | ratio |
 | --- | ---: | ---: | ---: | ---: |
-| Seek a person by name | 2.52x | 0.018 | 0.019 | 1.08x |
-| 1 hop | 3.33x | 0.038 | 0.061 | 1.60x |
-| 2 hops | 3.22x | 0.381 | 0.990 | 2.54x |
-| 3 hops | 2.89x | 4.67 | 13.8 | 3.06x |
-| Variable length 1..3, distinct | 1.09x | 12.5 | 14.0 | 0.98x |
-| Shortest path | 3.14x | 0.047 | 0.042 | 0.88x |
-| Shortest path, 5 hops | 1.50x | 30.6 | 47.9 | 1.65x |
-| Shortest path, none (directed) | 4.92x | 0.030 | 0.059 | 2.04x |
-| Shortest path, none (either way) | 2.54x | 32.2 | 89.2 | 2.64x |
-| Label scan and filter | 2.17x | 2.53 | 4.91 | 2.07x |
-| Group by city | 2.53x | 23.0 | 62.8 | 2.71x |
-| All relationships | 0.50x | 16.6 | 7.92 | 0.45x |
-| Triangles (bounded) | 2.34x | 12.4 | 30.9 | 2.49x |
+| Seek a person by name | 2.52x | 0.021 | 0.025 | 1.04x |
+| 1 hop | 3.33x | 0.049 | 0.071 | 1.89x |
+| 2 hops | 3.22x | 0.373 | 0.964 | 2.58x |
+| 3 hops | 2.89x | 4.53 | 13.1 | 2.94x |
+| Variable length 1..3, distinct | 1.09x | 13.5 | 14.3 | 1.05x |
+| Shortest path | 3.14x | 0.056 | 0.056 | 0.95x |
+| Shortest path, 5 hops | 1.50x | 34.0 | 48.3 | 1.36x |
+| Shortest path, none (directed) | 4.92x | 0.032 | 0.060 | 1.91x |
+| Shortest path, none (either way) | 2.54x | 37.6 | 91.8 | 2.53x |
+| Label scan and filter | 2.17x | 2.10 | 4.98 | 2.31x |
+| Group by city | 2.53x | 27.9 | 76.8 | 2.62x |
+| All relationships | 0.50x | 18.1 | 7.86 | 0.41x |
+| Triangles (bounded) | 2.34x | 15.0 | 32.6 | 2.24x |
 
 **The same text every run: writes** (`BENCH_ENTRY=bench/writes.ts npm run bench:smaltdb`):
 
 | Write | before | smaltcy | smaltdb | ratio |
 | --- | ---: | ---: | ---: | ---: |
-| Create 1 node | 50.6x | 0.007 | 0.509 | 40.9x |
-| Create 1,000 nodes | 12.3x | 0.709 | 10.7 | 13.9x |
-| Create 1 relationship | 115x | 0.015 | 2.06 | 115x |
-| Create 1,000 relationships | 13.4x | 1.46 | 19.1 | 12.8x |
-| Set 1 property by name | 8.34x | 0.012 | 0.084 | 8.62x |
-| Set 1,000 properties | 14.8x | 0.614 | 10.9 | 19.1x |
-| Merge existing node | 5.40x | 0.011 | 0.064 | 5.83x |
-| Merge 1,000 new nodes | 0.84x | 16.3 | 14.2 | 0.85x |
-| Delete 1,000 nodes | 32.9x | 0.547 | 17.9 | 35.9x |
+| Create 1 node | 50.6x | 0.009 | 0.536 | 47.2x |
+| Create 1,000 nodes | 12.3x | 0.880 | 11.7 | 12.7x |
+| Create 1 relationship | 115x | 0.015 | 2.19 | 105x |
+| Create 1,000 relationships | 13.4x | 1.70 | 20.9 | 12.2x |
+| Set 1 property by name | 8.34x | 0.012 | 0.087 | 8.33x |
+| Set 1,000 properties | 14.8x | 0.664 | 11.7 | 18.2x |
+| Merge existing node | 5.40x | 0.011 | 0.068 | 5.71x |
+| Merge 1,000 new nodes | 0.84x | 16.3 | 14.1 | 0.84x |
+| Delete 1,000 nodes | 32.9x | 0.546 | 18.8 | 33.9x |
 
 What it says:
 
-- **The gate** (seek by name and 1 hop within 1.5 times smaltcy's time, with a literal and with a parameter): 1.14
-  and 1.09 for the seek, 0.88 and 0.80 for 1 hop.
-- **Reads that start at a node found by a value** are near smaltcy's time when their values differ: 2 hops 1.21 and
-  1.15, variable length 0.99 and 0.92, the shortest path 0.76 and 0.88, directed 1.38 and 1.53. What is left is
-  smaltdb's work on each row (3 hops 1.88 and 2.03, a shortest path that isn't there 2.77 and 3.06): steps 2 and 3.
+- **The gate** (seek by name and 1 hop within 1.5 times smaltcy's time, with a literal and with a parameter): 1.15
+  and 1.04 for the seek, 0.91 and 0.84 for 1 hop.
+- **Reads that start at a node found by a value** are near smaltcy's time when their values differ: 2 hops 1.22 and
+  1.29, variable length 0.96 and 0.97, the shortest path 0.62 and 0.96, directed 1.50 and 1.63. What is left is
+  smaltdb's work on each row (3 hops 2.02 and 2.00, a shortest path that isn't there 2.29 and 2.81): steps 2 and 3.
 - **When the text repeats**, the short queries no longer compile their Cypher to a plan and find their statement by
-  the plan's text on every run: the seek 2.52 to 1.08, the shortest path 3.14 to 0.88, 1 hop 3.33 to 1.60, no path
-  (directed) 4.92 to 2.04. The other queries are unchanged: over two runs of this change their ratios fall on both
-  sides of the baseline's (3 hops 2.73 and 3.06 against 2.89; the label scan 2.15 and 2.07 against 2.17).
-- **A write that finds its rows by a parameter** lost its 55 ms scan: create 1 relationship 63.8 to 2.75 ms, set 1
-  property 56.7 to 0.66, merge existing 60.6 to 0.20.
-- **A write whose values differ** plans fewer statements: merge existing 0.529 to 0.191 ms, set 1 property 1.11 to
-  0.825, create 1 relationship 3.39 to 2.81, create 1 node 0.936 to 0.754.
-- **Slower: delete 1 node with its value written in the text**, 2.84 to 3.57 ms. Its match is now a statement
+  the plan's text on every run: the seek 2.52 to 1.04, the shortest path 3.14 to 0.95, 1 hop 3.33 to 1.89, no path
+  (directed) 4.92 to 1.91. The other queries are unchanged: over three runs of this change their ratios fall on both
+  sides of the baseline's (3 hops 2.73, 3.06 and 2.94 against 2.89; the label scan 2.15, 2.07 and 2.31 against 2.17).
+- **A write that finds its rows by a parameter** lost its 55 ms scan: create 1 relationship 63.8 to 2.67 ms, set 1
+  property 56.7 to 0.68, merge existing 60.6 to 0.10.
+- **A write whose values differ** plans fewer statements: merge existing 28.3 to 6.62 times smaltcy's time (0.529
+  to 0.111 ms), set 1 property 31.0 to 21.9, create 1 relationship 85.8 to 69.3, create 1 node 46.6 to 38.4.
+- **Slower: delete 1 node with its value written in the text**, 2.84 to 3.77 ms. Its match is now a statement
   smaltdb keeps, with the plan it made when `:Bench` had 441 nodes: a scan of the node table. Planned anew for every
   statement, as it was, the match moved to the label's index as the label shrank. With a parameter it was a kept
-  statement before (3.99 ms; 3.64 now). The two plans timed on their own (prepared, in turns): the label's index
+  statement before (3.99 ms; 3.73 now). The two plans timed on their own (prepared, in turns): the label's index
   takes 0.13 ms at 201 nodes of the label and 0.26 ms at 401; the scan takes 1.39 ms whatever the label holds, and
   smaltdb's planner takes it from about 500 nodes on, where the index would still be the faster up to about 2,100
   (an estimate, from 0.66 µs a node).
-- **Slower by 0.004 to 0.007 ms: a single write whose text repeats** (merge existing 0.057 to 0.064 ms, set 1
-  property 0.080 to 0.084). Its values are taken out again on every call (2.5 to 5.5 µs, timed on its own), which
-  gains nothing when the text is the same.
+- **Slower by about 0.01 ms: a single write whose text repeats** (merge existing 0.057 to 0.068 ms, set 1 property
+  0.080 to 0.087). Its values are taken out again on every call (2.5 to 5.5 µs, timed on its own), which gains
+  nothing when the text is the same.
+- **Slower: set 1,000 properties with the value written in the text**, 11.8 to 12.5 ms, now what it takes with a
+  parameter (12.4 before, 12.5 now). smaltdb's expression compiler builds a map of literals once and a map that holds
+  a parameter for each row (`fold`, read in its source). That this is the 0.7 ms is an assumption: timing the update
+  alone would confirm it.
 - **Where a single write's time goes now** (the smaltdb statements one Cypher statement becomes, 200 statements with
   other values each, timed by a scratch script; ms for one Cypher statement):
   - create 1 node, 0.82: the largest node id, a scan of the node table, 0.37; the two appends, planned anew, 0.19.

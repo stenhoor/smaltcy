@@ -219,8 +219,11 @@ query's values.
   checks on a row's stored bytes before it decodes the row (for a parameter since smaltdb `1c2fce8`). The plan is then
   for values of those kinds, so a shape holds the kind of every value taken out and of every parameter given: a value
   of another kind is another statement.
-- **What stays in a shape:** NULL, booleans and every other literal; SKIP and LIMIT with their values, which the
-  compiler checks as it compiles; the graph's labels and types with their tables.
+- **What stays in a shape:** NULL, booleans and every other literal; the values inside a list or a map the query
+  builds (`[1, 2]`, `{a: 1}`: smaltdb makes one once when all of it is written out, so an `IN` over it is a lookup, and
+  types its elements by what is written; a pattern's property map is conditions, and its values are taken out); SKIP
+  and LIMIT with their values, which the compiler checks as it compiles; the graph's labels and types with their
+  tables.
 - **Not kept:** a query that reads the past (its version is found before it is compiled), and one with more than 64
   values. Where the compiler needs a value written out (the direction and type of `degree()`), it refuses the query
   with its values taken out, and that shape is compiled as written from then on, as every query was before.

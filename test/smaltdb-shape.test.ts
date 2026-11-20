@@ -78,12 +78,25 @@ describe('a query with other values runs the statement kept for its shape', () =
     expect(prepared()).toBe(6);
   });
 
-  test('several values, in lists and maps, and the same value twice', () => {
+  test('several values, and the same value twice', () => {
     const { db, prepared } = counting(b.db);
     for (const [x, y, z] of [['Ada', 1900, 'a'], ['Grace', 1815, 'b'], ['Ada', 1, 'Ada']] as const) {
-      same(db, `MATCH (p:Person) WHERE p.name IN ['${x}', '${z}'] OR p.born > ${y} RETURN p.name AS name, {k: '${x}', n: ${y}} AS m, ['${z}', ${y}] AS l ORDER BY name`);
+      same(db, `MATCH (p:Person {name: '${x}'}) WHERE p.born > ${y} OR p.name < '${z}' RETURN p.name AS name, '${z}' AS z, ${y} + 1 AS y ORDER BY name`);
     }
     expect(prepared()).toBe(1);
+  });
+
+  test('a list or a map the query builds stays written: another list is another statement', () => {
+    const { db, prepared } = counting(b.db);
+    for (const [x, y, z] of [['Ada', 1900, 'a'], ['Grace', 1815, 'b'], ['Ada', 1, 'Ada']] as const) {
+      same(db, `MATCH (p:Person) WHERE p.name IN ['${x}', '${z}'] RETURN p.name AS name, {k: '${x}', n: ${y}} AS m, ['${z}', ${y}, []] AS l ORDER BY name`);
+    }
+    expect(prepared()).toBe(3);
+    // The lists the same and a value beside them another: one statement.
+    for (const year of [1900, 1815, 1]) same(db, `MATCH (p:Person) WHERE p.name IN ['Ada', 'Alan'] AND p.born > ${year} RETURN p.name AS name, [1, []] AS l ORDER BY name`);
+    expect(prepared()).toBe(4);
+    // Lists of lists with an empty one among them, whose elements smaltdb types by what is written.
+    same(db, 'UNWIND [[1, 2], [1], [], [2, 0], [1, null]] AS x RETURN min(x) AS lo, max(x) AS hi');
   });
 
   test('parameters: one statement for values of one kind, another for another kind', () => {
@@ -145,9 +158,11 @@ describe('a query with other values runs the statement kept for its shape', () =
 
   test('more values than a statement takes parameters for: compiled as written', () => {
     const { db, prepared } = counting(b.db);
-    const many = Array.from({ length: 100 }, (_, i) => 1800 + i);
-    same(db, `MATCH (p:Person) WHERE p.born IN [${many.join(', ')}] RETURN p.name AS name ORDER BY name`);
+    const many = Array.from({ length: 70 }, (_, i) => `p.born = ${1800 + 2 * i}`);
+    same(db, `MATCH (p:Person) WHERE ${many.join(' OR ')} RETURN p.name AS name ORDER BY name`);
     expect(prepared()).toBe(0);
+    same(db, `MATCH (p:Person) WHERE ${many.slice(0, 60).join(' OR ')} RETURN p.name AS name ORDER BY name`);
+    expect(prepared()).toBe(1);
   });
 
   test('a database that can only run statements: the same rows', () => {
