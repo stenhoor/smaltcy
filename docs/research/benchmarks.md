@@ -1216,8 +1216,13 @@ What it says:
   Cypher 19%, finding the shape 7%, the two appends 44% (25% writing the two rows and their three index entries), the
   savepoint and its release 7%, the commit 5%, the id lookup 4%.
 - **Deleting 1 node, differing, is the furthest of them** (7.6x to 9.5x, 0.20 to 0.23 ms). That case deletes one of 401
-  nodes of a label, found by a scan of the label. Where its time goes is not measured yet; the same DELETE of a
-  label's only node took 0.034 ms in a scratch run of this change (3.3x to 3.6x, three runs).
+  nodes of a label, found by a scan of the label (it has no index on the property), and the scan is most of it. In a
+  scratch run with 801 nodes of the label, the match alone (`MATCH (n:Bench {i: …}) RETURN n.i`, a value that differs
+  each time) took 371 and 377 µs on smaltdb and 70 and 68 µs on smaltcy (two runs). smaltdb reads the label's entries
+  from the label index, then each node by its rowid: one seek for each node of the label (EXPLAIN ANALYZE). So this is
+  a read's cost, and one the read benchmarks do not have: their label scan is over a label that is nearly the whole
+  node table, which smaltdb reads in one loop. The same DELETE of a label's only node took 0.034 ms in a scratch run
+  of this change (3.3x to 3.6x, three runs).
 - **Writes of 1,000 rows did not move.** smaltdb's own times, the three runs before and now: creating 1,000 nodes 8.0
   to 8.9 ms and 8.0 to 8.4; 1,000 relationships 13.2 to 13.7 and 11.8 to 12.9; setting 1,000 properties 7.0 to 7.5
   and 6.9 to 7.3; deleting 1,000 nodes 13.2 to 13.8 and 13.1 to 13.3. Their rows are written into one statement as
