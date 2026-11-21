@@ -184,6 +184,14 @@ all it wrote, the labels and types it added included:
   that commit. The latest is the last commit in `smalt_commits` (smaltdb records every commit that writes a table
   with history), the oldest kept the node table's horizon in `smalt_history`. A plan with `AT VERSION` that writes is
   smaltcy's error.
+- **The last commit is read from the end of `smalt_commits`** (`lastCommitOf`). smaltdb adds a row for each commit
+  as it is made, so the latest is the table's last row, and the last commit at or before a time is the first such row
+  from the end: the read stops there. Every statement outside a transaction looks the latest up, so the runner keeps
+  the statement for it, prepared once for a database (and one for a time, its parameter). Measured on the lookup
+  alone, in turns (three runs): a `max` over a scan of the commits took 2.7 to 4.6 µs at 6 commits, 17 µs at 1,000 and
+  286 to 300 µs at 20,000; the kept statement takes 0.4 to 1.2 µs at any of them. A seek by name on a graph of one
+  node, against smaltcy's in-memory engine with history (two runs, the engines taking turns): 3.1x and 2.8x at 1,000
+  commits and 31x and 32x at 20,000 before; 1.01x and 0.96x, and 1.06x and 1.06x now.
 - **`version()`** is the version read: `AT VERSION`'s, else the last commit in `smalt_commits` (at or before `AT
   TIME`'s moment), 0 before the first; NULL on a graph without history, as smaltcy gives it.
 - **`forget(v)`** is `forgetOnSmaltdb`: smaltdb's `forget` maintenance statement with `before: { commit: v }`, for each

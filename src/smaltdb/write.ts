@@ -44,7 +44,7 @@ import type { GraphTables } from './schema.js';
 import { NODE_LABEL } from './schema.js';
 import { runByShape, valuesOut } from './shape.js';
 import {
-  and, asOfOf, call, caseWhen, colRef, COMMITS_TABLE, Compiler, compileQuery, eq, HOPS, IDS, isNull, lit, noHistory, NULL, or,
+  and, asOfOf, call, caseWhen, colRef, Compiler, compileQuery, eq, HOPS, IDS, isNull, lastCommitOf, lastOf, lit, noHistory, NULL, or,
   paramsRead, paramValues, PROPS, Unsupported, type AsOf, type Binding, type Frame, type Rel, type Val,
 } from './compile.js';
 
@@ -205,11 +205,27 @@ export function latestVersion(db: SmaltdbDatabase): number {
   return lastCommit(db);
 }
 
+type Prepared = NonNullable<ReturnType<NonNullable<SmaltdbDatabase['preparePlan']>>>;
+
+/**
+ * A database's statements for its last commit, each prepared the first time it is run and kept: the latest, and the
+ * last at or before a time (its parameter). Every statement on a graph that keeps history runs the first, so smaltdb
+ * does not look it up by its plan each time.
+ */
+const commitLookups = new WeakMap<object, { latest?: Prepared; atTime?: Prepared }>();
+
+/** The last commit recorded in `smalt_commits` (`lastCommitOf`), 0 before any: with `atOrBefore`, the last at or before that time. */
 function lastCommit(db: SmaltdbDatabase, atOrBefore?: number): number {
-  let commits: PlanOp = scan(COMMITS_TABLE, [0, 1]);
-  if (atOrBefore !== undefined) commits = filter(commits, call('cmp_le', [colRef(1, 'int'), lit(atOrBefore)], 'bool'));
-  const r = db.queryPlan({ kind: 'query', plan: maxOf(commits), columns: [{ name: 'v', type: 'int' }] } as PlanStatementInput);
-  return (r.rows[0]?.[0] as number | null) ?? 0;
+  const statement = (time?: PlanExpr): PlanStatementInput => ({ kind: 'query', plan: lastCommitOf(time), columns: [{ name: 'v', type: 'int' }] }) as PlanStatementInput;
+  let rows: readonly (readonly unknown[])[];
+  if (!db.preparePlan) rows = db.queryPlan(statement(atOrBefore === undefined ? undefined : lit(atOrBefore))).rows;
+  else {
+    let kept = commitLookups.get(db);
+    if (!kept) commitLookups.set(db, (kept = {}));
+    if (atOrBefore === undefined) rows = (kept.latest ??= db.preparePlan(statement())).result().rows;
+    else rows = (kept.atTime ??= db.preparePlan(statement({ k: 'param', index: 0, type: 'num' }))).result([atOrBefore] as never).rows;
+  }
+  return (rows[0]?.[0] as number | null) ?? 0;
 }
 
 /**
@@ -337,12 +353,6 @@ const ONE_ROW: PlanOp = { op: 'values', rows: [[]], types: [] };
 const scalar = (p: PlanOp, type: PlanType): PlanExpr => ({ k: 'subquery', mode: 'scalar', plan: p, type, collation: 'binary' });
 const exists = (p: PlanOp): PlanExpr => ({ k: 'subquery', mode: 'exists', plan: p, type: 'bool', collation: 'binary' });
 const maxOf = (p: PlanOp): PlanOp => ({ op: 'aggregate', input: p, keys: [], aggs: [{ fn: 'max', args: [colRef(0, 'int')], star: false, distinct: false, collation: 'binary', type: 'int' }], carry: [] });
-/**
- * The row of a table with the largest rowid (`rows`: a scan of the table whose column 0 is its rowid), none for an
- * empty table. smaltdb reads a table from its end for its rowids in descending order and stops at the first row; a
- * `max` over the scan reads every row.
- */
-const lastOf = (rows: PlanOp): PlanOp => ({ op: 'limit', input: { op: 'sort', input: rows, keys: [{ expr: colRef(0, 'int'), desc: true, nullsFirst: false, collation: 'binary' }] }, count: lit(1) });
 
 /** Whether a plan reads the graph: a MATCH, or an EXISTS or pattern comprehension (a nested plan) in an expression. */
 function readsGraph(x: unknown): boolean {

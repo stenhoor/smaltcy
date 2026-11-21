@@ -100,6 +100,26 @@ export const noHistory = (): never => {
 export const COMMITS_TABLE = 'smalt_commits';
 
 /**
+ * The row of a table with the largest rowid (`rows`: a scan of the table whose column 0 is its rowid), none for an
+ * empty table. smaltdb reads a table from its end for its rowids in descending order and stops at the first row; a
+ * `max` over the scan reads every row.
+ */
+export const lastOf = (rows: PlanOp): PlanOp => ({ op: 'limit', input: { op: 'sort', input: rows, keys: [{ expr: colRef(0, 'int'), desc: true, nullsFirst: false, collation: 'binary' }] }, count: lit(1) });
+
+/**
+ * The id of the last commit recorded in `smalt_commits`, as a plan of one column: one row, or none before the first
+ * commit. With `atOrBefore` (a time: a literal or a parameter), the last commit at or before it. smaltdb adds a row
+ * for each commit as it is made, so the last row holds the largest id: the table is read from its end and the read
+ * stops at the first row that counts, where a `max` over a scan reads every commit.
+ */
+export function lastCommitOf(atOrBefore?: PlanExpr): PlanOp {
+  // The rowid (the order the commits were recorded in), the commit's id, its time.
+  let commits: PlanOp = { op: 'scan', table: COMMITS_TABLE, columns: [-1, 0, 1] };
+  if (atOrBefore !== undefined) commits = { op: 'filter', input: commits, pred: call('cmp_le', [colRef(2, 'int'), atOrBefore], 'bool') };
+  return { op: 'project', input: lastOf(commits), exprs: [colRef(1, 'int')] };
+}
+
+/**
  * A compiled plan reading the past: every scan of the graph's tables and every `relationships` (in subqueries too)
  * reads them as of `asOf`. smaltdb's `paths` reads its edge tables as they are now, so variable-length relationships
  * and shortest paths are refused (a variable-length search where the order doesn't show, an `iterate`, too: it is
@@ -2531,9 +2551,7 @@ export class Compiler {
   private version(): Val {
     if (!this.t.history) return literal(null);
     if (this.asOf && 'commit' in this.asOf) return { k: 'value', e: lit(this.asOf.commit), t: 'int' };
-    let commits: PlanOp = { op: 'scan', table: COMMITS_TABLE, columns: [0, 1] };
-    if (this.asOf) commits = { op: 'filter', input: commits, pred: call('cmp_le', [colRef(1, 'int'), lit(this.asOf.time)], 'bool') };
-    const last: PlanOp = { op: 'aggregate', input: commits, keys: [], aggs: [{ fn: 'max', args: [colRef(0, 'int')], star: false, distinct: false, collation: 'binary', type: 'int' }], carry: [] };
+    const last = lastCommitOf(this.asOf ? lit(this.asOf.time) : undefined);
     return { k: 'value', e: call('coalesce', [{ k: 'subquery', mode: 'scalar', plan: last, type: 'int', collation: 'binary' }, lit(0)], 'int'), t: 'int' };
   }
 
