@@ -3,9 +3,9 @@ import { Database } from 'smaltdb-src/engine/database.js';
 import { compile } from '../src/cypher/index.js';
 import { HistoryStore, open, SmaltcyError, type Graph } from '../src/index.js';
 import { social } from '../src/datasets/index.js';
-import { Unsupported } from '../src/smaltdb/compile.js';
+import { compileQuery, lastCommitOf, lit, paramValues, Unsupported } from '../src/smaltdb/compile.js';
 import { graphTables, graphTablesFor, loadStatements, schemaStatements, type GraphTables } from '../src/smaltdb/schema.js';
-import { forgetOnSmaltdb, latestVersion, runOnSmaltdb, type NextIds, type RunOptions } from '../src/smaltdb/write.js';
+import { forgetOnSmaltdb, latestVersion, runOnSmaltdb, type NextIds, type RunOptions, type SmaltdbDatabase } from '../src/smaltdb/write.js';
 import { EVOLVING, randomSteps, type CommitOptions, type HistoryStep } from './helpers/history-cases.js';
 import { dataOf } from './helpers/smaltdb.js';
 
@@ -189,6 +189,102 @@ describe('history on smaltdb: every version as it was', () => {
     expect(() => p.g.run(`AT VERSION 6 ${NODES}`)).toThrow(/no version 6/);
     expect(() => runOnSmaltdb(p.db, compile(`AT VERSION ${latestVersion(p.db) + 1} ${NODES}`).plan, p.tables)).toThrow(/no version/);
     expect(() => runOnSmaltdb(p.db, compile(`AT VERSION -1 ${NODES}`).plan, p.tables)).toThrow(/no version/);
+  });
+});
+
+describe('the last commit is read from the end of smalt_commits', () => {
+  /** The operators smaltdb runs a query with, from the top, each with the rows it gave (EXPLAIN ANALYZE). */
+  const operators = (db: Database, plan: unknown): [string, number][] =>
+    (db.queryPlan({ kind: 'explain', mode: 'analyze', query: { kind: 'query', plan } } as never).rows as unknown[][]).map((r) => [String(r[2]), r[5] as number]);
+  /** The last commit recorded at or before a time (every one, without), from all of them. */
+  const lastOf = (p: Pair, time = Infinity): number => Math.max(0, ...p.recorded().filter((c) => c.time <= time).map((c) => c.id));
+
+  test('before the first commit there is none', () => {
+    const p = new Pair(open({ history: true }), 'x');
+    expect(p.recorded()).toEqual([]);
+    expect(latestVersion(p.db)).toBe(0);
+    expect(runOnSmaltdb(p.db, compile('RETURN version() AS v').plan, p.tables).rows).toEqual([[0]]);
+  });
+
+  test('the latest version: one row read, whatever the commits', () => {
+    const p = randomPair(9, 25);
+    expect(p.recorded().length).toBeGreaterThan(20);
+    expect(latestVersion(p.db)).toBe(lastOf(p));
+    const ops = operators(p.db, lastCommitOf());
+    // No sort and no aggregate, and the scan stops at its first row.
+    expect(ops.map(([name]) => name)).toEqual(['PROJECT', 'LIMIT', 'PROJECT', 'SCAN smalt_commits']);
+    expect(ops.map(([, rows]) => rows)).toEqual([1, 1, 1, 1]);
+  });
+
+  test('the last commit at or before a time: the commits after it are read, then it', () => {
+    const p = randomPair(10, 25);
+    const recorded = p.recorded();
+    for (const { time } of recorded) {
+      const ops = operators(p.db, lastCommitOf(lit(time)));
+      expect(ops.map(([name]) => name)).toEqual(['PROJECT', 'LIMIT', 'PROJECT', 'FILTER', 'SCAN smalt_commits']);
+      expect(ops.map(([, rows]) => rows), String(time)).toEqual([1, 1, 1, 1, recorded.filter((c) => c.time > time).length + 1]);
+    }
+    // A time before the first commit: every commit is read, and none counts.
+    const before = Math.min(...recorded.map((c) => c.time)) - 1;
+    expect(operators(p.db, lastCommitOf(lit(before))).map(([, rows]) => rows)).toEqual([0, 0, 0, 0, recorded.length]);
+  });
+
+  test('a time between two milliseconds reads the last commit before it', () => {
+    const p = randomPair(11, 12);
+    for (const { time } of p.recorded()) {
+      for (const t of [time + 0.5, time - 0.5]) {
+        // Through the runner, which finds the version first; then compiled as it is, where version() finds it.
+        const r = runOnSmaltdb(p.db, compile('AT TIME $t RETURN version() AS v').plan, p.tables, { params: { t } });
+        expect([r.rows, r.version], String(t)).toEqual([[[lastOf(p, t)]], lastOf(p, t)]);
+        const q = compileQuery(compile('AT TIME $t RETURN version() AS v').plan, p.tables, { params: { t } });
+        expect(p.db.queryPlan(q.statement, paramValues(q, { t }) as never).rows, String(t)).toEqual([[lastOf(p, t)]]);
+      }
+    }
+  });
+
+  test('a database that prepares no statements reads the same versions, and takes no maximum over the commits', () => {
+    const p = randomPair(12, 15);
+    const statements: unknown[] = [];
+    const plain: SmaltdbDatabase = {
+      queryPlan: (stmt, params) => {
+        statements.push(stmt);
+        return p.db.queryPlan(stmt, params as never);
+      },
+      get inTransaction() {
+        return p.db.inTransaction;
+      },
+    };
+    expect(latestVersion(plain)).toBe(lastOf(p));
+    const { time } = p.recorded()[5]!;
+    for (const q of ['AT TIME $t RETURN version() AS v', `AT TIME $t ${NODES}`]) {
+      const mine = runOnSmaltdb(plain, compile(q).plan, p.tables, { params: { t: time } });
+      const theirs = runOnSmaltdb(p.db, compile(q).plan, p.tables, { params: { t: time } });
+      expect([mine.rows, mine.version], q).toEqual([theirs.rows, lastOf(p, time)]);
+    }
+    expect(runOnSmaltdb(plain, compile(NODES).plan, p.tables).version).toBe(lastOf(p));
+    const wrote = runOnSmaltdb(plain, compile('CREATE (:Z)').plan, p.tables, { ids: p.ids });
+    expect(wrote.version).toBe(lastOf(p));
+    expect(wrote.version).toBe(latestVersion(p.db));
+    const text = statements.map((x) => JSON.stringify(x));
+    expect(text.some((x) => x.includes('smalt_commits'))).toBe(true);
+    expect(text.filter((x) => x.includes('smalt_commits') && x.includes('"aggregate"'))).toEqual([]);
+  });
+
+  test('each database has its own statements, which follow its commits, a forget and a new label', () => {
+    const a = randomPair(13, 8);
+    const b = randomPair(14, 16);
+    expect([latestVersion(a.db), latestVersion(b.db), latestVersion(a.db)]).toEqual([lastOf(a), lastOf(b), lastOf(a)]);
+    expect(lastOf(a)).not.toBe(lastOf(b));
+    const at = (p: Pair, t: number) => runOnSmaltdb(p.db, compile('AT TIME $t RETURN version() AS v').plan, p.tables, { params: { t } }).rows;
+    const ta = a.recorded()[3]!.time;
+    const tb = b.recorded()[9]!.time;
+    expect([at(a, ta), at(b, tb), at(a, ta)]).toEqual([[[lastOf(a, ta)]], [[lastOf(b, tb)]], [[lastOf(a, ta)]]]);
+    // A commit on one moves its latest, and not the other's.
+    const was = latestVersion(b.db);
+    a.step({ kind: 'run', statement: 'CREATE (:NeverSeen {k: 1})', options: {} });
+    expect([latestVersion(a.db), latestVersion(b.db)]).toEqual([lastOf(a), was]);
+    forgetOnSmaltdb(b.db, b.tables, b.commits.get(10)!);
+    expect([latestVersion(b.db), at(b, tb)]).toEqual([was, [[Math.max(lastOf(b, tb), b.commits.get(10)!)]]]);
   });
 });
 
