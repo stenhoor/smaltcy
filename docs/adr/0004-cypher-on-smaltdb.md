@@ -219,6 +219,13 @@ query's values.
 - **Not kept:** a query that reads the past (its version is found before it is compiled), and one with more than 64
   values. Where the compiler needs a value written out (the direction and type of `degree()`), it refuses the query
   with its values taken out, and that shape is compiled as written from then on, as every query was before.
+- **How a kept statement is found** (2026-11-21). The walk that takes a query's values out writes its shape as a list
+  of tokens: the plan's names, strings and numbers in the order it meets them, a mark where a list or an object opens
+  and closes, and a mark of its kind where a value was taken out. It hashes the tokens as it writes them. The query's
+  statement is the one kept under that hash whose tokens are the same, so two shapes with one hash stay two
+  statements. Until then the shape was a text, built for every query and looked up in a map: building it and hashing
+  it took most of the time of finding a kept statement (6.5 µs for the benchmark's seek by name, 1.7 µs as tokens;
+  docs/research/benchmarks.md, "A kept statement found by its tokens").
 - **Writes** run with their statement's values as parameters too (`valuesOut`), so the queries the runner makes for
   one statement and for the next of its shape are the same to smaltdb, which keeps them by their text. The rows the
   runner itself holds (the ids it found, the values it computed, the rows it appends) are still written into its
