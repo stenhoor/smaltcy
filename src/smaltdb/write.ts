@@ -13,6 +13,12 @@
  *   statements, not a few per row. It does only where that writes what row by row would: a SET or REMOVE sets one
  *   property or labels, of entities no two rows share, to values that read no other entity; a CREATE's properties read
  *   no nested plan and no entity it creates; a DELETE of nodes detaches them. Anything else runs row by row.
+ * - **Statements are kept.** The smaltdb statements made here for a Cypher statement are kept for its shape (shape.ts,
+ *   `writeByShape`; `Runner.site`): each is prepared once and run again by the next statement of the shape. Their
+ *   parameters are the Cypher statement's values, the row they run over (one row is a `values` of one row of
+ *   parameters) and the runner's own values (a new id, a rowid, a property map). A write of all its rows at once
+ *   writes them into its statements, which smaltdb plans each time; a statement that adds a label or a type makes
+ *   its statements anew from there, for the graph's new tables.
  * - **Entities are read live.** A row holds a node's id and a relationship's type and rowid; every query over a row
  *   reads their properties from their tables again, so `SET n.x = 1 RETURN n.x` reads 1. Values computed before a
  *   write keep what they were. Nodes, relationships and paths in the results are read once the statement is done, as
@@ -42,7 +48,7 @@ import { forEachChild, slotsRead, type Expr } from '../plan/expr.js';
 import { exprsOf, type GraphPlan, type Op, type Pattern, type RemoveItem, type SetItem } from '../plan/ops.js';
 import type { GraphTables } from './schema.js';
 import { NODE_LABEL } from './schema.js';
-import { runByShape, valuesOut } from './shape.js';
+import { runByShape, writeByShape } from './shape.js';
 import {
   and, asOfOf, call, caseWhen, colRef, Compiler, compileQuery, eq, HOPS, IDS, isNull, lastCommitOf, lastOf, lit, noHistory, NULL, or,
   paramsRead, paramValues, PROPS, Unsupported, type AsOf, type Binding, type Frame, type Rel, type Val,
@@ -152,15 +158,16 @@ export function runOnSmaltdb(db: SmaltdbDatabase, gp: GraphPlan, tables: GraphTa
   }
   if (gp.asOf) throw new Unsupported('AT VERSION and AT TIME');
   if (own && db.inTransaction) throw new Unsupported("an author or a message for a statement inside a transaction (give them to the transaction's begin or commit)");
-  // The statement with its values as parameters (shape.ts): what the runner then makes of it differs from one
-  // statement of its shape to the next only in parameters and in the rows it writes.
-  const stated = valuesOut(gp, params);
-  const run = new Runner(db, tables, stated.params, options.ids);
+  // The statement with its values as parameters, and what the runner kept for its shape (shape.ts): the statements it
+  // makes for one statement of a shape and for the next differ only in their parameters, so it makes each once.
+  const stated = writeByShape(db, gp, tables, params);
+  const run = new Runner(db, tables, stated.params, options.ids, stated.sites);
   const transaction = (action: string, more: object = {}) => db.queryPlan({ kind: 'transaction', action, ...more } as PlanStatementInput);
+  const around = own ? null : savepoints(db);
   if (own) {
     transaction('begin', { mode: 'deferred', ...(options.author !== undefined ? { author: options.author } : {}), ...(options.message !== undefined ? { message: options.message } : {}) });
   } else {
-    transaction('savepoint', { name: SAVEPOINT });
+    around!.savepoint();
   }
   let out: { columns: readonly string[]; rows: unknown[][] };
   try {
@@ -168,13 +175,13 @@ export function runOnSmaltdb(db: SmaltdbDatabase, gp: GraphPlan, tables: GraphTa
   } catch (e) {
     if (own) transaction('rollback');
     else {
-      transaction('rollback', { savepoint: SAVEPOINT });
-      transaction('release', { name: SAVEPOINT });
+      around!.rollback();
+      around!.release();
     }
     throw e;
   }
   if (own) transaction('commit');
-  else transaction('release', { name: SAVEPOINT });
+  else around!.release();
   const version = tables.history && !db.inTransaction ? latestVersion(db) : undefined;
   return { ...out, counts: run.counts, tables: run.tables(), ...(version !== undefined ? { version } : {}) };
 }
@@ -198,6 +205,29 @@ export function indexStatement(gp: Extract<GraphPlan, { kind: 'createIndex' | 'd
     columns: [{ column: -1, expr: { text: `map_get(props, ${JSON.stringify(gp.key)})`, expr }, desc: false, collation: 'binary' }],
   };
   return { kind: 'schema', op: { op: 'createIndex', index, ifNotExists: true } } as PlanStatementInput;
+}
+
+/** The three statements around a write that runs in a savepoint. */
+interface Savepoints {
+  readonly savepoint: () => void;
+  readonly rollback: () => void;
+  readonly release: () => void;
+}
+
+/** A database's savepoint statements, prepared the first time a write runs on it and kept. */
+const savepointsOf = new WeakMap<object, Savepoints>();
+
+function savepoints(db: SmaltdbDatabase): Savepoints {
+  let kept = savepointsOf.get(db);
+  if (kept) return kept;
+  const statement = (action: string, more: object): (() => void) => {
+    const stmt = { kind: 'transaction', action, ...more } as PlanStatementInput;
+    const prepared = db.preparePlan?.(stmt);
+    return prepared ? () => void prepared.result() : () => void db.queryPlan(stmt);
+  };
+  kept = { savepoint: statement('savepoint', { name: SAVEPOINT }), rollback: statement('rollback', { savepoint: SAVEPOINT }), release: statement('release', { name: SAVEPOINT }) };
+  savepointsOf.set(db, kept);
+  return kept;
 }
 
 /** The latest version of a graph that keeps history: the last commit recorded in `smalt_commits`, 0 before any. */
@@ -390,6 +420,30 @@ function readsDeleted(op: Op): boolean {
   return Object.entries(op).some(([k, v]) => k !== 'input' && k !== 'inputs' && walk(v));
 }
 
+/** The most nodes and relationships a DELETE deletes one by one, each by a statement kept for one (`deleteRows`). */
+const FEW = 8;
+
+/** A parameter's name for a column of the row a kept statement runs with: no name Cypher can write, then the column. */
+const ROW = '\u0001';
+
+/**
+ * A statement the runner makes for one row, or for values of its own, with those as its parameters. It is made once
+ * for a part of a write's plan and kept there (`Runner.site`), then run with each row's values, where a statement with
+ * the values written in it is a plan of its own each time, which smaltdb plans from nothing. It holds no runner: a
+ * statement kept outlives the run that made it.
+ */
+interface Stmt {
+  /** Runs it with its parameters bound: its rows. */
+  readonly rows: (bound: readonly unknown[]) => readonly (readonly unknown[])[];
+  /** Its parameters in order: a column of the row (0 and up), a value of the runner's (-1 - k), or a Cypher parameter's name. */
+  readonly order: readonly (number | string)[];
+  /** The row's columns of type `any`: each is given as a one-element `list<any>`, which keeps its kind (smaltdb ADR 0039). */
+  readonly wrapped: readonly boolean[] | null;
+}
+
+/** A value of the runner's as a parameter of a statement it makes by hand: parameter `k`, given as `given[k]` (`Runner.run`). */
+const own = (k: number, type: PlanType): PlanExpr => ({ k: 'param', index: k, type });
+
 class Runner {
   readonly counts = emptyCounts();
   private readonly labelTables: Map<string, string>;
@@ -401,16 +455,77 @@ class Runner {
     private readonly db: SmaltdbDatabase,
     private readonly t0: GraphTables,
     private readonly params: Readonly<Record<string, unknown>>,
-    private readonly ids?: NextIds,
+    private readonly ids: NextIds | undefined,
+    /**
+     * What runs of this statement's shape keep (shape.ts, `writeByShape`): by part of the plan, then by what it is
+     * for. Null when nothing is kept: the statement is run as written, or this run changed the graph's tables (a new
+     * label or type), which what is kept was made for.
+     */
+    private sites: Map<unknown, Map<string, unknown>> | null,
   ) {
     this.labelTables = new Map(t0.labelTables);
     this.types = new Map(t0.types);
   }
 
-  /** The graph's tables as they are now (the compiler reads the maps, which grow as labels and types are added). */
-  tables(): GraphTables {
-    return { ...this.t0, labelTables: this.labelTables, types: this.types };
+  /** What is kept for `role` of a part of the plan (`anchor`, or a table's name): made by the first run that needs it. */
+  private site<T>(anchor: unknown, role: string, make: () => T): T {
+    const sites = this.sites;
+    if (sites === null) return make();
+    let roles = sites.get(anchor);
+    if (roles === undefined) sites.set(anchor, (roles = new Map()));
+    let kept = roles.get(role) as T | undefined;
+    if (kept === undefined) roles.set(role, (kept = make()));
+    return kept;
   }
+
+  /** A parameter for column `i` of the row a statement runs with, numbered among `c`'s parameters. */
+  private rowParam(c: Compiler, i: number, type: PlanType): PlanExpr {
+    return { k: 'param', index: c.paramNames.push(ROW + i) - 1, type };
+  }
+
+  /**
+   * A statement compiled by `c` over one row of `frame` (`leafOne`), as one to run with each row's values and the
+   * statement's Cypher parameters. It is prepared when it is kept; one made for this run alone goes by its plan.
+   */
+  private stmt(c: Compiler, statement: PlanStatementInput, frame: Frame | null): Stmt {
+    const order = paramsRead(statement, c.paramNames).map((name) => (name.startsWith(ROW) ? Number(name.slice(ROW.length)) : name));
+    return this.prepared(statement, order, frame ? frame.types.map((t) => t === 'any') : null);
+  }
+
+  /** A statement made by hand, whose parameters are `count` values of the runner's (`own`). */
+  private ownStmt(statement: PlanStatementInput, count: number): Stmt {
+    return this.prepared(statement, Array.from({ length: count }, (_, k) => -1 - k), null);
+  }
+
+  private prepared(statement: PlanStatementInput, order: readonly (number | string)[], wrapped: readonly boolean[] | null): Stmt {
+    const db = this.db;
+    const prepared = this.sites !== null ? db.preparePlan?.(statement) : undefined;
+    return { order, wrapped, rows: prepared ? (bound) => prepared.result(bound as readonly never[]).rows : (bound) => db.queryPlan(statement, bound).rows };
+  }
+
+  /** Runs a statement with `row`'s values, the runner's (`given`) and the Cypher statement's parameters. */
+  private run(s: Stmt, row: Row | null, given?: readonly unknown[]): readonly (readonly unknown[])[] {
+    const order = s.order;
+    const bound: unknown[] = new Array(order.length);
+    for (let i = 0; i < order.length; i++) {
+      const p = order[i]!;
+      // A named one is there: the compiler refuses a parameter that wasn't given, and a shape holds which are.
+      if (typeof p === 'string') bound[i] = this.params[p];
+      else if (p < 0) bound[i] = given![-1 - p];
+      else bound[i] = s.wrapped![p] ? [row![p] ?? null] : (row![p] ?? null);
+    }
+    return s.rows(bound);
+  }
+
+  /**
+   * The graph's tables as they are now: the ones given, until this run adds a label or a type (then with the runner's
+   * maps, which grow as more are added). The same object while nothing is added, so what is kept by the tables (a
+   * shape's signature, shape.ts) is found again by the caller's next statement.
+   */
+  tables(): GraphTables {
+    return this.grown ?? this.t0;
+  }
+  private grown: GraphTables | null = null;
 
   private compiler(): Compiler {
     return new Compiler(this.tables(), this.params);
@@ -437,7 +552,7 @@ class Runner {
   private deleting = false;
 
   statement(gp: Extract<GraphPlan, { kind: 'query' }>): { columns: readonly string[]; rows: unknown[][] } {
-    this.deleting = deletes(gp.root);
+    this.deleting = this.site(gp, 'deletes', () => deletes(gp.root));
     const s = this.stream(gp.root, false);
     for (const col of gp.columns) {
       // smaltcy's engine gives a deleted node or relationship in a path or list as an empty one; smaltdb's lists drop it.
@@ -447,18 +562,31 @@ class Runner {
     const rows: Row[] = [];
     s.run((row) => (rows.push(row), true));
     // The results, read now: nodes, relationships and paths as they are at the end of the statement.
-    const c = this.compiler();
-    const leaf = this.leaf(s.frame, rows, true);
-    const exprs: PlanExpr[] = [];
-    const columns: { name: string; type: PlanType }[] = [];
-    for (const col of gp.columns) {
-      const b = leaf.frame.slots.get(col.slot) ?? refuse(`a result column (${col.name}) that isn't bound`);
-      const v = c.valueOf(b);
-      const r = v.k === 'value' ? { e: v.e, t: v.t } : c.resultValue(v);
-      exprs.push(r.e);
-      columns.push({ name: col.name, type: r.t });
+    if (!gp.columns.length) return { columns: [], rows: rows.map(() => []) };
+    const results = (c: Compiler, leaf: Rel): PlanStatementInput => {
+      const exprs: PlanExpr[] = [];
+      const columns: { name: string; type: PlanType }[] = [];
+      for (const col of gp.columns) {
+        const b = leaf.frame.slots.get(col.slot) ?? refuse(`a result column (${col.name}) that isn't bound`);
+        const v = c.valueOf(b);
+        const r = v.k === 'value' ? { e: v.e, t: v.t } : c.resultValue(v);
+        exprs.push(r.e);
+        columns.push({ name: col.name, type: r.t });
+      }
+      return { kind: 'query', plan: project(leaf.plan, exprs), columns };
+    };
+    let out: unknown[][];
+    if (rows.length === 1) {
+      // One row: a statement kept for the plan, the row its parameters.
+      const kept = this.site(gp, 'results', () => {
+        const c = this.compiler();
+        return this.stmt(c, results(c, this.leafOne(c, s.frame, true)), s.frame);
+      });
+      out = this.run(kept, rows[0]!).map((row) => [...row]);
+    } else {
+      const c = this.compiler();
+      out = this.exec(c, results(c, this.leaf(s.frame, rows, true)));
     }
-    const out = gp.columns.length ? this.exec(c, { kind: 'query', plan: project(leaf.plan, exprs), columns }) : rows.map(() => []);
     return { columns: gp.columns.map((col) => col.name), rows: out };
   }
 
@@ -467,14 +595,21 @@ class Runner {
    * input first, writes (so the order rows reach it in matters).
    */
   private stream(op: Op, above: boolean, quiet = true): Stream {
-    if (!writes(op) && settled(op)) return this.query(op);
-    if (op.op !== 'delete' && op.op !== 'argument' && deletes(op) && readsDeleted(op)) refuse(AFTER_DELETE_FEATURE);
-    const inputAbove = WRITES.has(op.op) || (above && op.op !== 'eager' && op.op !== 'sort' && op.op !== 'aggregate');
-    // `quiet`: nothing above this operation, up to one that reads all its rows first, reads the graph, writes or stops
-    // early, so a write here may write all its rows at once.
-    const inputQuiet = BARRIERS.has(op.op) || (quiet && !touches(op));
-    // Its rows are read before it writes (`stream` makes them one query), and it can write them all at once.
-    const batch = quiet && op.op !== 'argument' && op.op !== 'union' && settled(op.input);
+    // What the operation is to the runner is read from the plan alone, where it is at one place (so `above` and
+    // `quiet` are the same each time): worked out once for a plan that is kept.
+    const how = this.site(op, 'how', () => ({
+      query: !writes(op) && settled(op),
+      refused: op.op !== 'delete' && op.op !== 'argument' && deletes(op) && readsDeleted(op),
+      inputAbove: WRITES.has(op.op) || (above && op.op !== 'eager' && op.op !== 'sort' && op.op !== 'aggregate'),
+      // `quiet`: nothing above this operation, up to one that reads all its rows first, reads the graph, writes or
+      // stops early, so a write here may write all its rows at once.
+      inputQuiet: BARRIERS.has(op.op) || (quiet && !touches(op)),
+      // Its rows are read before it writes (`stream` makes them one query), and it can write them all at once.
+      batch: quiet && op.op !== 'argument' && op.op !== 'union' && settled((op as Op & { input: Op }).input),
+    }));
+    if (how.query) return this.query(op);
+    if (how.refused) refuse(AFTER_DELETE_FEATURE);
+    const { inputAbove, inputQuiet, batch } = how;
     switch (op.op) {
       case 'argument':
         if (op.slots.length) return refuse('a nested plan with writes');
@@ -493,30 +628,30 @@ class Runner {
         return refuse('UNION with writes');
       case 'create': {
         const input = this.stream(op.input, inputAbove, inputQuiet);
-        return this.create(op, input, batch && this.createInBatch(op.pattern, input.frame));
+        return this.create(op, input, batch && this.site(op, 'in a batch', () => this.createInBatch(op.pattern, input.frame)));
       }
       case 'merge': {
         const input = this.stream(op.input, inputAbove, inputQuiet);
-        return this.merge(op, input, batch && this.mergeInBatch(op, input.frame));
+        return this.merge(op, input, batch && this.site(op, 'in a batch', () => this.mergeInBatch(op, input.frame)));
       }
       case 'set': {
         const input = this.stream(op.input, inputAbove, inputQuiet);
-        if (batch && this.setInBatch(op.items, input.frame)) return this.batched(input, (rows) => this.setRows(op.items, input.frame, rows, false));
+        if (batch && this.site(op, 'in a batch', () => this.setInBatch(op.items, input.frame))) return this.batched(input, (rows) => this.setRows(op.items, input.frame, rows, false));
         return { frame: input.frame, run: (sink) => input.run((row) => (this.setItems(op.items, input.frame, row), sink(row))) };
       }
       case 'remove': {
         const input = this.stream(op.input, inputAbove, inputQuiet);
-        if (batch && this.setInBatch(op.items, input.frame)) return this.batched(input, (rows) => this.setRows(op.items, input.frame, rows, true));
+        if (batch && this.site(op, 'in a batch', () => this.setInBatch(op.items, input.frame))) return this.batched(input, (rows) => this.setRows(op.items, input.frame, rows, true));
         return { frame: input.frame, run: (sink) => input.run((row) => (this.removeItems(op.items, input.frame, row), sink(row))) };
       }
       case 'delete': {
         const input = this.stream(op.input, inputAbove, inputQuiet);
-        if (batch && this.deleteInBatch(op, input.frame)) return this.batched(input, (rows) => this.deleteRows(op, input.frame, rows));
+        if (batch && this.site(op, 'in a batch', () => this.deleteInBatch(op, input.frame))) return this.batched(input, (rows) => this.deleteRows(op, input.frame, rows));
         return {
           frame: input.frame,
           run: (sink) =>
             input.run((row) => {
-              for (const t of op.targets) this.deleteValue(this.evaluate(input.frame, row, t), op.detach);
+              op.targets.forEach((t, k) => this.deleteValue(this.evaluate(op, k === 0 ? 'target' : `target ${k}`, input.frame, row, t), op.detach));
               return sink(row);
             }),
         };
@@ -526,12 +661,17 @@ class Runner {
 
   /** A plan that writes nothing and reads what writes don't change: one query, run when its rows are wanted. */
   private query(op: Op): Stream {
-    const c = this.compiler();
-    const r = c.op(op);
+    // Asked for when it runs: by then an earlier write of this run may have added a label or a type (`site`).
+    const kept = () =>
+      this.site(op, 'query', () => {
+        const c = this.compiler();
+        const r = c.op(op);
+        return { frame: r.frame, stmt: this.stmt(c, { kind: 'query', plan: r.plan, columns: r.frame.types.map((type, i) => ({ name: `c${i}`, type })) }, null) };
+      });
     return {
-      frame: r.frame,
+      frame: kept().frame,
       run: (sink) => {
-        for (const row of this.rowsOf(c, r)) if (!sink(row)) return false;
+        for (const row of this.run(kept().stmt, null)) if (!sink([...row])) return false;
         return true;
       },
     };
@@ -557,15 +697,27 @@ class Runner {
     return { c, r: c.op(op) };
   }
 
+  /**
+   * `op` over one row of `frame` (its input's rows), as a statement kept for `anchor`: the frame of its rows, and the
+   * statement, which runs with a row as its parameters.
+   */
+  private overOne(anchor: unknown, role: string, op: Op & { input: Op }, frame: Frame): { frame: Frame; stmt: Stmt } {
+    return this.site(anchor, role, () => {
+      const c = this.compiler();
+      c.given.set(op.input, this.leafOne(c, frame));
+      const r = c.op(op);
+      return { frame: r.frame, stmt: this.stmt(c, { kind: 'query', plan: r.plan, columns: r.frame.types.map((type, i) => ({ name: `c${i}`, type })) }, frame) };
+    });
+  }
+
   /** An operation that passes rows on as they come: run on each row, its rows passed on before the next row's. */
   private perRow(op: Op & { input: Op }, input: Stream): Stream {
-    const { frame } = this.over(op, input.frame, []).r;
     return {
-      frame,
+      frame: this.overOne(op, 'rows', op, input.frame).frame,
       run: (sink) =>
         input.run((row) => {
-          const { c, r } = this.over(op, input.frame, [row]);
-          for (const out of this.rowsOf(c, r)) if (!sink(out)) return false;
+          // Asked for at each row: an earlier row's write may have added a label or a type (`site`).
+          for (const out of this.run(this.overOne(op, 'rows', op, input.frame).stmt, row)) if (!sink([...out])) return false;
           return true;
         }),
     };
@@ -573,14 +725,19 @@ class Runner {
 
   /** An operation that reads all its input first (EAGER, ORDER BY, aggregates): all of it, then one query. */
   private allRows(op: Op & { input: Op }, input: Stream): Stream {
-    const { frame } = this.over(op, input.frame, []).r;
     return {
-      frame,
+      frame: this.overOne(op, 'rows', op, input.frame).frame,
       run: (sink) => {
         const rows: Row[] = [];
         input.run((row) => (rows.push(row), true));
-        const { c, r } = this.over(op, input.frame, rows);
-        for (const out of this.rowsOf(c, r)) if (!sink(out)) return false;
+        // One row: the statement kept for a row. More, or none: one query with their values written in it.
+        let outs: Row[];
+        if (rows.length === 1) outs = this.run(this.overOne(op, 'rows', op, input.frame).stmt, rows[0]!).map((out) => [...out]);
+        else {
+          const { c, r } = this.over(op, input.frame, rows);
+          outs = this.rowsOf(c, r);
+        }
+        for (const out of outs) if (!sink(out)) return false;
         return true;
       },
     };
@@ -623,10 +780,25 @@ class Runner {
     if (n === 0) return { plan: { op: 'values', rows: rows.map(() => []), types: [] }, frame };
     const types = frame.types.map((t) => (t === 'any' ? 'list<any>' : t));
     // A node's or relationship's properties are read from its table below: the rows' own are not sent.
-    const live = new Set<number>();
-    for (const b of frame.slots.values()) if (b.k === 'node' || b.k === 'rel') live.add(b.props);
+    const live = liveProps(frame);
     const columns = frame.types.map((t, i) => (live.has(i) ? rows.map(() => null) : rows.map((r) => (t === 'any' ? [r[i] ?? null] : (r[i] ?? null)))));
-    const values = { op: 'values', rows: [], types, columns } as unknown as PlanOp;
+    return this.leafOver({ op: 'values', rows: [], types, columns } as unknown as PlanOp, frame, results);
+  }
+
+  /**
+   * One row the runner holds as a plan, its values the statement's parameters (`rowParam`): what `leaf` makes of one
+   * row, for a statement that is kept and run with each row.
+   */
+  private leafOne(c: Compiler, frame: Frame, results = false): Rel {
+    if (frame.types.length === 0) return { plan: ONE_ROW, frame };
+    const types = frame.types.map((t) => (t === 'any' ? 'list<any>' : t));
+    const live = liveProps(frame);
+    const row = types.map((t, i) => (live.has(i) ? lit(null, t) : this.rowParam(c, i, t)));
+    return this.leafOver({ op: 'values', rows: [row], types } as PlanOp, frame, results);
+  }
+
+  /** `values` (the rows' columns) as the frame's columns: each node's and relationship's properties read from its table. */
+  private leafOver(values: PlanOp, frame: Frame, results: boolean): Rel {
     const exprs = frame.types.map((t, i) => (t === 'any' ? call('list_get', [colRef(i, 'list<any>'), lit(0)], 'any') : colRef(i, t)));
     for (const b of frame.slots.values()) {
       if (b.k === 'node') {
@@ -664,25 +836,32 @@ class Runner {
 
   // Expressions.
 
-  /** An expression's value for one row. */
-  private evaluate(frame: Frame, row: Row, x: Expr): Value {
+  /**
+   * An expression's value for one row. Its statement is kept for `role` of `anchor`: the part of the plan the
+   * expression belongs to (a SET item, a DELETE, a pattern's node). What keeps a statement is read with rows of one
+   * frame, the one the statement was made for: an expression read with rows of two (a pattern's property map, before
+   * and after the pattern's nodes are in the row) is kept under a role for each.
+   */
+  private evaluate(anchor: unknown, role: string, frame: Frame, row: Row, x: Expr): Value {
     if (x.k === 'lit') return { k: 'value', v: x.v };
     if (x.k === 'param') {
       if (!(x.name in this.params)) throw new SmaltcyError('SMALTCY_PARAM', `Missing parameter $${x.name}`);
       return { k: 'value', v: this.params[x.name] ?? null };
     }
-    const c = this.compiler();
-    const leaf = this.leaf(frame, [row]);
-    const v = c.expr(x, leaf.frame);
-    const [exprs, types] = columnsOf(v);
-    const out = this.exec(c, { kind: 'query', plan: project(leaf.plan, exprs), columns: types.map((type, i) => ({ name: `c${i}`, type })) })[0]!;
-    return decode(v, out);
+    const kept = this.site(anchor, role, () => {
+      const c = this.compiler();
+      const leaf = this.leafOne(c, frame);
+      const v = c.expr(x, leaf.frame);
+      const [exprs, types] = columnsOf(v);
+      return { v, stmt: this.stmt(c, { kind: 'query', plan: project(leaf.plan, exprs), columns: types.map((type, i) => ({ name: `c${i}`, type })) }, frame) };
+    });
+    return decode(kept.v, this.run(kept.stmt, row)[0]!);
   }
 
-  /** An expression's value for each of the rows, as one query. */
-  private evaluateAll(frame: Frame, rows: readonly Row[], x: Expr): Value[] {
+  /** An expression's value for each of the rows, as one query (one row: `evaluate`, by the statement kept for it). */
+  private evaluateAll(anchor: unknown, role: string, frame: Frame, rows: readonly Row[], x: Expr): Value[] {
     if (!rows.length) return [];
-    if (x.k === 'lit' || x.k === 'param' || rows.length === 1) return rows.map((row) => this.evaluate(frame, row, x));
+    if (x.k === 'lit' || x.k === 'param' || rows.length === 1) return rows.map((row) => this.evaluate(anchor, role, frame, row, x));
     const c = this.compiler();
     const leaf = this.leaf(frame, rows);
     const v = c.expr(x, leaf.frame);
@@ -691,8 +870,8 @@ class Runner {
   }
 
   /** `propertyMap` for each of the rows: a map literal's entries evaluated for all of them in one query. */
-  private propertyMaps(frame: Frame, rows: readonly Row[], x: Expr, what: string): { props: Props; nulls: string[]; isMap: boolean }[] {
-    if (x.k !== 'map' || rows.length < 2) return rows.map((row) => this.propertyMap(frame, row, x, what));
+  private propertyMaps(anchor: unknown, frame: Frame, rows: readonly Row[], x: Expr, what: string): { props: Props; nulls: string[]; isMap: boolean }[] {
+    if (x.k !== 'map' || rows.length < 2) return rows.map((row) => this.propertyMap(anchor, 'props', frame, row, x, what));
     const c = this.compiler();
     const leaf = this.leaf(frame, rows);
     const vals = x.entries.map(([, e]) => c.expr(e, leaf.frame));
@@ -710,25 +889,55 @@ class Runner {
     });
   }
 
-  /** A property map's entries (a map literal's evaluated together, a parameter's or a node's as they are), NULLs dropped. */
-  private propertyMap(frame: Frame, row: Row, x: Expr, what: string): { props: Props; nulls: string[]; isMap: boolean } {
+  /**
+   * A map literal's entries when each is a written value or a parameter (`plain` for the map) holding NULL, a boolean,
+   * a string or a number: their values, with no query. Undefined when one holds anything else (a list, a map, a
+   * parameter that wasn't given): the query then gives the value, or the error, it always gave.
+   */
+  private plainEntries(entries: readonly (readonly [string, Expr])[]): Record<string, Value> | undefined {
+    const raw: Record<string, Value> = {};
+    for (const [k, e] of entries) {
+      let v: unknown;
+      if (e.k === 'lit') v = e.v;
+      else if (e.k === 'param' && e.name in this.params) v = this.params[e.name];
+      else return undefined;
+      if (!(v === null || typeof v === 'string' || typeof v === 'boolean' || typeof v === 'number')) return undefined;
+      raw[k] = { k: 'value', v };
+    }
+    return raw;
+  }
+
+  /**
+   * A property map's entries (a map literal's evaluated together, a parameter's or a node's as they are), NULLs
+   * dropped. Its statement is kept for `role` of `anchor`: the pattern's node or relationship, or the SET item, the
+   * map belongs to (`evaluate`).
+   */
+  private propertyMap(anchor: unknown, role: string, frame: Frame, row: Row, x: Expr, what: string): { props: Props; nulls: string[]; isMap: boolean } {
     let raw: Record<string, Value>;
     let isMap = true;
-    if (x.k === 'map') {
-      const c = this.compiler();
-      const leaf = this.leaf(frame, [row]);
-      const vals = x.entries.map(([, e]) => c.expr(e, leaf.frame));
-      const cols = vals.map(columnsOf);
-      const out = vals.length ? this.exec(c, { kind: 'query', plan: project(leaf.plan, cols.flatMap(([e]) => e)), columns: cols.flatMap(([, t]) => t).map((type, i) => ({ name: `c${i}`, type })) })[0]! : [];
-      raw = {};
+    // A map whose every entry is a value written in the statement or a parameter's is read here, as `evaluate` reads one.
+    const plain = x.k === 'map' && this.site(x, 'plain', () => x.entries.every(([, e]) => e.k === 'lit' || e.k === 'param')) ? this.plainEntries(x.entries) : undefined;
+    if (plain !== undefined) raw = plain;
+    else if (x.k === 'map') {
+      const kept = this.site(anchor, role, () => {
+        const c = this.compiler();
+        const leaf = this.leafOne(c, frame);
+        const vals = x.entries.map(([, e]) => c.expr(e, leaf.frame));
+        const cols = vals.map(columnsOf);
+        const statement: PlanStatementInput = { kind: 'query', plan: project(leaf.plan, cols.flatMap(([e]) => e)), columns: cols.flatMap(([, t]) => t).map((type, i) => ({ name: `c${i}`, type })) };
+        return { vals, widths: cols.map(([, t]) => t.length), stmt: vals.length ? this.stmt(c, statement, frame) : null };
+      });
+      const out = kept.stmt ? this.run(kept.stmt, row)[0]! : [];
+      const entries: Record<string, Value> = {};
       let at = 0;
       x.entries.forEach(([k], i) => {
-        const n = cols[i]![1].length;
-        raw[k] = decode(vals[i]!, out.slice(at, at + n));
+        const n = kept.widths[i]!;
+        entries[k] = decode(kept.vals[i]!, out.slice(at, at + n));
         at += n;
       });
+      raw = entries;
     } else {
-      const v = this.evaluate(frame, row, x);
+      const v = this.evaluate(anchor, role, frame, row, x);
       if (v.k === 'node' || v.k === 'rel') {
         isMap = false;
         raw = Object.fromEntries(Object.entries(v.props ?? {}).map(([k, p]) => [k, { k: 'value', v: p }]));
@@ -811,8 +1020,8 @@ class Runner {
       if (r.dir === 'both') throw new SmaltcyError('SMALTCY_SEMANTIC', 'A relationship to create needs a direction');
       if (r.min !== undefined) throw new SmaltcyError('SMALTCY_SEMANTIC', "Can't create a variable-length relationship");
     }
-    const nodeProps = created.map((n) => (n.props ? this.propertyMaps(inFrame, rows, n.props, 'CREATE').map((m) => m.props) : rows.map((): Props => ({}))));
-    const relProps = p.rels.map((r) => (r.props ? this.propertyMaps(inFrame, rows, r.props, 'CREATE').map((m) => m.props) : rows.map((): Props => ({}))));
+    const nodeProps = created.map((n) => (n.props ? this.propertyMaps(n, inFrame, rows, n.props, 'CREATE').map((m) => m.props) : rows.map((): Props => ({}))));
+    const relProps = p.rels.map((r) => (r.props ? this.propertyMaps(r, inFrame, rows, r.props, 'CREATE').map((m) => m.props) : rows.map((): Props => ({}))));
     const relTables = p.rels.map((r) => this.type(r.types[0]!));
     const node = { ids: [] as number[], props: [] as Props[] };
     const labels = { ids: [] as number[], labels: [] as string[] };
@@ -865,11 +1074,9 @@ class Runner {
       }
       return next;
     });
-    if (node.ids.length) this.db.queryPlan(this.append(this.tables().nodes, ['int', PROPS], [node.ids, node.props], [0, 1]));
-    if (labels.ids.length) this.db.queryPlan(this.append(this.tables().labels, ['int', 'text'], [labels.ids, labels.labels], [0, 1]));
-    rels.forEach((t, k) => {
-      if (t.rowids.length) this.db.queryPlan(this.append(relTables[k]!, ['int', 'int', 'int', PROPS], [t.rowids, t.starts, t.ends, t.props], [-1, 0, 1, 2]));
-    });
+    this.appendRows(this.tables().nodes, ['int', PROPS], [node.ids, node.props], [0, 1]);
+    this.appendRows(this.tables().labels, ['int', 'text'], [labels.ids, labels.labels], [0, 1]);
+    rels.forEach((t, k) => this.appendRows(relTables[k]!, ['int', 'int', 'int', PROPS], [t.rowids, t.starts, t.ends, t.props], [-1, 0, 1, 2]));
     return outRows;
   }
 
@@ -880,14 +1087,13 @@ class Runner {
    */
   private merge(op: Extract<Op, { op: 'merge' }>, input: Stream, batch = false): Stream {
     const match: Extract<Op, { op: 'match' }> = { op: 'match', input: op.input, pattern: op.pattern, optional: false };
-    const { frame } = this.over(match, input.frame, []).r;
+    const frame = this.overOne(op, 'match', match, input.frame).frame;
     if (batch) return this.batched(input, (rows) => this.mergeRows(op, match, input.frame, frame, rows), frame);
     return {
       frame,
       run: (sink) =>
         input.run((row) => {
-          const { c, r } = this.over(match, input.frame, [row]);
-          const found = this.rowsOf(c, r);
+          const found = this.run(this.overOne(op, 'match', match, input.frame).stmt, row).map((f) => [...f]);
           if (found.length) {
             for (const f of found) {
               this.setItems(op.onMatch, frame, f);
@@ -923,7 +1129,7 @@ class Runner {
   private mergeRows(op: Extract<Op, { op: 'merge' }>, match: Extract<Op, { op: 'match' }>, inFrame: Frame, out: Frame, rows: Row[]): Row[] {
     if (!rows.length) return [];
     const n = op.pattern.nodes[0]!;
-    const maps = n.props ? this.propertyMaps(inFrame, rows, n.props, 'MERGE') : rows.map(() => ({ props: {} as Props, nulls: [] as string[], isMap: true }));
+    const maps = n.props ? this.propertyMaps(n, inFrame, rows, n.props, 'MERGE') : rows.map(() => ({ props: {} as Props, nulls: [] as string[], isMap: true }));
     if (maps.some((m) => m.nulls.length) || rows.length === 1) {
       const outRows: Row[] = [];
       this.merge(op, { frame: inFrame, run: (sink) => rows.every((r) => sink(r)) }).run((r) => (outRows.push(r), true));
@@ -988,11 +1194,10 @@ class Runner {
       done.add(n.slot);
       for (const l of n.labels) this.label(l);
       // The properties read the row as it is now: the nodes created before this one are in it.
-      const props = n.props ? this.propertyMap(out, next, n.props, 'CREATE').props : {};
+      const props = n.props ? this.propertyMap(n, 'props, row by row', out, next, n.props, 'CREATE').props : {};
       const id = this.newNodeId();
-      this.db.queryPlan(this.append(this.tables().nodes, ['int', PROPS], [[id], [props]], [0, 1]));
-      const labels = [...new Set(n.labels)];
-      if (labels.length) this.db.queryPlan(this.append(this.tables().labels, ['int', 'text'], [labels.map(() => id), labels], [0, 1]));
+      this.appendRow(this.tables().nodes, ['int', PROPS], [id, props], [0, 1]);
+      for (const l of new Set(n.labels)) this.appendRow(this.tables().labels, ['int', 'text'], [id, l], [0, 1]);
       const b = nodeOf(n.slot);
       next[b.id] = id;
       next[b.props] = props;
@@ -1010,9 +1215,9 @@ class Runner {
       const a = next[nodeOf(p.nodes[r.from]!.slot).id] as number;
       const z = next[nodeOf(p.nodes[r.to]!.slot).id] as number;
       const [start, end] = r.dir === 'out' ? [a, z] : [z, a];
-      const props = r.props ? this.propertyMap(out, next, r.props, 'CREATE').props : {};
+      const props = r.props ? this.propertyMap(r, 'props, row by row', out, next, r.props, 'CREATE').props : {};
       const rowid = this.newRelId();
-      this.db.queryPlan(this.append(table, ['int', 'int', 'int', PROPS], [[rowid], [start], [end], [props]], [-1, 0, 1, 2]));
+      this.appendRow(table, ['int', 'int', 'int', PROPS], [rowid, start, end, props], [-1, 0, 1, 2]);
       const b = out.slots.get(r.slot) as Extract<Binding, { k: 'rel' }>;
       next[b.type] = type;
       next[b.rowid] = rowid;
@@ -1033,6 +1238,22 @@ class Runner {
   private append(table: string, types: readonly PlanType[], columns: readonly (readonly unknown[])[], into: readonly number[]): PlanStatementInput {
     const input = { op: 'values', rows: [], types, columns } as unknown as PlanOp;
     return write({ op: 'append', table, db: 'main', input, columns: into, upserts: [] });
+  }
+
+  /** Appends one row to a table: a statement kept for the table, the row's values its parameters. */
+  private appendRow(table: string, types: readonly PlanType[], row: readonly unknown[], into: readonly number[]): void {
+    const kept = this.site(table, 'append', () => {
+      const input = { op: 'values', rows: [types.map((t, k) => own(k, t))], types } as PlanOp;
+      return this.ownStmt(write({ op: 'append', table, db: 'main', input, columns: into, upserts: [] }), types.length);
+    });
+    this.run(kept, null, row);
+  }
+
+  /** Appends rows given as columns: one row by the statement kept for it, more as one statement with their values in it. */
+  private appendRows(table: string, types: readonly PlanType[], columns: readonly (readonly unknown[])[], into: readonly number[]): void {
+    const n = columns[0]!.length;
+    if (n === 1) this.appendRow(table, types, columns.map((c) => c[0]), into);
+    else if (n > 1) this.db.queryPlan(this.append(table, types, columns, into));
   }
 
   private newNodeId(): number {
@@ -1060,13 +1281,14 @@ class Runner {
    */
   private largest(table: string, column: number): number {
     // The table's own largest is its last row. Its past versions hold the rowid as a column: those are scanned.
-    const last = this.lookup(lastOf(scan(table, [column])), ['int'])[0];
+    const one = (plan: PlanOp): PlanStatementInput => ({ kind: 'query', plan, columns: [{ name: 'c0', type: 'int' }] });
+    const last = this.run(this.site(table, 'last', () => this.ownStmt(one(lastOf(scan(table, [column]))), 0)), null)[0];
     let max = last ? (last[0] as number) : -1;
     const past: [string, number][] = [];
     if (this.t0.history === 'versions') past.push([`smalt_versions_${table}`, 0]);
     if (this.t0.history === 'log') past.push([`smalt_log_${table}`, 2]);
     for (const [t, c] of past) {
-      const m = this.lookup(maxOf(scan(t, [c])), ['int'])[0]![0] as number | null;
+      const m = this.run(this.site(t, 'max', () => this.ownStmt(one(maxOf(scan(t, [c]))), 0)), null)[0]![0] as number | null;
       if (m !== null && m > max) max = m;
     }
     return max;
@@ -1080,6 +1302,9 @@ class Runner {
     const table = `${this.t0.graph}_l${this.labelTables.size}`;
     this.db.queryPlan({ kind: 'schema', op: { op: 'alterPropertyGraph', name: this.t0.graph, action: { kind: 'addLabel', label: l, table } } } as PlanStatementInput);
     this.labelTables.set(l, table);
+    this.grown ??= { ...this.t0, labelTables: this.labelTables, types: this.types };
+    // What is kept was made for the graph's tables as they were: the rest of this run makes its statements anew.
+    this.sites = null;
     return table;
   }
 
@@ -1090,6 +1315,8 @@ class Runner {
     const table = `${this.t0.graph}_t${this.types.size}`;
     this.db.queryPlan({ kind: 'schema', op: { op: 'alterPropertyGraph', name: this.t0.graph, action: { kind: 'addType', type: t, table } } } as PlanStatementInput);
     this.types.set(t, table);
+    this.grown ??= { ...this.t0, labelTables: this.labelTables, types: this.types };
+    this.sites = null;
     return table;
   }
 
@@ -1098,31 +1325,31 @@ class Runner {
   private setItems(items: readonly SetItem[], frame: Frame, row: Row): void {
     for (const it of items) {
       // The target first: a NULL target is a no-op, its value not computed (as in smaltcy's engine).
-      const t = this.evaluate(frame, row, it.target);
+      const t = this.evaluate(it, 'target', frame, row, it.target);
       if (isNullValue(t)) continue;
       switch (it.kind) {
         case 'prop': {
           const target = this.entity(t, "Can't set a property on a");
-          const v = this.evaluate(frame, row, it.value);
-          if (v.k === 'value' && v.v === null) this.setProps(target, (cur) => removeKeys(cur, [it.key]), 1, without(target.props, [it.key]));
+          const v = this.evaluate(it, 'value', frame, row, it.value);
+          if (v.k === 'value' && v.v === null) this.setProps(it, 'unset', it.key, target, 1, without(target.props, [it.key]));
           else {
             const value = propertyValue(v, 'SET');
-            this.setProps(target, (cur, given) => call('map_merge', [cur, call('map_of', [lit(it.key), given], PROPS)], PROPS), 1, { ...without(target.props, [it.key]), [it.key]: value }, value);
+            this.setProps(it, 'set', it.key, target, 1, { ...without(target.props, [it.key]), [it.key]: value }, value);
           }
           break;
         }
         case 'props': {
           const target = this.entity(t, "Can't set a property on a");
-          const { props, nulls, isMap } = this.propertyMap(frame, row, it.value, 'SET');
+          const { props, nulls, isMap } = this.propertyMap(it, 'value', frame, row, it.value, 'SET');
           if (target.props === null) break;
           if (!it.merge) {
             // Every property the map hasn't is removed, then the map's set.
             const removed = Object.keys(target.props).filter((k) => !(k in props)).length;
-            this.setProps(target, (_cur, given) => given, removed + Object.keys(props).length, props, props, PROPS);
+            this.setProps(it, 'replace', null, target, removed + Object.keys(props).length, props, props, PROPS);
           } else {
             // With +=, a NULL in the map removes the key.
             const gone = isMap ? nulls : [];
-            this.setProps(target, (cur, given) => call('map_merge', [removeKeys(cur, gone), given], PROPS), gone.length + Object.keys(props).length, { ...without(target.props, gone), ...props }, props, PROPS);
+            this.setProps(it, 'merge', null, target, gone.length + Object.keys(props).length, { ...without(target.props, gone), ...props }, props, PROPS, gone);
           }
           break;
         }
@@ -1131,7 +1358,7 @@ class Runner {
           for (const l of it.labels) {
             if (this.hasLabel(t.id!, l)) continue;
             this.label(l);
-            this.db.queryPlan(this.append(this.tables().labels, ['int', 'text'], [[t.id], [l]], [0, 1]));
+            this.appendRow(this.tables().labels, ['int', 'text'], [t.id, l], [0, 1]);
             this.counts.labelsAdded++;
           }
           break;
@@ -1142,18 +1369,22 @@ class Runner {
 
   private removeItems(items: readonly RemoveItem[], frame: Frame, row: Row): void {
     for (const it of items) {
-      const t = this.evaluate(frame, row, it.target);
+      const t = this.evaluate(it, 'target', frame, row, it.target);
       if (isNullValue(t)) continue;
       if (it.kind === 'prop') {
         const target = this.entity(t, "Can't set a property on a");
-        this.setProps(target, (cur) => removeKeys(cur, [it.key]), 1, without(target.props, [it.key]));
+        this.setProps(it, 'unset', it.key, target, 1, without(target.props, [it.key]));
         continue;
       }
       if (t.k !== 'node') throw new SmaltcyError('SMALTCY_TYPE', `Can't remove labels from a ${valueTypeName(t)}`);
       for (const l of it.labels) {
         if (!this.hasLabel(t.id!, l)) continue;
-        const entries = filter(scan(this.tables().labels, [-1, 0, 1]), and(eq(colRef(1, 'int'), lit(t.id)), eq(colRef(2, 'text'), lit(l, 'text'))));
-        this.db.queryPlan(write({ op: 'delete', table: this.tables().labels, db: 'main', input: entries, rowid: 0 }));
+        const labels = this.tables().labels;
+        const kept = this.site(labels, `drop:${l}`, () => {
+          const entries = filter(scan(labels, [-1, 0, 1]), and(eq(colRef(1, 'int'), own(0, 'int')), eq(colRef(2, 'text'), lit(l, 'text'))));
+          return this.ownStmt(write({ op: 'delete', table: labels, db: 'main', input: entries, rowid: 0 }), 1);
+        });
+        this.run(kept, null, [t.id]);
         this.counts.labelsRemoved++;
       }
     }
@@ -1210,8 +1441,8 @@ class Runner {
         this.setPropRows(it, frame, live);
         continue;
       }
-      const targets = this.evaluateAll(frame, live, it.target);
-      const values = 'value' in it ? this.evaluateAll(frame, live, it.value) : null;
+      const targets = this.evaluateAll(it, 'target', frame, live, it.target);
+      const values = 'value' in it ? this.evaluateAll(it, 'value', frame, live, it.value) : null;
       // By table: the rowids, and the value each gets (`null` removes the key).
       const writes = new Map<string, { column: number; rowids: number[]; given: unknown[]; removed: number[] }>();
       targets.forEach((t, i) => {
@@ -1247,7 +1478,7 @@ class Runner {
    */
   private setPropRows(it: Extract<SetItem | RemoveItem, { kind: 'prop' }>, frame: Frame, rows: readonly Row[]): void {
     const b = frame.slots.get((it.target as { i: number }).i)!;
-    const values = 'value' in it ? this.evaluateAll(frame, rows, it.value) : null;
+    const values = 'value' in it ? this.evaluateAll(it, 'value', frame, rows, it.value) : null;
     const writes = new Map<string, { column: number; rowids: number[]; given: unknown[]; removed: number[] }>();
     rows.forEach((row, i) => {
       const [table, column, rowid] = b.k === 'node' ? [this.tables().nodes, 1, row[b.id] as number] : [this.types.get(row[(b as Extract<Binding, { k: 'rel' }>).type] as string)!, 2, row[(b as Extract<Binding, { k: 'rel' }>).rowid] as number];
@@ -1311,8 +1542,12 @@ class Runner {
   }
 
   private hasLabel(id: number, l: string): boolean {
-    const entries = filter(scan(this.tables().labels, [0, 1]), and(eq(colRef(0, 'int'), lit(id)), eq(colRef(1, 'text'), lit(l, 'text'))));
-    return this.lookup(project(ONE_ROW, [exists(entries)]), ['bool'])[0]![0] === true;
+    const labels = this.tables().labels;
+    const kept = this.site(labels, `has:${l}`, () => {
+      const entries = filter(scan(labels, [0, 1]), and(eq(colRef(0, 'int'), own(0, 'int')), eq(colRef(1, 'text'), lit(l, 'text'))));
+      return this.ownStmt({ kind: 'query', plan: project(ONE_ROW, [exists(entries)]), columns: [{ name: 'c0', type: 'bool' }] }, 1);
+    });
+    return this.run(kept, null, [id])[0]![0] === true;
   }
 
   /** A node or relationship whose properties are set: its table, rowid and properties (NULL: it's gone). */
@@ -1323,11 +1558,14 @@ class Runner {
   }
 
   /**
-   * Sets a node's or relationship's properties to `f` of what they are (in the table) and of `given` (a value given
-   * from here, `any` or `type`), counting `count` properties set; nothing when it's gone, as in smaltcy's engine.
-   * `next` is what they become: when it is what they are, nothing is written (smaltcy's history records no change).
+   * Sets a node's or relationship's properties from what they are (in the table) and `given` (a value given from
+   * here, `any` or `type`), counting `count` properties set; nothing when it's gone, as in smaltcy's engine. `how`:
+   * `set` sets the key `key` to `given`, `unset` removes it, `replace` makes them `given` (a map), and `merge` removes
+   * the keys `gone`, then sets `given`'s (a map's). `next` is what they become: when it is what they are, nothing is
+   * written (smaltcy's history records no change). The statement is kept for `anchor` (the SET or REMOVE item) and the
+   * table: the row's rowid, `given` and `gone` are its parameters.
    */
-  private setProps(e: { table: string; column: number; rowid: number; props: Props | null }, f: (cur: PlanExpr, given: PlanExpr) => PlanExpr, count: number, next: Props | null, given: unknown = null, type: PlanType = 'any'): void {
+  private setProps(anchor: unknown, how: 'set' | 'unset' | 'replace' | 'merge', key: string | null, e: { table: string; column: number; rowid: number; props: Props | null }, count: number, next: Props | null, given: unknown = null, type: PlanType = 'any', gone: readonly string[] = []): void {
     if (e.props === null) return;
     if (next !== null && sameProps(e.props, next)) {
       this.counts.propertiesSet += count;
@@ -1335,11 +1573,21 @@ class Runner {
     }
     // A value of `any` crosses as a one-element `list<any>`, which keeps its kind (smaltdb ADR 0039).
     const wrapped = type === 'any';
-    const values = { op: 'values', rows: [], types: [wrapped ? 'list<any>' : type], columns: [[wrapped ? [given] : given]] } as unknown as PlanOp;
-    // The target joined with the value (smaltdb's UPDATE … FROM shape: the WHERE over the join).
-    const input = filter({ op: 'join', kind: 'cross', inputs: [scan(e.table, [-1, e.column]), values], ordered: true }, eq(colRef(0, 'int'), lit(e.rowid)));
-    const g = wrapped ? call('list_get', [colRef(2, 'list<any>'), lit(0)], 'any') : colRef(2, type);
-    this.db.queryPlan(write({ op: 'update', table: e.table, db: 'main', input, rowid: 0, sets: [{ column: e.column, value: f(colRef(1, PROPS), g) }], from: true }));
+    const kept = this.site(anchor, `${how}:${e.table}`, () => {
+      const values = { op: 'values', rows: [[own(1, wrapped ? 'list<any>' : type)]], types: [wrapped ? 'list<any>' : type] } as PlanOp;
+      // The target joined with the value (smaltdb's UPDATE … FROM shape: the WHERE over the join).
+      const input = filter({ op: 'join', kind: 'cross', inputs: [scan(e.table, [-1, e.column]), values], ordered: true }, eq(colRef(0, 'int'), own(0, 'int')));
+      const g = wrapped ? call('list_get', [colRef(2, 'list<any>'), lit(0)], 'any') : colRef(2, type);
+      const cur = colRef(1, PROPS);
+      // map_merge keeps the second map's value of a key both have: the key is set without removing it first.
+      const value =
+        how === 'set' ? call('map_merge', [cur, call('map_of', [lit(key), g], PROPS)], PROPS)
+        : how === 'unset' ? removeKeys(cur, [key!])
+        : how === 'replace' ? g
+        : call('map_merge', [call('map_remove', [cur, own(2, 'list<text>')], PROPS), g], PROPS);
+      return this.ownStmt(write({ op: 'update', table: e.table, db: 'main', input, rowid: 0, sets: [{ column: e.column, value }], from: true }), how === 'merge' ? 3 : 2);
+    });
+    this.run(kept, null, [e.rowid, wrapped ? [given] : given, gone]);
     this.counts.propertiesSet += count;
   }
 
@@ -1413,6 +1661,20 @@ class Runner {
         }
       }
     }
+    // A few of them: each by the statements kept for one (`deleteRel`, `deleteWhere`), which seek it by its id. The
+    // statements below hold the ids and are planned each time, and smaltdb joins a list of ids with an edge table's
+    // ends by reading the whole table where an end has many relationships on average.
+    let few = nodes.size;
+    for (const rowids of rels.values()) few += rowids.size;
+    if (few <= FEW) {
+      for (const [type, rowids] of rels) for (const rowid of rowids) this.deleteRel(type, rowid);
+      for (const id of nodes) {
+        // A self-loop starts and ends here: the second delete finds it gone.
+        for (const table of this.types.values()) this.counts.relationshipsDeleted += this.deleteWhere(table, [-1, 0, 1], 1, id) + this.deleteWhere(table, [-1, 0, 1], 2, id);
+        this.counts.nodesDeleted += this.deleteWhere(this.tables().nodes, [0], 0, id);
+      }
+      return rows;
+    }
     for (const [type, rowids] of rels) {
       const table = this.types.get(type)!;
       this.counts.relationshipsDeleted += this.deleted(table, filter(scan(table, [-1]), call('in_list', [colRef(0, 'int'), ...[...rowids].map((r) => lit(r))], 'bool')));
@@ -1435,9 +1697,19 @@ class Runner {
   }
 
   private deleteRel(type: string, rowid: number): void {
-    const table = this.types.get(type)!;
-    const rows = filter(scan(table, [-1]), eq(colRef(0, 'int'), lit(rowid)));
-    this.counts.relationshipsDeleted += this.deleted(table, rows);
+    this.counts.relationshipsDeleted += this.deleteWhere(this.types.get(type)!, [-1], 0, rowid);
+  }
+
+  /**
+   * Deletes the rows of a table whose column `column` (of `columns`, the first of them the rowid) is `value`: how many
+   * there were. A statement kept for the table, `value` its parameter.
+   */
+  private deleteWhere(table: string, columns: readonly number[], column: number, value: number): number {
+    const kept = this.site(table, `delete:${columns.join()}:${column}`, () => {
+      const input = filter(scan(table, columns), eq(colRef(column, 'int'), own(0, 'int')));
+      return this.ownStmt(write({ op: 'delete', table, db: 'main', input, rowid: 0, returning: [lit(1)] }), 1);
+    });
+    return this.run(kept, null, [value]).length;
   }
 
   /** Deletes the rows of `input` (column 0 their rowid): how many there were. */
@@ -1446,22 +1718,34 @@ class Runner {
   }
 
   private deleteNode(id: number, detach: boolean): void {
-    const node = filter(scan(this.tables().nodes, [0]), eq(colRef(0, 'int'), lit(id)));
-    // Each end on its own, so each is a seek on the edge table's index (an OR of the two would scan the table).
-    const touching = (table: string, end: 1 | 2) => filter(scan(table, [-1, 0, 1]), eq(colRef(end, 'int'), lit(id)));
+    const nodes = this.tables().nodes;
     const tables = [...this.types.values()];
-    const ends = tables.flatMap((t) => [exists(touching(t, 1)), exists(touching(t, 2))]);
-    const [here, connected] = this.lookup(project(ONE_ROW, [exists(node), ends.length ? or(...ends) : lit(false)]), ['bool', 'bool'])[0]!;
+    // Whether it is there, and whether a relationship starts or ends at it: one statement kept, the id its parameter.
+    const state = this.site(nodes, 'state', () => {
+      const node = filter(scan(nodes, [0]), eq(colRef(0, 'int'), own(0, 'int')));
+      // Each end on its own, so each is a seek on the edge table's index (an OR of the two would scan the table).
+      const touching = (table: string, end: 1 | 2) => filter(scan(table, [-1, 0, 1]), eq(colRef(end, 'int'), own(0, 'int')));
+      const ends = tables.flatMap((t) => [exists(touching(t, 1)), exists(touching(t, 2))]);
+      return this.ownStmt({ kind: 'query', plan: project(ONE_ROW, [exists(node), ends.length ? or(...ends) : lit(false)]), columns: [{ name: 'c0', type: 'bool' }, { name: 'c1', type: 'bool' }] }, 1);
+    });
+    const [here, connected] = this.run(state, null, [id])[0]!;
     if (here !== true) return;
     if (connected === true) {
       if (!detach) throw new SmaltcyError('SMALTCY_CONSTRAINT', `Cannot delete node ${id}: it still has relationships (use DETACH DELETE)`);
       // A self-loop starts and ends here: the second delete finds it gone.
-      for (const t of tables) this.counts.relationshipsDeleted += this.deleted(t, touching(t, 1)) + this.deleted(t, touching(t, 2));
+      for (const t of tables) this.counts.relationshipsDeleted += this.deleteWhere(t, [-1, 0, 1], 1, id) + this.deleteWhere(t, [-1, 0, 1], 2, id);
     }
     // Its entries in the label index go with it (smaltdb's rules on a graph's tables).
-    this.deleted(this.tables().nodes, node);
+    this.deleteWhere(nodes, [0], 0, id);
     this.counts.nodesDeleted++;
   }
+}
+
+/** The columns of a frame that hold a node's or a relationship's properties: read from its table, not sent with a row. */
+function liveProps(frame: Frame): Set<number> {
+  const live = new Set<number>();
+  for (const b of frame.slots.values()) if (b.k === 'node' || b.k === 'rel') live.add(b.props);
+  return live;
 }
 
 /** A property map's entries as properties: NULLs dropped (their keys in `nulls`), the rest checked. */

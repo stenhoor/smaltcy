@@ -237,14 +237,32 @@ query's values.
   statements. Until then the shape was a text, built for every query and looked up in a map: building it and hashing
   it took most of the time of finding a kept statement (6.5 µs for the benchmark's seek by name, 1.7 µs as tokens;
   docs/research/benchmarks.md, "A kept statement found by its tokens").
-- **Writes** run with their statement's values as parameters too (`valuesOut`), so the queries the runner makes for
-  one statement and for the next of its shape are the same to smaltdb, which keeps them by their text. The rows the
-  runner itself holds (the ids it found, the values it computed, the rows it appends) are still written into its
-  statements: each of those is planned again. That is the write path's own cost and step 4 of the issue's plan. The
-  scans that found the largest ids were part of it until 2026-11-21. With the largest ids read from the tables' ends,
-  creating 1 node went from 44x to 53x of smaltcy's time to 13x to 14x, and creating 1 relationship from 114x to 120x
-  to 12x to 13x (three runs each way, in turns, on smaltdb `166c6cd`); with statements that differ each time, from 31x
-  to 35x to 12x to 13x and from 47x to 59x to 14x to 16x.
+- **Writes are kept by shape too** (`writeByShape`, since 2026-11-21). A statement that writes is run as several
+  smaltdb statements, which the runner makes as it goes: the rows a MATCH below the write finds, a value computed for
+  a row, a row appended, a property set, a node deleted. Each is made once for the write's shape, prepared, and kept
+  with the shape (`Runner.site`: by the part of the Cypher plan it is for, then by what it does there, the table or the
+  label included where a statement serves one). The next statement of the shape runs them. Their parameters are the
+  Cypher statement's values, taken out as a query's are; the row a statement runs over (one row is a `values` of one
+  row of parameters); and the runner's own values: a new node's id, the rowid a SET writes, and a row's properties as
+  one map parameter (smaltdb's ADR 0020, "Parameters"; stenhoor/smaltdb#291). A property map whose entries are
+  all written values or parameters (`{name: $name, age: 30}`) is read in JavaScript, with no query.
+  - **Planned each time, as before:** a write of all its rows at once (a CREATE, SET, REMOVE or DELETE in a batch
+    writes its rows into one statement as columns), but a DELETE of up to eight nodes and relationships, which goes
+    one by one through the statements kept for one; and the rest of a run once it adds a label or a type, since what
+    is kept was made for the graph's tables as they were (the graph with the new label is another shape, which keeps
+    its own from the next statement on).
+  - **Measured** (docs/research/benchmarks.md, "Writes kept by shape"; smaltdb's time over smaltcy's, before and now
+    in turns): creating 1 node 12.2x to 12.9x before, 3.5x to 4.5x now; setting 1 property 6.3x to 7.8x before, 2.4x
+    now; merging a node that is there 5.3x to 5.9x before, 1.17x to 1.26x now; with statements that differ each time,
+    creating 1 relationship 19.0x to 21.6x before, 2.4x to 2.7x now, and deleting 1 node 73x to 85x before, 7.6x to
+    9.5x now. Writes of 1,000 rows did not move. No single write is under the bar: what is left is smaltdb running
+    the statements.
+  - **Before this** the rows the runner itself holds (the ids it found, the values it computed, the rows it appends)
+    were written into its statements, and each of those was planned again. The scans that found the largest ids were
+    part of that until earlier on 2026-11-21: with the largest ids read from the tables' ends, creating 1 node went
+    from 44x to 53x of smaltcy's time to 13x to 14x, and creating 1 relationship from 114x to 120x to 12x to 13x
+    (three runs each way, in turns, on smaltdb `166c6cd`); with statements that differ each time, from 31x to 35x to
+    12x to 13x and from 47x to 59x to 14x to 16x.
 - **A kept statement keeps its plan** until smaltdb plans it again (a schema change, or a table four times larger or
   smaller). A statement planned anew each time follows the data more closely: one case measures slower for it
   (docs/research/benchmarks.md, "Statements kept by shape").
@@ -311,7 +329,13 @@ graph, and lists those the compiler refuses; the list can only shrink. `test/sma
 case of the Cypher suite (`test/helpers/write-cases.ts`, which `test/cypher-write.test.ts` runs on smaltcy's engine) and
 more sequences of writes on both engines, comparing after each statement the rows, the counts and the whole graph (ids,
 labels in order, properties, relationships), statements that fail on both (smaltdb rolled back, new labels and types
-included; the same error code and message as smaltcy's), and the writes it refuses. Two more sets run queries on both engines and
+included; the same error code and message as smaltcy's), and the writes it refuses. `test/smaltdb-kept-writes.test.ts`
+runs those write cases again and again on the graph they leave, where the second run is by the statements kept, and on a
+database that prepares nothing; writes of one shape with other values, counting the statements prepared (none once the
+shape is kept); writes over many rows, counting the statements run (as many for 40 rows as for 20); a label or a type
+added while a statement runs; statements that fail with others kept; a DELETE of one to thirty nodes and
+relationships; and values of every kind as parameters. Each compares both engines after every statement, as above
+(`test/helpers/write-pair.ts`). Two more sets run queries on both engines and
 compare their rows: over properties of every kind (and the errors values of the wrong kind raise: the same code and
 message on both), over labels and types spelled two ways (`Person` and `person`, `KNOWS` and `knows`, read and
 written), and over relationships on a graph with self-loops, parallel
@@ -346,6 +370,14 @@ value as a literal and as a parameter). The first two benchmarks run one text ag
 from the statement it kept; an application's statements differ, and there smaltdb was furthest behind. smaltcy's
 engine on its `MemoryStore` stays the bar; its `CsrStore`'s times are reported beside it. How a time and a ratio are
 taken, and the baseline before that work: docs/research/benchmarks.md, "Method" and "Statements that differ".
+
+The owner added (2026-11-21, stenhoor/smaltdb#274), on the writes that are still over the bar and on where a kept
+statement lives: "Need to keep pushing cost down. Comparison should be equivalent, memory to memory, wal will have to be
+optimized but it will obviously be slower." and "cy produces plans that are executed by db, if it is plan execution it
+belongs on db not cy". Read here as: the bar is smaltdb in memory against smaltcy's `MemoryStore`, and what executes
+a plan belongs in smaltdb. The write runner here (`src/smaltdb/write.ts`) executes a write's plan from smaltcy, as
+several smaltdb statements, and the statements kept by shape (`src/smaltdb/shape.ts`) are kept here: by that reading
+both are to move into smaltdb. How they move is smaltdb's to record first; until then they stay as they are.
 
 ## Consequences
 
