@@ -139,8 +139,10 @@ all it wrote, the labels and types it added included:
   edge table, with the property maps evaluated against the row as it is (a map literal's entries one by one, so each
   keeps its kind). The ids are chosen by the runner, not by smaltdb: a node's is one more than the largest node id, a
   relationship's rowid one more than the largest rowid of any edge table (so it stays unique across types, and `id(r)`
-  reads it); within a statement they count on. **New labels and types** are added with `alterPropertyGraph` (`addLabel`
-  / `addType`) the first time a write uses them; the reserved label `smaltcy:node` is refused.
+  reads it); within a statement they count on. The largest is its table's last row: the runner asks for the table's
+  rows by rowid from the last and takes the first, which smaltdb reads from the table's end, one row (a `max` over a
+  scan of the table read every row, until 2026-11-21). **New labels and types** are added with `alterPropertyGraph`
+  (`addLabel` / `addType`) the first time a write uses them; the reserved label `smaltcy:node` is refused.
 - **SET and REMOVE** are `update`s of the `props` map in smaltdb (`map_merge`, `map_remove`), so the properties a write
   doesn't touch keep their stored kind: `n.k = v` sets one key (NULL removes it), `n = map` replaces the map, `n += map`
   merges it (its NULLs remove keys). A label is an entry in the label index, added or deleted. A NULL target is a no-op
@@ -187,9 +189,10 @@ all it wrote, the labels and types it added included:
 - **`forget(v)`** is `forgetOnSmaltdb`: smaltdb's `forget` maintenance statement with `before: { commit: v }`, for each
   of the graph's tables, in one savepoint; a version after the latest is smaltcy's error.
 - **New ids with history** also count the largest id in the graph's past versions (smaltdb's `smalt_versions_<table>`,
-  or `smalt_log_<table>`), so an id a readable version holds is never given to another node or relationship, as
-  smaltcy's ADR 0002 keeps ids stable across versions. A caller can also keep the next ids itself (`RunOptions.ids`,
-  as smaltcy's store keeps them across statements, rolled back or not): ids then go on as smaltcy's do.
+  or `smalt_log_<table>`, scanned for it: the rowid is a column there, not their order), so an id a readable version
+  holds is never given to another node or relationship, as smaltcy's ADR 0002 keeps ids stable across versions. A
+  caller can also keep the next ids itself (`RunOptions.ids`, as smaltcy's store keeps them across statements, rolled
+  back or not): ids then go on as smaltcy's do.
 
 **Indexes.** smaltcy's `CREATE INDEX FOR (n:L) ON (n.k)` and `DROP INDEX ON :L(k)` (`IndexPlan`) run as smaltdb schema
 statements: an expression index on the node table, on `map_get(props, k)`, named `<graph>_ix_<label>_<key>` with the
@@ -229,8 +232,11 @@ query's values.
 - **Writes** run with their statement's values as parameters too (`valuesOut`), so the queries the runner makes for
   one statement and for the next of its shape are the same to smaltdb, which keeps them by their text. The rows the
   runner itself holds (the ids it found, the values it computed, the rows it appends) are still written into its
-  statements: each of those is planned again. That, and the scans that find the largest ids, are the write path's
-  own cost and step 4 of the issue's plan.
+  statements: each of those is planned again. That is the write path's own cost and step 4 of the issue's plan. The
+  scans that found the largest ids were part of it until 2026-11-21. With the largest ids read from the tables' ends,
+  creating 1 node went from 44x to 53x of smaltcy's time to 13x to 14x, and creating 1 relationship from 114x to 120x
+  to 12x to 13x (three runs each way, in turns, on smaltdb `166c6cd`); with statements that differ each time, from 31x
+  to 35x to 12x to 13x and from 47x to 59x to 14x to 16x.
 - **A kept statement keeps its plan** until smaltdb plans it again (a schema change, or a table four times larger or
   smaller). A statement planned anew each time follows the data more closely: one case measures slower for it
   (docs/research/benchmarks.md, "Statements kept by shape").
