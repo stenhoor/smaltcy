@@ -4,6 +4,7 @@ import { compile } from '../src/cypher/index.js';
 import { open, type Graph } from '../src/index.js';
 import { Unsupported } from '../src/smaltdb/compile.js';
 import type { GraphTables } from '../src/smaltdb/schema.js';
+import { keptShapes } from '../src/smaltdb/shape.js';
 import { runOnSmaltdb, type SmaltdbDatabase } from '../src/smaltdb/write.js';
 import { social } from './helpers/graphs.js';
 import { READ_CASES, READ_PARAMS } from './helpers/read-cases.js';
@@ -163,6 +164,56 @@ describe('a query with other values runs the statement kept for its shape', () =
     expect(prepared()).toBe(0);
     same(db, `MATCH (p:Person) WHERE ${many.slice(0, 60).join(' OR ')} RETURN p.name AS name ORDER BY name`);
     expect(prepared()).toBe(1);
+  });
+
+  test('shapes with one hash are kept apart: names of one length with the same ends', () => {
+    const { db, prepared } = counting(b.db);
+    // The hash takes a name's length and its first and last letter (shape.ts): these three queries have one hash.
+    const keys = ['born', 'burn', 'bean'];
+    for (let round = 0; round < 3; round++) {
+      for (const key of keys) same(db, `MATCH (p:Person) RETURN p.name AS name, p.${key} AS x ORDER BY name`);
+      expect(keptShapes(db)).toEqual({ shapes: 3, hashes: 1 });
+    }
+    expect(prepared()).toBe(3);
+    // A value among them, with others of its shape in between.
+    for (const year of [1900, 1815, 1950]) {
+      for (const key of keys) same(db, `MATCH (p:Person) WHERE p.${key} < ${year} RETURN p.name AS name ORDER BY name`);
+    }
+    expect(prepared()).toBe(6);
+    expect(keptShapes(db)).toEqual({ shapes: 6, hashes: 2 });
+  });
+
+  test('0 and -0 written in a list are two shapes: what stays written is compared as it is', () => {
+    const { db, prepared } = counting(b.db);
+    for (let round = 0; round < 2; round++) for (const zero of ['-0.0', '0.0']) onSmaltdb(db, b.tables, `RETURN [1.5, ${zero}] AS l`);
+    expect(prepared()).toBe(2);
+  });
+
+  test('past 256 shapes the oldest goes, and is compiled again when it comes back', () => {
+    const { db, prepared } = counting(b.db);
+    // Each column name is a shape of its own. Some have one hash (a name's length and ends): c10, c20 and c30.
+    const run = (i: number) => expect(onSmaltdb(db, b.tables, `MATCH (p:Person {name: 'Ada'}) RETURN p.born AS c${i}`)).toEqual([{ [`c${i}`]: 1815 }]);
+    for (let i = 0; i <= 256; i++) run(i);
+    expect(prepared()).toBe(257);
+    expect(keptShapes(db).shapes).toBe(256);
+    expect(keptShapes(db).hashes).toBeLessThan(256);
+    // The newest and the oldest left are kept.
+    run(256);
+    run(1);
+    expect(prepared()).toBe(257);
+    // The first went: it is compiled again, and the oldest left goes for it.
+    run(0);
+    expect(prepared()).toBe(258);
+    run(1);
+    expect(prepared()).toBe(259);
+    // Ten more, and c3 to c12 go: c10 from among others of its hash, which stay.
+    for (let i = 300; i < 310; i++) run(i);
+    expect(prepared()).toBe(269);
+    for (const i of [20, 30, 13, 256, 0, 1, 309]) run(i);
+    expect(prepared()).toBe(269);
+    run(10);
+    expect(prepared()).toBe(270);
+    expect(keptShapes(db).shapes).toBe(256);
   });
 
   test('a database that can only run statements: the same rows', () => {
