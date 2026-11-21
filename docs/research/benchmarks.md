@@ -932,3 +932,101 @@ What it says:
   step 5b) is what they need, and they are measured again with the next pin.
 - **The writes did not change** beyond what they move between runs. The write runner uses the same walk
   (`valuesOut`), which is a few µs of a write.
+
+## Properties in smaltdb's graph index, and group by city's plan (2026-11-21)
+
+Step 5 of stenhoor/smaltdb#274 (smaltdb's ADR 0041): the pin moves from `166c6cd` to `13c4493`, which adds three
+changes of smaltdb's. Its graph index remembers the property map of a node or relationship row once it is read by
+its id, and gives it from memory from then on (stenhoor/smaltdb#287, step 5b). Projections one above the other are
+one (stenhoor/smaltdb#285). Groups in the order of their first row no longer take a list for every row
+(stenhoor/smaltdb#286, step 5c). smaltcy's own code does not change. Two tests do: they assert that an equality on
+an indexed property seeks the index, and now ask it of a label of 217 nodes, because smaltdb reads a label of 17
+nodes by id from its graph index (its ADR 0041, "As built").
+
+The same method, in the same container. "Before" is the section above's "now" (the pin `166c6cd`), "now" is the pin
+`13c4493`: two series run hours apart, not in turns. A ratio is smaltdb's time over smaltcy's.
+
+**The same text every run** (`BENCH_INDEXES=1 npm run bench:smaltdb`; three runs before, three now; the times are
+the first run's now):
+
+| Query | Before | Now | smaltcy, smaltdb now (ms) |
+|---|---|---|---|
+| seek by name | 0.83x, 0.83x, 0.83x | 0.83x, 0.84x, 0.84x | 0.018, 0.014 |
+| 1 hop | 0.61x, 0.61x, 0.59x | 0.60x, 0.60x, 0.60x | 0.032, 0.019 |
+| 2 hops | 0.34x, 0.34x, 0.33x | 0.32x, 0.31x, 0.31x | 0.359, 0.113 |
+| 3 hops | 0.28x, 0.29x, 0.29x | 0.28x, 0.28x, 0.28x | 4.347, 1.214 |
+| 1 hop, directed | 0.63x, 0.63x, 0.64x | 0.63x, 0.63x, 0.64x | 0.029, 0.018 |
+| 3 hops, directed | 0.27x, 0.27x, 0.26x | 0.26x, 0.26x, 0.25x | 2.264, 0.585 |
+| 2 hops to a label | 0.25x, 0.26x, 0.23x | 0.23x, 0.24x, 0.24x | 0.748, 0.178 |
+| 2 hops, relationship filter | 1.88x, 1.76x, 1.84x | 0.62x, 0.59x, 0.60x | 0.594, 0.377 |
+| var-length 1..3, distinct | 0.59x, 0.58x, 0.58x | 0.53x, 0.54x, 0.53x | 11.510, 6.189 |
+| shortest path | 0.66x, 0.61x, 0.69x | 0.65x, 0.66x, 0.57x | 0.045, 0.029 |
+| shortest path, 5 hops | 0.17x, 0.17x, 0.17x | 0.17x, 0.18x, 0.18x | 27.346, 5.109 |
+| shortest path, none (out) | 0.89x, 0.88x, 0.88x | 0.89x, 0.88x, 0.88x | 0.030, 0.026 |
+| shortest path, none (all) | 0.24x, 0.22x, 0.23x | 0.24x, 0.24x, 0.26x | 30.184, 7.484 |
+| label scan + filter | 0.56x, 0.58x, 0.56x | 0.53x, 0.56x, 0.56x | 2.227, 1.185 |
+| group by city | 1.87x, 1.58x, 1.76x | 0.89x, 0.91x, 0.88x | 17.163, 16.353 |
+| all relationships | 0.16x, 0.16x, 0.17x | 0.17x, 0.17x, 0.18x | 15.412, 2.792 |
+| triangles (bounded) | 0.83x, 0.75x, 0.74x | 0.48x, 0.52x, 0.51x | 11.956, 6.190 |
+
+**Statements that differ** (`BENCH_ENTRY=bench/vary.ts npm run bench:smaltdb`; a literal, a parameter; two runs
+before, two now):
+
+| Statement | Before | Now |
+|---|---|---|
+| seek by name | 1.01x, 0.95x and 1.08x, 0.96x | 1.00x, 0.96x and 1.01x, 0.98x |
+| 1 hop | 0.56x, 0.64x and 0.57x, 0.60x | 0.63x, 0.65x and 0.59x, 0.71x |
+| 2 hops | 0.42x, 0.43x and 0.42x, 0.45x | 0.40x, 0.42x and 0.41x, 0.41x |
+| 3 hops | 0.31x, 0.33x and 0.34x, 0.40x | 0.30x, 0.35x and 0.30x, 0.33x |
+| 3 hops, directed | 0.34x, 0.50x and 0.37x, 0.47x | 0.47x, 0.49x and 0.35x, 0.46x |
+| 2 hops to a label | 0.27x, 0.29x and 0.27x, 0.31x | 0.34x, 0.26x and 0.28x, 0.29x |
+| 2 hops, relationship filter | 0.95x, 0.99x and 0.85x, 1.00x | 0.68x, 0.79x and 0.77x, 0.75x |
+| var-length 1..3, distinct | 0.59x, 0.60x and 0.65x, 0.62x | 0.53x, 0.53x and 0.51x, 0.54x |
+| shortest path | 0.13x, 0.16x and 0.13x, 0.15x | 0.15x, 0.15x and 0.13x, 0.16x |
+| shortest path, directed | 0.93x, 0.75x and 0.88x, 0.70x | 0.87x, 0.80x and 0.97x, 0.64x |
+| shortest path, none | 0.25x, 0.26x and 0.27x, 0.26x | 0.26x, 0.25x and 0.27x, 0.27x |
+| label scan + filter | 1.08x, 0.68x and 1.10x, 0.71x | 1.06x, 0.71x and 1.01x, 0.74x |
+| create 1 node | 38.6x, 47.0x and 40.8x, 46.4x | 46.4x, 53.7x and 45.8x, 53.1x |
+| create 1,000 nodes | 13.7x, 14.4x and 13.8x, 14.9x | 14.5x, 15.2x and 13.3x, 14.9x |
+| create 1 relationship | 73.7x, 80.0x and 70.9x, 87.8x | 67.1x, 72.6x and 62.9x, 69.2x |
+| create 1,000 relationships | 9.95x, 9.83x and 9.26x, 9.92x | 10.2x, 10.2x and 9.83x, 9.25x |
+| set 1 property by name | 24.6x, 24.4x and 22.5x, 24.5x | 23.6x, 25.6x and 25.2x, 27.7x |
+| set 1,000 properties | 13.0x, 13.3x and 13.8x, 13.6x | 13.9x, 14.8x and 14.5x, 14.9x |
+| merge existing node | 4.66x, 4.30x and 5.34x, 5.29x | 5.70x, 5.54x and 5.50x, 5.00x |
+| merge 1,000 new nodes | 0.90x, 0.90x and 0.92x, 0.91x | 0.96x, 0.91x and 0.93x, 0.90x |
+| delete 1 node | 112x, 134x and 119x, 132x | 74.2x, 79.6x and 70.6x, 84.2x |
+| delete 1,000 nodes | 22.4x, 22.7x and 22.6x, 23.3x | 22.6x, 21.9x and 22.9x, 21.8x |
+
+**The same text every run: writes** (`BENCH_ENTRY=bench/writes.ts npm run bench:smaltdb`; one run before, two now):
+
+| Write | Before | Now | smaltcy, smaltdb now (ms) |
+|---|---|---|---|
+| create 1 node | 50.6x | 54.4x, 54.3x | 0.007, 0.490 |
+| create 1,000 nodes | 13.3x | 14.9x, 14.6x | 0.700, 9.923 |
+| create 1 relationship | 117x | 119x, 121x | 0.015, 2.019 |
+| create 1,000 relationships | 11.5x | 11.0x, 11.7x | 1.469, 17.435 |
+| set 1 property by name | 6.89x | 7.12x, 7.02x | 0.012, 0.083 |
+| set 1,000 properties | 13.5x | 11.5x, 13.9x | 0.665, 7.904 |
+| merge existing node | 5.31x | 5.33x, 5.40x | 0.010, 0.059 |
+| merge 1,000 new nodes | 0.78x | 0.83x, 0.83x | 15.687, 12.820 |
+| delete 1,000 nodes | 28.6x | 30.1x, 30.1x | 0.489, 14.810 |
+
+What it says:
+
+- **Every read with the same text is under the bar** in each of the three runs: 0.17x to 0.91x.
+- **The two that were over it:** the relationship filter (1.76x to 1.88x before, 0.59x to 0.62x now; smaltdb's
+  1.104 ms is 0.377) and group by city (1.58x to 1.87x before, 0.88x to 0.91x now; smaltdb's 35.985 ms is 16.353).
+  The relationship filter reads each relationship's property from memory. Group by city has all three changes.
+- **The triangles got faster too** (0.74x to 0.83x before, 0.48x to 0.52x now; smaltdb's 10.215 ms is 6.190): their
+  nodes are found by id in the graph index.
+- **Statements that differ: the relationship filter is under the bar** with a literal and with a parameter (0.85x
+  to 1.00x before, 0.68x to 0.79x now).
+- **Two reads are at the bar or over it, both with a literal in the text.** The seek by name reads 1.00x and 1.01x
+  (0.96x and 0.98x with a parameter): the section above has what it is. The label scan reads 1.06x and 1.01x (0.71x
+  and 0.74x with a parameter): none of the three changes touches its plan, and what it needs is smaltdb's ADR 0041,
+  section 3 (the columns of an output nothing reads).
+- **Deleting 1 node, a statement that differs, got faster for smaltdb** (3.25 to 3.48 ms before, 2.10 to 2.26 now;
+  112x to 134x before, 70.6x to 84.2x now). It finds its node by a scan of a label with no index (441 nodes when the
+  case begins). Not profiled.
+- **The other writes did not change** beyond what they move between runs. Creating 1 node took smaltdb 0.445 to
+  0.496 ms in five runs on the pin before, and 0.490 in both runs now.
