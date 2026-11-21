@@ -21,6 +21,10 @@
  * A query that reads the past (`AT VERSION`, `AT TIME`) isn't kept: its version is found before it is compiled. Where
  * the compiler needs a value written out (the direction and type of `degree()`), it refuses the query with its values
  * taken out: that shape is remembered as one to compile as written, as every query was before.
+ *
+ * A statement that writes has a shape too (`writeByShape`). It is run as several smaltdb statements, which the write
+ * runner makes (write.ts): what is kept for its shape is its plan with a parameter where each value was, and the
+ * statements the runner made for that plan's parts, which the next statement of the shape runs with its own values.
  */
 import type { PlanStatementInput } from 'smaltdb/engine';
 import type { QueryPlan } from '../plan/ops.js';
@@ -53,11 +57,23 @@ interface Kept {
   readonly run: (values: readonly unknown[]) => { readonly rows: readonly (readonly unknown[])[] };
 }
 
+/**
+ * What is kept for a statement that writes (`writeByShape`): its plan with a parameter where each value was, the same
+ * object each time, so that what the write runner makes for a part of it is kept by that part (`sites`).
+ */
+export interface KeptWrite {
+  readonly plan: QueryPlan;
+  /** What the runner keeps for the plan's parts: by part, then by what it is for (write.ts, `Runner.site`). */
+  readonly sites: Map<unknown, Map<string, unknown>>;
+}
+
 /** A shape kept for a database: what it is found by, and its statement (`null`: one to compile as written). */
 interface Entry {
   readonly hash: number;
   readonly tokens: readonly unknown[];
   readonly kept: Kept | null;
+  /** For a statement that writes: what is kept for it (`null`: it is run as written). */
+  readonly write?: KeptWrite | null;
 }
 
 /** A database's shapes: by their hash, and in the order they were kept (the oldest first). */
@@ -315,18 +331,37 @@ function withHoles(gp: QueryPlan, params: Readonly<Record<string, unknown>>): Qu
 }
 
 /**
- * A statement that writes, with a parameter where each of its values was (`runByShape`'s rule), and its parameters
- * with those values among them: what the write runner runs, so that the statements it makes for one Cypher statement
- * and for the next of its shape differ only in their parameters, and smaltdb plans each once. The statement as it is
- * where the compiler needs one of its values written out, or it holds more values than a statement takes.
+ * A statement that writes, by its shape: its plan with a parameter where each of its values was (taken out as a
+ * query's are), its parameters with those values among them, and what the write runner keeps for that plan (`sites`). The plan is the
+ * one kept for the shape, the same object for every statement of the shape, so the runner finds what it kept for a
+ * part of it. `sites` is null, and the statement as it is, where the compiler needs one of its values written out or
+ * it holds more values than a statement takes: the runner then keeps nothing.
  */
-export function valuesOut(gp: QueryPlan, params: Readonly<Record<string, unknown>>): { plan: QueryPlan; params: Readonly<Record<string, unknown>> } {
-  const plan = withHoles(gp, params);
+export function writeByShape(db: object, gp: QueryPlan, tables: GraphTables, params: Readonly<Record<string, unknown>>): { plan: QueryPlan; params: Readonly<Record<string, unknown>>; sites: Map<unknown, Map<string, unknown>> | null } {
+  shapeOf(gp, tables, params);
   const taken = values;
-  if (asWritten || taken.length === 0 || taken.length > MAX_HOLES) return { plan: gp, params };
-  const all: Record<string, unknown> = { ...params };
-  for (let i = 0; i < taken.length; i++) all[HOLE + i] = taken[i];
-  return { plan, params: all };
+  if (taken.length > MAX_HOLES) return { plan: gp, params, sites: null };
+  let all = shapes.get(db);
+  if (!all) shapes.set(db, (all = { byHash: new Map(), inOrder: [] }));
+  let entry = found(all);
+  if (entry === undefined) {
+    // Its tokens are copied before its values are taken out: that walks it again, into `toks`.
+    const tokens = toks.slice(0, n);
+    const under = hash;
+    let write: KeptWrite | null = { plan: gp, sites: new Map() };
+    if (taken.length > 0) {
+      const plan = withHoles(gp, params);
+      write = asWritten ? null : { plan, sites: new Map() };
+    }
+    entry = { hash: under, tokens, kept: null, write };
+    add(all, entry);
+  }
+  const write = entry.write;
+  if (!write) return { plan: gp, params, sites: null };
+  if (taken.length === 0) return { plan: write.plan, params, sites: write.sites };
+  const withValues: Record<string, unknown> = { ...params };
+  for (let i = 0; i < taken.length; i++) withValues[HOLE + i] = taken[i];
+  return { plan: write.plan, params: withValues, sites: write.sites };
 }
 
 /**

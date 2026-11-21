@@ -339,10 +339,13 @@ describe('a shape is for the graph as it is: labels, types and indexes that come
     p.write('UNWIND range(1, 20) AS i CREATE (:N {i: i, half: i % 2})');
     const q = (i: number) => `MATCH (n:N) WHERE n.i > ${i} RETURN count(n) AS c, sum(n.half) AS odd`;
     p.same(q(5));
-    const before = p.prepared();
     p.write('MATCH (n:N) WHERE n.i > 15 DETACH DELETE n');
+    // The writes keep statements of their own (test/smaltdb-kept-writes.test.ts): the read prepares no other.
+    let before = p.prepared();
     p.same(q(5));
+    expect(p.prepared()).toBe(before);
     p.write('MATCH (n:N) WHERE n.i < 3 SET n.i = 100');
+    before = p.prepared();
     p.same(q(10));
     expect(p.prepared()).toBe(before);
   });
