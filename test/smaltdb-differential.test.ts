@@ -501,6 +501,20 @@ const KINDS = `CREATE (:T {k: 'int1', v: 1}), (:T {k: 'float1', v: 1.0}), (:T {k
   (:T {k: 'list', v: [1]}), (:T {k: 'liststr', v: ['a']}), (:T {k: 'none'}), (:T {k: 'zero', v: 0}), (:T {k: 'nan', v: 0.0 / 0.0}),
   (:T {k: 'negzero', v: -0.0}), (:T {k: 'inf', v: 1.0 / 0}), (:T {k: 'neginf', v: -1.0 / 0}), (:T {k: 'big', v: 9007199254740991})`;
 
+/**
+ * The values of every kind, 200 more nodes of their label and 500 of another, in smaltdb, with an index on the
+ * label's `v`.
+ */
+function seekable(): { db: Database; tables: GraphTables } {
+  const g = open();
+  g.run(KINDS);
+  g.run("UNWIND range(1, 200) AS i CREATE (:T {k: 'more', v: i + 5000})");
+  g.run("UNWIND range(1, 500) AS i CREATE (:U {k: 'filler', v: i + 1000})");
+  const { db, tables } = both(g);
+  runOnSmaltdb(db, compile('CREATE INDEX FOR (n:T) ON (n.v)').plan, tables);
+  return { db, tables };
+}
+
 describe('comparisons with literals: both engines give the same rows', () => {
   const g = open();
   g.run(KINDS);
@@ -548,9 +562,13 @@ describe('comparisons with literals: both engines give the same rows', () => {
     const { db: idb, tables: it } = both(h);
     runOnSmaltdb(idb, compile('CREATE INDEX FOR (n:T) ON (n.v)').plan, it);
     for (const [, cypher] of cases) expect(onSmaltdb(idb, it, cypher), cypher).toEqual(h.query(cypher));
-    const q = compileQuery(compile('MATCH (n:T) WHERE n.v = 1 RETURN n.k AS k').plan, it);
-    const explained = idb.queryPlan({ kind: 'explain', mode: 'plan', query: q.statement } as never).rows.map((r) => r.join(' '));
+    // The seek, where the label has more nodes than these 17: so few, smaltdb reads from its graph index, which
+    // costs it less than a seek (its ADR 0041).
+    const { db: sdb, tables: st } = seekable();
+    const q = compileQuery(compile('MATCH (n:T) WHERE n.v = 1 RETURN n.k AS k').plan, st);
+    const explained = sdb.queryPlan({ kind: 'explain', mode: 'plan', query: q.statement } as never).rows.map((r) => r.join(' '));
     expect(explained.some((line) => line.includes('USING INDEX graph_ix_'))).toBe(true);
+    expect(sdb.queryPlan(q.statement).rows.map((r) => r[0]).sort()).toEqual(['float1', 'int1']);
   });
 });
 
@@ -595,9 +613,11 @@ describe('comparisons with parameters: both engines give the same rows', () => {
     const { db: idb, tables: it } = both(h);
     runOnSmaltdb(idb, compile('CREATE INDEX FOR (n:T) ON (n.v)').plan, it);
     for (const [name, cypher, x] of all) expect(onSmaltdb(idb, it, cypher, { x }), name).toEqual(h.query(cypher, { x }));
+    // The seek, where the label has more nodes than these 17 (see the same test with literals).
+    const { db: sdb, tables: st } = seekable();
     for (const x of [1, 1.5, 'a']) {
-      const q = compileQuery(compile('MATCH (n:T) WHERE n.v = $x RETURN n.k AS k').plan, it, { params: { x } });
-      const explained = idb.queryPlan({ kind: 'explain', mode: 'plan', query: q.statement } as never, [x]).rows.map((r) => r.join(' '));
+      const q = compileQuery(compile('MATCH (n:T) WHERE n.v = $x RETURN n.k AS k').plan, st, { params: { x } });
+      const explained = sdb.queryPlan({ kind: 'explain', mode: 'plan', query: q.statement } as never, [x]).rows.map((r) => r.join(' '));
       expect(explained.some((line) => line.includes('USING INDEX graph_ix_')), String(x)).toBe(true);
     }
   });
