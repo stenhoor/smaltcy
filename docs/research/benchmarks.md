@@ -787,3 +787,148 @@ What it says:
 - **The writes hold no such comparison,** and moved as they move between runs: creating 1 node took smaltdb 0.74
   and 0.66 ms before, 0.85 and 0.83 in this run, and 0.75 to 0.83 in two more runs of that case alone on this pin,
   with smaltcy's own time between 0.015 and 0.028 ms.
+
+## A kept statement found by its tokens (2026-11-21)
+
+For stenhoor/smaltdb#274: the two reads that were over the bar and take under 0.04 ms. A change to the smaltdb path
+only (`src/smaltdb/shape.ts`; ADR 0004, "Statements kept by shape"). smaltcy's own engine is as it was, and smaltdb
+is the pin of the section above (`166c6cd`).
+
+**Where a small read's time went.** The seek by name in a loop, µs for one run: the lowest of 15 batches' means of
+5,000 runs, the things measured taking turns. Before and now are two processes (one with `main`'s `shape.ts`, one
+with this change), so the rows that did not change differ by what the machine did between them.
+
+| | Before | Now |
+|---|---|---|
+| Compiling the Cypher (both engines do) | 5.54 | 6.17 |
+| smaltcy's whole run | 9.63 | 11.36 |
+| smaltdb's whole run | 14.95 | 11.02 |
+| of it, finding the kept statement | 6.25 | 1.77 |
+| of it, the prepared statement | 2.39 | 2.50 |
+
+Finding the kept statement took more than running it. Profiled, it was two things: building the shape as a text
+while walking the plan (43% of it), and looking that text up in a map (47%).
+
+**What changed.** The walk writes the shape as a list of tokens (the plan's names, strings and numbers, a mark where
+a list or an object opens and closes, a mark of its kind where a value was taken out) and hashes them as it writes
+them. The statement is the one kept under that hash whose tokens are the same. No text is built.
+
+**Finding a kept statement**, µs: `runOnSmaltdb` with the Cypher compiled once, on a database whose prepared
+statements return no rows, the 17 shapes all kept. The lowest of 21 batches' means of 20,000 runs.
+
+| Query | Before | Now |
+|---|---|---|
+| seek by name | 6.48 | 1.71 |
+| 1 hop | 7.73 | 2.03 |
+| 2 hops | 9.37 | 2.41 |
+| 3 hops | 10.82 | 2.77 |
+| 1 hop, directed | 7.80 | 2.02 |
+| 3 hops, directed | 10.99 | 2.77 |
+| 2 hops to a label | 9.57 | 2.37 |
+| 2 hops, relationship filter | 11.03 | 2.82 |
+| var-length 1..3, distinct | 8.48 | 2.07 |
+| shortest path | 12.50 | 3.19 |
+| shortest path, 5 hops | 12.30 | 3.20 |
+| shortest path, none (out) | 12.28 | 3.26 |
+| shortest path, none (all) | 12.07 | 3.23 |
+| label scan + filter | 7.19 | 1.95 |
+| group by city | 11.21 | 2.71 |
+| all relationships | 7.22 | 1.74 |
+| triangles (bounded) | 11.01 | 2.76 |
+| all 17 together | 168.04 | 43.00 |
+
+**Before and now** in the three tables below were run in turns in one series, both on this pin: before with `main`'s
+`shape.ts`, now with this change. A ratio is smaltdb's time over smaltcy's.
+
+**The same text every run** (`BENCH_INDEXES=1 npm run bench:smaltdb`; three runs before, three now; the times are
+the first run's now):
+
+| Query | Before | Now | smaltcy, smaltdb now (ms) |
+|---|---|---|---|
+| seek by name | 1.09x, 1.04x, 1.02x | 0.83x, 0.83x, 0.83x | 0.018, 0.015 |
+| 1 hop | 0.78x, 0.77x, 0.78x | 0.61x, 0.61x, 0.59x | 0.040, 0.025 |
+| 2 hops | 0.35x, 0.34x, 0.35x | 0.34x, 0.34x, 0.33x | 0.346, 0.127 |
+| 3 hops | 0.30x, 0.29x, 0.29x | 0.28x, 0.29x, 0.29x | 4.413, 1.265 |
+| 1 hop, directed | 0.83x, 0.85x, 0.83x | 0.63x, 0.63x, 0.64x | 0.029, 0.019 |
+| 3 hops, directed | 0.27x, 0.27x, 0.27x | 0.27x, 0.27x, 0.26x | 2.286, 0.617 |
+| 2 hops to a label | 0.27x, 0.26x, 0.25x | 0.25x, 0.26x, 0.23x | 0.744, 0.187 |
+| 2 hops, relationship filter | 1.87x, 1.87x, 1.82x | 1.88x, 1.76x, 1.84x | 0.567, 1.104 |
+| var-length 1..3, distinct | 0.63x, 0.63x, 0.57x | 0.59x, 0.58x, 0.58x | 11.731, 7.095 |
+| shortest path | 0.83x, 0.83x, 0.85x | 0.66x, 0.61x, 0.69x | 0.044, 0.030 |
+| shortest path, 5 hops | 0.17x, 0.17x, 0.16x | 0.17x, 0.17x, 0.17x | 27.932, 5.148 |
+| shortest path, none (out) | 1.15x, 1.14x, 1.15x | 0.89x, 0.88x, 0.88x | 0.029, 0.026 |
+| shortest path, none (all) | 0.23x, 0.23x, 0.23x | 0.24x, 0.22x, 0.23x | 31.267, 7.655 |
+| label scan + filter | 0.54x, 0.58x, 0.58x | 0.56x, 0.58x, 0.56x | 2.129, 1.202 |
+| group by city | 1.50x, 1.65x, 1.65x | 1.87x, 1.58x, 1.76x | 17.693, 35.985 |
+| all relationships | 0.15x, 0.17x, 0.15x | 0.16x, 0.16x, 0.17x | 16.336, 2.647 |
+| triangles (bounded) | 0.77x, 0.75x, 0.81x | 0.83x, 0.75x, 0.74x | 11.672, 10.215 |
+
+**Statements that differ** (`BENCH_ENTRY=bench/vary.ts npm run bench:smaltdb`; a literal, a parameter; two runs
+before, two now):
+
+| Statement | Before | Now |
+|---|---|---|
+| seek by name | 1.12x, 1.02x and 1.18x, 1.02x | 1.01x, 0.95x and 1.08x, 0.96x |
+| 1 hop | 0.65x, 0.70x and 0.66x, 0.81x | 0.56x, 0.64x and 0.57x, 0.60x |
+| 2 hops | 0.44x, 0.50x and 0.49x, 0.51x | 0.42x, 0.43x and 0.42x, 0.45x |
+| 3 hops | 0.31x, 0.32x and 0.33x, 0.35x | 0.31x, 0.33x and 0.34x, 0.40x |
+| 3 hops, directed | 0.39x, 0.50x and 0.42x, 0.55x | 0.34x, 0.50x and 0.37x, 0.47x |
+| 2 hops to a label | 0.30x, 0.30x and 0.35x, 0.40x | 0.27x, 0.29x and 0.27x, 0.31x |
+| 2 hops, relationship filter | 0.98x, 1.00x and 1.09x, 1.10x | 0.95x, 0.99x and 0.85x, 1.00x |
+| var-length 1..3, distinct | 0.67x, 0.67x and 0.60x, 0.64x | 0.59x, 0.60x and 0.65x, 0.62x |
+| shortest path | 0.14x, 0.16x and 0.13x, 0.16x | 0.13x, 0.16x and 0.13x, 0.15x |
+| shortest path, directed | 1.05x, 0.89x and 1.06x, 0.87x | 0.93x, 0.75x and 0.88x, 0.70x |
+| shortest path, none | 0.27x, 0.26x and 0.25x, 0.25x | 0.25x, 0.26x and 0.27x, 0.26x |
+| label scan + filter | 1.10x, 0.78x and 1.03x, 0.74x | 1.08x, 0.68x and 1.10x, 0.71x |
+| create 1 node | 38.2x, 44.6x and 39.6x, 44.1x | 38.6x, 47.0x and 40.8x, 46.4x |
+| create 1,000 nodes | 13.7x, 13.9x and 13.4x, 14.6x | 13.7x, 14.4x and 13.8x, 14.9x |
+| create 1 relationship | 64.7x, 79.8x and 62.4x, 74.8x | 73.7x, 80.0x and 70.9x, 87.8x |
+| create 1,000 relationships | 9.51x, 9.69x and 9.74x, 8.46x | 9.95x, 9.83x and 9.26x, 9.92x |
+| set 1 property by name | 24.6x, 25.1x and 26.4x, 26.9x | 24.6x, 24.4x and 22.5x, 24.5x |
+| set 1,000 properties | 14.2x, 14.8x and 12.4x, 13.8x | 13.0x, 13.3x and 13.8x, 13.6x |
+| merge existing node | 5.79x, 5.75x and 5.57x, 5.19x | 4.66x, 4.30x and 5.34x, 5.29x |
+| merge 1,000 new nodes | 0.91x, 0.93x and 0.92x, 0.94x | 0.90x, 0.90x and 0.92x, 0.91x |
+| delete 1 node | 116x, 134x and 121x, 136x | 112x, 134x and 119x, 132x |
+| delete 1,000 nodes | 24.1x, 23.5x and 22.6x, 22.5x | 22.4x, 22.7x and 22.6x, 23.3x |
+
+**The same text every run: writes** (`BENCH_ENTRY=bench/writes.ts npm run bench:smaltdb`; one run before, one now):
+
+| Write | Before | Now | smaltcy, smaltdb now (ms) |
+|---|---|---|---|
+| create 1 node | 50.2x | 50.6x | 0.007, 0.445 |
+| create 1,000 nodes | 13.8x | 13.3x | 0.721, 9.667 |
+| create 1 relationship | 119x | 117x | 0.015, 2.096 |
+| create 1,000 relationships | 11.6x | 11.5x | 1.386, 16.858 |
+| set 1 property by name | 7.63x | 6.89x | 0.012, 0.079 |
+| set 1,000 properties | 15.0x | 13.5x | 0.616, 7.799 |
+| merge existing node | 5.72x | 5.31x | 0.010, 0.058 |
+| merge 1,000 new nodes | 0.80x | 0.78x | 15.782, 12.363 |
+| delete 1,000 nodes | 28.3x | 28.6x | 0.492, 14.363 |
+
+What it says:
+
+- **The two reads over the bar that take under 0.04 ms are under it** with the same text: the seek by name (1.02x to
+  1.09x before, 0.83x in each of the three runs now) and the shortest path with a direction and no path (1.14x and
+  1.15x before, 0.88x and 0.89x now).
+- **Every read of under 0.1 ms got faster against smaltcy,** by what finding its statement took: 1 hop from 0.77x
+  and 0.78x to 0.59x to 0.61x, 1 hop with a direction from 0.83x to 0.85x to 0.63x and 0.64x, the shortest path from
+  0.83x to 0.85x to 0.61x to 0.69x. The reads of a millisecond and more did not change: finding a statement was 6 to
+  13 µs of them.
+- **Statements that differ.** The seek by name with a parameter is under the bar (1.02x before, 0.95x and 0.96x
+  now), and so is the directed shortest path with a literal (1.05x and 1.06x before, 0.93x and 0.88x now). The seek
+  by name with a literal went from 1.12x and 1.18x to 1.01x and 1.08x: still at the bar or over it.
+- **What is left of the seek by name with a literal is code that is not optimized yet when it is timed.** It is
+  this benchmark's first case, so its 200 statements are the first the process times. Timed the same way in a
+  scratch run (each statement once, the engines taking turns in blocks of ten), smaltdb took 1.03 to 1.07 times
+  smaltcy's time over the first 200 statements (five runs), and 0.77 to 0.81 times over the same 200 run again as a
+  third pass in the same process. With Node's optimizing compiler off (`node --no-opt`, one run) it took 1.33 to 1.38
+  times in every pass. So smaltdb's path runs more code for a statement than smaltcy's engine does, and takes less
+  time once that code is optimized. In one of those first passes smaltdb's 49.7 µs were 23.8 compiling the Cypher,
+  14.4 in the prepared statement and 7.6 finding it and in the runner around it; in a loop those are 6.17, 2.50 and
+  1.77.
+- **The label scan with a literal is not this change's** (1.10x and 1.03x before, 1.08x and 1.10x now): finding its
+  statement is 2 µs of 4 ms. It is smaltdb's ADR 0041, section 3 (the columns of an output nothing reads).
+- **The relationship filter and group by city are over the bar on this pin.** stenhoor/smaltdb#287 (ADR 0041's
+  step 5b) is what they need, and they are measured again with the next pin.
+- **The writes did not change** beyond what they move between runs. The write runner uses the same walk
+  (`valuesOut`), which is a few µs of a write.
