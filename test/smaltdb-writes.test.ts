@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'vitest';
 import type { Database } from 'smaltdb-src/engine/database.js';
+import type { PlanStatementInput } from 'smaltdb/engine';
 import { compile } from '../src/cypher/index.js';
 import { open, type Graph } from '../src/index.js';
 import { Unsupported } from '../src/smaltdb/compile.js';
 import type { GraphTables } from '../src/smaltdb/schema.js';
-import { runOnSmaltdb } from '../src/smaltdb/write.js';
+import { runOnSmaltdb, type SmaltdbDatabase } from '../src/smaltdb/write.js';
 import { social } from './helpers/graphs.js';
 import { both, dataOf } from './helpers/smaltdb.js';
 import { WRITE_CASES } from './helpers/write-cases.js';
@@ -386,6 +387,59 @@ describe('transactions on smaltdb', () => {
     const r = runOnSmaltdb(p.db, compile("MATCH (n:Person {name: 'Ada'}) RETURN n.born AS b").plan, p.tables);
     expect(r.rows).toEqual([[1815]]);
     expect(r.tables).toBe(p.tables);
+  });
+});
+
+describe('new ids on smaltdb', () => {
+  /** A database that keeps the statements it is given. */
+  function recording(db: Database): { db: SmaltdbDatabase; statements: PlanStatementInput[] } {
+    const statements: PlanStatementInput[] = [];
+    return {
+      db: {
+        queryPlan: (stmt, params) => {
+          statements.push(stmt);
+          return db.queryPlan(stmt, params as never);
+        },
+        get inTransaction() {
+          return db.inTransaction;
+        },
+      },
+      statements,
+    };
+  }
+  /** The operators smaltdb runs a query with, from the top, each with the rows it gave (EXPLAIN ANALYZE). */
+  const operators = (db: Database, query: PlanStatementInput): [string, number][] =>
+    (db.queryPlan({ kind: 'explain', mode: 'analyze', query } as never).rows as unknown[][]).map((r) => [String(r[2]), r[5] as number]);
+  type Query = { kind: string; plan: { op: string; input?: { op: string; input?: { op: string; table?: string } } } };
+
+  test("the largest ids are the tables' last rows: read from their ends, no table scanned for them", () => {
+    const p = start('social');
+    const r = recording(p.db);
+    const created = runOnSmaltdb(r.db, compile("CREATE (a:Person {name: 'New'})-[:KNOWS]->(b:City {name: 'Newer'}) RETURN id(a) AS a, id(b) AS b").plan, p.tables);
+    const mine = p.g.run("CREATE (a:Person {name: 'New'})-[:KNOWS]->(b:City {name: 'Newer'}) RETURN id(a) AS a, id(b) AS b");
+    expect(created.rows).toEqual(mine.rows);
+    expect(stateIn(p.db, created.tables)).toEqual(stateOf(p.g));
+    // One lookup for the node table and one for each relationship type's table: its rows by rowid from the last, and
+    // the first of them.
+    const lookups = (r.statements as unknown as Query[]).filter((s) => s.kind === 'query' && s.plan.op === 'limit' && s.plan.input?.op === 'sort' && s.plan.input.input?.op === 'scan');
+    expect(lookups.map((s) => s.plan.input!.input!.table).sort()).toEqual([p.tables.nodes, ...p.tables.types.values()].sort());
+    for (const s of lookups) {
+      const table = s.plan.input!.input!.table!;
+      const ops = operators(p.db, s as unknown as PlanStatementInput);
+      // No sort, and the scan stops at its first row.
+      expect(ops.map(([name]) => name), table).toEqual(['LIMIT', 'PROJECT', `SCAN ${table}`]);
+      expect(ops.map(([, rows]) => rows), table).toEqual([1, 1, 1]);
+    }
+    // No statement takes a maximum over a table's rows.
+    expect((r.statements as unknown as Query[]).filter((s) => s.kind === 'query' && s.plan.op === 'aggregate' && s.plan.input?.op === 'scan')).toEqual([]);
+  });
+
+  test('a graph with no node and no relationship: the first ids, as on smaltcy', () => {
+    const p = new Pair(open());
+    p.run('CREATE (a:A {i: 1})-[:R]->(b:B {i: 2}) RETURN id(a) AS a, id(b) AS b');
+    p.run('MATCH (a:A) CREATE (a)-[:R {n: 1}]->(:B {i: 3})-[:S]->(a)');
+    p.run('MATCH ()-[r]->() RETURN id(r) AS r ORDER BY r');
+    p.run('MATCH (n) RETURN id(n) AS n ORDER BY n');
   });
 });
 

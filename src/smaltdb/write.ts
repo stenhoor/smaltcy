@@ -337,6 +337,12 @@ const ONE_ROW: PlanOp = { op: 'values', rows: [[]], types: [] };
 const scalar = (p: PlanOp, type: PlanType): PlanExpr => ({ k: 'subquery', mode: 'scalar', plan: p, type, collation: 'binary' });
 const exists = (p: PlanOp): PlanExpr => ({ k: 'subquery', mode: 'exists', plan: p, type: 'bool', collation: 'binary' });
 const maxOf = (p: PlanOp): PlanOp => ({ op: 'aggregate', input: p, keys: [], aggs: [{ fn: 'max', args: [colRef(0, 'int')], star: false, distinct: false, collation: 'binary', type: 'int' }], carry: [] });
+/**
+ * The row of a table with the largest rowid (`rows`: a scan of the table whose column 0 is its rowid), none for an
+ * empty table. smaltdb reads a table from its end for its rowids in descending order and stops at the first row; a
+ * `max` over the scan reads every row.
+ */
+const lastOf = (rows: PlanOp): PlanOp => ({ op: 'limit', input: { op: 'sort', input: rows, keys: [{ expr: colRef(0, 'int'), desc: true, nullsFirst: false, collation: 'binary' }] }, count: lit(1) });
 
 /** Whether a plan reads the graph: a MATCH, or an EXISTS or pattern comprehension (a nested plan) in an expression. */
 function readsGraph(x: unknown): boolean {
@@ -1043,11 +1049,13 @@ class Runner {
    * holds is not given again.
    */
   private largest(table: string, column: number): number {
-    const tables: [string, number][] = [[table, column]];
-    if (this.t0.history === 'versions') tables.push([`smalt_versions_${table}`, 0]);
-    if (this.t0.history === 'log') tables.push([`smalt_log_${table}`, 2]);
-    let max = -1;
-    for (const [t, c] of tables) {
+    // The table's own largest is its last row. Its past versions hold the rowid as a column: those are scanned.
+    const last = this.lookup(lastOf(scan(table, [column])), ['int'])[0];
+    let max = last ? (last[0] as number) : -1;
+    const past: [string, number][] = [];
+    if (this.t0.history === 'versions') past.push([`smalt_versions_${table}`, 0]);
+    if (this.t0.history === 'log') past.push([`smalt_log_${table}`, 2]);
+    for (const [t, c] of past) {
       const m = this.lookup(maxOf(scan(t, [c])), ['int'])[0]![0] as number | null;
       if (m !== null && m > max) max = m;
     }
