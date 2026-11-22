@@ -5,7 +5,8 @@ import { fileURLToPath } from 'node:url';
 const src = (p: string) => fileURLToPath(new URL(`./src/${p}`, import.meta.url));
 // smaltdb, for the compiler to its plans (ADR 0033 step 8 in smaltdb): its source in the packed build that
 // scripts/fetch-packed.mjs installs (packed.json), as smaltql's tests run it.
-const db = (p: string) => fileURLToPath(new URL(`./node_modules/smaltdb/src/${p}`, import.meta.url));
+// SMALTDB_SRC: a smaltdb checkout's `src`, to run the tests on an engine that is not pinned yet.
+const db = (p: string) => (process.env.SMALTDB_SRC ? `${process.env.SMALTDB_SRC}/${p}` : fileURLToPath(new URL(`./node_modules/smaltdb/src/${p}`, import.meta.url)));
 const dbPackage = db('../package.json');
 const dbVersion = existsSync(dbPackage) ? (JSON.parse(readFileSync(dbPackage, 'utf8')) as { version: string }).version : '0.0.0';
 

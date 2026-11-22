@@ -270,7 +270,7 @@ interface NodesBinding {
 export type Binding = ValueBinding | NodeBinding | RelBinding | RelsBinding | PathBinding | NodesBinding;
 
 /** A binding with its columns moved by `f`. */
-function moveBinding(b: Binding, f: (col: number) => number): Binding {
+export function moveBinding(b: Binding, f: (col: number) => number): Binding {
   switch (b.k) {
     case 'value': return { ...b, col: f(b.col) };
     case 'node': return { k: 'node', id: f(b.id), props: f(b.props) };
@@ -465,12 +465,12 @@ const INFINITY: PlanExpr = { k: 'lit', value: Infinity, type: 'real' };
  * An error raised when a row reaches it (smaltdb's `raise_error`, which a CASE branch not taken doesn't evaluate): a
  * smaltcy error code and its message, text or an expression giving text.
  */
-const raise = (code: ErrorCode, message: string | PlanExpr, type: PlanType = 'any'): PlanExpr =>
+export const raise = (code: ErrorCode, message: string | PlanExpr, type: PlanType = 'any'): PlanExpr =>
   call('raise_error', [typeof message === 'string' ? lit(message) : message, lit(code)], type);
 /** What a plan does with values whose Cypher meaning it can't keep yet: `Unsupported`'s code and message, when a row meets them. */
-const refuseWhenMet = (feature: string, type: PlanType = 'any'): PlanExpr => raise('SMALTCY_UNSUPPORTED', new Unsupported(feature).message, type);
+export const refuseWhenMet = (feature: string, type: PlanType = 'any'): PlanExpr => raise('SMALTCY_UNSUPPORTED', new Unsupported(feature).message, type);
 /** Text joined from literal parts and text expressions: an error's message. */
-const message = (...parts: (string | PlanExpr)[]): PlanExpr =>
+export const message = (...parts: (string | PlanExpr)[]): PlanExpr =>
   parts.map((p) => (typeof p === 'string' ? lit(p) : p)).reduce((a, b) => call('text_concat', [a, b], 'text'));
 
 // Cypher's kinds of values, and their order in ORDER BY (smaltcy's `orderCompare`): maps, nodes, relationships, lists,
@@ -554,7 +554,7 @@ const isNumber = (v: { e: PlanExpr }): PlanExpr => call('in_list', [call('any_ty
  * The name of a value's type as smaltcy's errors give it (`typeName`): NULL, BOOLEAN, INTEGER (a number with a whole
  * value), FLOAT, STRING, LIST or MAP; smaltdb's own type for other values.
  */
-function typeNameExpr(v: { e: PlanExpr; t: PlanType }): PlanExpr {
+export function typeNameExpr(v: { e: PlanExpr; t: PlanType }): PlanExpr {
   const k = staticKind(v.t);
   const named = new Map([[K_STRING, 'STRING'], [K_BOOL, 'BOOLEAN'], [K_LIST, 'LIST'], [K_MAP, 'MAP'], [K_NULL, 'NULL']]);
   const name = k === undefined ? undefined : named.get(k);
@@ -658,7 +658,7 @@ function eachOf(list: Typed, mode: 'map' | 'filter', type: PlanType, body: (el: 
 }
 
 /** `each` with aggregates over a list's elements: `body` reads their results. */
-function eachAggOf(list: Typed, aggs: (el: Typed) => plan.AggCall[], body: (agg: (i: number) => PlanExpr) => PlanExpr, type: PlanType): PlanExpr {
+export function eachAggOf(list: Typed, aggs: (el: Typed) => plan.AggCall[], body: (agg: (i: number) => PlanExpr) => PlanExpr, type: PlanType): PlanExpr {
   const id = ++lastVar;
   const t = elemType(list.t);
   return { k: 'each', mode: 'agg', list: list.e, aggs: aggs({ e: variable(id, 'value', t), t }), body: body((i) => variable(id, 'agg', 'int', i)), type, bind: id } as unknown as PlanExpr;
@@ -679,7 +679,7 @@ function letIn(v: Typed, type: PlanType, body: (x: Typed) => PlanExpr): PlanExpr
  * and the one that binds it. An `element` or `eachAgg` made elsewhere (a list comprehension's) counts only the `each`s
  * made elsewhere, so the builders' are added to its depth.
  */
-function bindVars(e: PlanExpr): PlanExpr {
+export function bindVars(e: PlanExpr): PlanExpr {
   const walk = (x: unknown, stack: readonly (number | null)[]): unknown => {
     if (Array.isArray(x)) return x.map((y) => walk(y, stack));
     if (x === null || typeof x !== 'object') return x;

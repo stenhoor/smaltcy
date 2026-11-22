@@ -9,6 +9,10 @@ import { open, type Graph } from '../../src/index.js';
 import { Unsupported } from '../../src/smaltdb/compile.js';
 import type { GraphTables } from '../../src/smaltdb/schema.js';
 import { runOnSmaltdb, type NextIds, type SmaltdbDatabase } from '../../src/smaltdb/write.js';
+import { runPlanOnSmaltdb } from '../../src/smaltdb/write-plan.js';
+
+/** SMALTCY_WRITES=plan: a write is one smaltdb plan (write-plan.ts), where it is the runner's statements without. */
+const run = process.env.SMALTCY_WRITES === 'plan' ? runPlanOnSmaltdb : runOnSmaltdb;
 import { social } from './graphs.js';
 import { both, dataOf } from './smaltdb.js';
 
@@ -82,7 +86,7 @@ export class Pair {
     let theirs: ReturnType<typeof runOnSmaltdb> | undefined;
     let theirsError: unknown;
     try {
-      theirs = runOnSmaltdb(this.given, compile(cypher).plan, this.tables, { params, ...(this.ids ? { ids: this.ids } : {}) });
+      theirs = run(this.given, compile(cypher).plan, this.tables, { params, ...(this.ids ? { ids: this.ids } : {}) });
       this.tables = theirs.tables;
     } catch (e) {
       theirsError = e;

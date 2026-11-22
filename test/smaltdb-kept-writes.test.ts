@@ -18,6 +18,13 @@ import { type Pair, start as startPair, stateIn, stateOf } from './helpers/write
 /** A graph on both engines, with smaltcy's numbering of new ids: these tests delete, and fail, and then create. */
 const start = (graph: 'empty' | 'social', through?: (db: Database) => SmaltdbDatabase): Pair => startPair(graph, through, true);
 
+/**
+ * PROTOTYPE (smaltdb ADR 0042, step 2's gate): with SMALTCY_WRITES=plan a write is one smaltdb plan, so nothing is
+ * kept here for its shape. What these tests say of the statements kept is then not looked at; what they say of rows,
+ * counts and the graph is.
+ */
+const PLANS = process.env.SMALTCY_WRITES === 'plan';
+
 /** A smaltdb database that counts the statements it is asked to prepare. */
 function counting(counter: { n: number }): (db: Database) => SmaltdbDatabase {
   return (db) => ({
@@ -113,9 +120,9 @@ describe('a write with other values runs the statements kept for its shape', () 
     run(0);
     run(1);
     const made = prepared.n;
-    expect(made, 'the shape keeps statements').toBeGreaterThan(0);
+    if (!PLANS) expect(made, 'the shape keeps statements').toBeGreaterThan(0);
     for (let i = 2; i < 9; i++) run(i);
-    expect(prepared.n, 'no statement is made for a write whose shape is kept').toBe(made);
+    if (!PLANS) expect(prepared.n, 'no statement is made for a write whose shape is kept').toBe(made);
   });
 
   test('a value of another kind is another shape, with statements of its own', () => {
@@ -126,19 +133,19 @@ describe('a write with other values runs the statements kept for its shape', () 
     set('2');
     const whole = prepared.n;
     set('3');
-    expect(prepared.n).toBe(whole);
+    if (!PLANS) expect(prepared.n).toBe(whole);
     // A text, then a float: each a shape of its own, kept in turn.
     set("'a'");
     const text = prepared.n;
-    expect(text).toBeGreaterThan(whole);
+    if (!PLANS) expect(text).toBeGreaterThan(whole);
     set("'b'");
     set('1.5');
     const float = prepared.n;
-    expect(float).toBeGreaterThan(text);
+    if (!PLANS) expect(float).toBeGreaterThan(text);
     set('2.5');
     set('4');
     set("'c'");
-    expect(prepared.n).toBe(float);
+    if (!PLANS) expect(prepared.n).toBe(float);
   });
 
   test('the shapes kept are counted with the reads kept, and the oldest go first', () => {
@@ -147,8 +154,8 @@ describe('a write with other values runs the statements kept for its shape', () 
     const before = keptShapes(p.db).shapes;
     // 300 shapes: a write that differs in a property's name.
     for (let i = 0; i < 300; i++) p.run(`MATCH (n:N) SET n.k${i} = ${i}`);
-    expect(keptShapes(p.db).shapes).toBe(256);
-    expect(before).toBeLessThan(256);
+    if (!PLANS) expect(keptShapes(p.db).shapes).toBe(256);
+    if (!PLANS) expect(before).toBeLessThan(256);
     // A shape that went is made again and runs as before.
     p.run('MATCH (n:N) SET n.k0 = -1 RETURN n.k0 AS k');
     p.run('MATCH (n:N) SET n.k0 = -2 RETURN n.k0 AS k');
@@ -187,7 +194,7 @@ describe('a label or a type added while a statement runs', () => {
     const after = prepared.n;
     set(4);
     set(5);
-    expect(prepared.n).toBe(after);
+    if (!PLANS) expect(prepared.n).toBe(after);
   });
 
   test('a statement that adds a label and then fails leaves the graph, and what is kept, as they were', () => {
@@ -257,8 +264,8 @@ describe('a write over many rows, below an operation that reads all its rows fir
       return ran.n;
     };
     const twenty = statements(20);
-    expect(twenty).toBeGreaterThan(0);
-    expect(statements(40)).toBe(twenty);
+    if (!PLANS) expect(twenty).toBeGreaterThan(0);
+    if (!PLANS) expect(statements(40)).toBe(twenty);
   });
 });
 
@@ -426,7 +433,7 @@ describe('the next ids, with statements kept', () => {
       tables = theirs.tables;
       expect(theirs.rows, cypher).toEqual(mine.rows);
     }
-    expect(ids).toEqual({ node: 12, relationship: 6 });
+    if (!PLANS) expect(ids).toEqual({ node: 12, relationship: 6 });
     expect(stateIn(p.db, tables)).toEqual(stateOf(g));
   });
 });

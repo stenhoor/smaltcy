@@ -49,6 +49,7 @@ import { exprsOf, type GraphPlan, type Op, type Pattern, type RemoveItem, type S
 import type { GraphTables } from './schema.js';
 import { NODE_LABEL } from './schema.js';
 import { runByShape, writeByShape } from './shape.js';
+import { runPlanOnSmaltdb } from './write-plan.js';
 import {
   and, asOfOf, call, caseWhen, colRef, Compiler, compileQuery, eq, HOPS, IDS, isNull, lastCommitOf, lastOf, lit, noHistory, NULL, or,
   paramsRead, paramValues, PROPS, Unsupported, type AsOf, type Binding, type Frame, type Rel, type Val,
@@ -156,6 +157,8 @@ export function runOnSmaltdb(db: SmaltdbDatabase, gp: GraphPlan, tables: GraphTa
     const read = version ?? (tables.history && !db.inTransaction ? latestVersion(db) : undefined);
     return { columns: r.columns, rows: r.rows, counts: emptyCounts(), tables, ...(read !== undefined ? { version: read } : {}) };
   }
+  // PROTOTYPE (smaltdb ADR 0042, step 2's gate): with SMALTCY_WRITES=plan a write is one smaltdb plan (write-plan.ts).
+  if (typeof process !== 'undefined' && process.env.SMALTCY_WRITES === 'plan') return runPlanOnSmaltdb(db, gp, tables, options);
   if (gp.asOf) throw new Unsupported('AT VERSION and AT TIME');
   if (own && db.inTransaction) throw new Unsupported("an author or a message for a statement inside a transaction (give them to the transaction's begin or commit)");
   // The statement with its values as parameters, and what the runner kept for its shape (shape.ts): the statements it
@@ -217,7 +220,7 @@ interface Savepoints {
 /** A database's savepoint statements, prepared the first time a write runs on it and kept. */
 const savepointsOf = new WeakMap<object, Savepoints>();
 
-function savepoints(db: SmaltdbDatabase): Savepoints {
+export function savepoints(db: SmaltdbDatabase): Savepoints {
   let kept = savepointsOf.get(db);
   if (kept) return kept;
   const statement = (action: string, more: object): (() => void) => {
@@ -385,7 +388,7 @@ const exists = (p: PlanOp): PlanExpr => ({ k: 'subquery', mode: 'exists', plan: 
 const maxOf = (p: PlanOp): PlanOp => ({ op: 'aggregate', input: p, keys: [], aggs: [{ fn: 'max', args: [colRef(0, 'int')], star: false, distinct: false, collation: 'binary', type: 'int' }], carry: [] });
 
 /** Whether a plan reads the graph: a MATCH, or an EXISTS or pattern comprehension (a nested plan) in an expression. */
-function readsGraph(x: unknown): boolean {
+export function readsGraph(x: unknown): boolean {
   if (Array.isArray(x)) return x.some(readsGraph);
   if (x === null || typeof x !== 'object') return false;
   const o = x as Record<string, unknown>;
@@ -394,7 +397,7 @@ function readsGraph(x: unknown): boolean {
 }
 
 /** Whether a plan deletes (its operations). */
-function deletes(op: Op): boolean {
+export function deletes(op: Op): boolean {
   if (op.op === 'delete') return true;
   if (op.op === 'argument') return false;
   if (op.op === 'union') return op.inputs.some(deletes);
@@ -406,10 +409,10 @@ function deletes(op: Op): boolean {
  * exist"), where smaltdb would give a value: refused after a DELETE, whatever they are given.
  */
 const READS_DELETED = new Set(['labels', 'properties', 'type', 'startNode', 'endNode', 'nodes', 'relationships', 'keys']);
-const AFTER_DELETE_FEATURE = 'labels(), properties(), type(), startNode(), endNode(), nodes() and relationships() after a DELETE, and paths and lists of nodes or relationships in its results';
+export const AFTER_DELETE_FEATURE = 'labels(), properties(), type(), startNode(), endNode(), nodes() and relationships() after a DELETE, and paths and lists of nodes or relationships in its results';
 
 /** Whether an operation's own expressions (not its input's) call one of `READS_DELETED`. */
-function readsDeleted(op: Op): boolean {
+export function readsDeleted(op: Op): boolean {
   const walk = (x: unknown): boolean => {
     if (Array.isArray(x)) return x.some(walk);
     if (x === null || typeof x !== 'object') return false;
@@ -1763,12 +1766,12 @@ function toProps(raw: Record<string, Value>, isMap: boolean, what: string): { pr
 const BARRIERS = new Set(['eager', 'sort', 'aggregate', 'distinct']);
 
 /** Whether a plan's rows are one query: it writes nothing and reads all it reads first (EAGER), or reads no graph. */
-function settled(op: Op): boolean {
+export function settled(op: Op): boolean {
   return !writes(op) && (op.op === 'eager' || !readsGraph(op));
 }
 
 /** Whether an expression reads only its row's values: no properties, labels, functions or nested plans. */
-function plainExpr(x: Expr): boolean {
+export function plainExpr(x: Expr): boolean {
   if (x.k === 'lit' || x.k === 'param' || x.k === 'slot') return true;
   if (!['list', 'map', 'and', 'or', 'xor', 'not', 'isNull', 'case'].includes(x.k)) return false;
   let ok = true;
@@ -1780,7 +1783,7 @@ function plainExpr(x: Expr): boolean {
  * Whether an operation, above a write in the same clause, would see that write's rows differ written one at a time
  * or all at once: it writes, matches, stops early, or reads more than its rows' values.
  */
-function touches(op: Op): boolean {
+export function touches(op: Op): boolean {
   if (WRITES.has(op.op) || op.op === 'match' || op.op === 'limit' || op.op === 'union') return true;
   return exprsOf(op).some((x) => !plainExpr(x));
 }
