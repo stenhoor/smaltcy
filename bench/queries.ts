@@ -15,6 +15,9 @@ export const QUERIES: [string, string][] = [
   ['shortest path, none (out)', "MATCH (a:Person {name: 'Wen 1172'}), (b:Person {name: 'Ana 1500'}) MATCH p = shortestPath((a)-[:KNOWS*]->(b)) RETURN length(p)"],
   ['shortest path, none (all)', "MATCH (a:Person {name: 'Bo 1'}), (b:City {name: 'Lisbon'}) MATCH p = shortestPath((a)-[:KNOWS*]-(b)) RETURN length(p)"],
   ['label scan + filter', 'MATCH (p:Person) WHERE p.age > 70 RETURN count(p)'],
+  // A small label (the network's 8 cities): one of its nodes by a property that has no index, and all of them.
+  ['small label + filter', "MATCH (c:City {name: 'Lisbon'}) RETURN c.name"],
+  ['small label', 'MATCH (c:City) RETURN c.name'],
   ['group by city', 'MATCH (p:Person)-[:LIVES_IN]->(c:City) RETURN c.name, count(p), avg(p.age)'],
   ['all relationships', 'MATCH ()-[r:KNOWS]->() RETURN count(r)'],
   ['triangles (bounded)', "MATCH (a:Person {community: 1})-[:KNOWS]->(b)-[:KNOWS]->(c), (a)-[:KNOWS]->(c) RETURN count(*)"],
