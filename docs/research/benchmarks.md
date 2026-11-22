@@ -1236,3 +1236,128 @@ What it says:
   0.11x to 1.00x differing (the seek by name with a literal, the first case timed, read 1.00x in one run and 0.94x in
   the other). Group by city reads 0.74x and 0.79x where it read 0.68x and 0.72x: smaltdb's time is the same (14.8
   and 15.1 ms before, 14.6 and 14.5 now) and smaltcy's is lower (21.3 and 19.5 ms before, 18.0 and 18.2 now).
+
+## Small labels, and nodes deleted (2026-11-22)
+
+stenhoor/smaltdb#274. The pin moves from `f383dd4` to `6b5f100`, smaltdb's `main` with three changes (its ADR 0042's
+step 1, and two that came of it):
+
+- stenhoor/smaltdb#293: a label's nodes are read from smaltdb's graph index, and a node is checked on its properties
+  before its row is asked for.
+- stenhoor/smaltdb#294: the rule that refuses to delete a node that has relationships asks the graph index, and a plan
+  smaltdb runs inside a statement gives its table writers back when it ends.
+- stenhoor/smaltdb#295: a label's nodes are read only between the label's lowest and highest node.
+
+No case read a small label, so three are new. In the reads: `small label + filter` (`MATCH (c:City {name: 'Lisbon'})
+RETURN c.name`, one of the network's 8 cities by a property that has no index) and `small label` (`MATCH (c:City)
+RETURN c.name`, the 8 cities). In the statements that differ: `node of a small label` (`MATCH (n:Bench {i: …}) RETURN
+n.i`, one of a label's 441 nodes by a property that has no index, which is the read `delete 1 node` starts with).
+
+The same method. Before and now were run in turns in one series: this change (the new cases; smaltcy's source is
+`main`'s, `93013cf`) bundled with the old pin's smaltdb source (`f383dd4`), and bundled with the new pin's
+(`6b5f100`). A ratio is smaltdb's time over smaltcy's.
+
+**The same text every run: writes** (`BENCH_ENTRY=bench/writes.ts`; two runs before, two now; the times are the first
+run's now):
+
+| Write | Before | Now | smaltcy, smaltdb now (ms) |
+|---|---|---|---|
+| create 1 node | 3.58x, 3.76x | 3.71x, 3.68x | 0.006, 0.022 |
+| create 1,000 nodes | 12.65x, 13.20x | 11.86x, 10.87x | 0.603, 7.592 |
+| create 1 relationship | 2.94x, 3.05x | 2.97x, 3.02x | 0.013, 0.041 |
+| create 1,000 relationships | 9.97x, 9.61x | 8.84x, 8.95x | 1.261, 12.063 |
+| set 1 property by name | 2.33x, 2.35x | 2.41x, 2.39x | 0.011, 0.026 |
+| set 1,000 properties | 14.98x, 13.82x | 12.46x, 13.30x | 0.577, 7.106 |
+| merge existing node | 1.15x, 1.15x | 1.10x, 1.17x | 0.010, 0.012 |
+| merge 1,000 new nodes | 0.74x, 0.72x | 0.71x, 0.70x | 13.416, 9.464 |
+| delete 1,000 nodes | 29.03x, 28.23x | 19.14x, 19.99x | 0.439, 8.634 |
+
+**Statements that differ** (`BENCH_ENTRY=bench/vary.ts`; a literal, a parameter; two runs before, two now):
+
+| Statement | Before | Now |
+|---|---|---|
+| seek by name | 0.92x, 0.93x and 0.93x, 0.97x | 1.02x, 0.89x and 0.87x, 0.87x |
+| 1 hop | 0.55x, 0.53x and 0.56x, 0.66x | 0.55x, 0.50x and 0.54x, 0.55x |
+| 2 hops | 0.39x, 0.39x and 0.40x, 0.39x | 0.36x, 0.40x and 0.37x, 0.40x |
+| 3 hops | 0.33x, 0.38x and 0.31x, 0.35x | 0.28x, 0.29x and 0.30x, 0.30x |
+| 3 hops, directed | 0.44x, 0.34x and 0.47x, 0.42x | 0.34x, 0.37x and 0.41x, 0.44x |
+| 2 hops to a label | 0.29x, 0.27x and 0.27x, 0.26x | 0.28x, 0.29x and 0.26x, 0.28x |
+| 2 hops, relationship filter | 0.76x, 0.69x and 0.65x, 0.69x | 0.67x, 0.75x and 0.70x, 0.65x |
+| var-length 1..3, distinct | 0.50x, 0.49x and 0.57x, 0.51x | 0.51x, 0.52x and 0.59x, 0.54x |
+| shortest path | 0.13x, 0.12x and 0.14x, 0.14x | 0.12x, 0.12x and 0.15x, 0.16x |
+| shortest path, directed | 0.83x, 0.91x and 0.66x, 0.68x | 0.89x, 0.94x and 0.71x, 0.74x |
+| shortest path, none | 0.23x, 0.24x and 0.23x, 0.22x | 0.25x, 0.24x and 0.24x, 0.26x |
+| label scan + filter | 0.74x, 0.76x and 0.55x, 0.56x | 0.78x, 0.73x and 0.54x, 0.53x |
+| node of a small label | 5.72x, 5.14x and 6.14x, 6.69x | 0.86x, 0.82x and 0.86x, 0.75x |
+| create 1 node | 4.16x, 4.30x and 3.76x, 4.53x | 4.01x, 4.02x and 3.63x, 4.61x |
+| create 1,000 nodes | 12.2x, 12.6x and 12.8x, 12.4x | 11.4x, 11.6x and 12.4x, 12.1x |
+| create 1 relationship | 2.71x, 2.62x and 2.48x, 2.76x | 2.45x, 2.59x and 3.77x, 2.76x |
+| create 1,000 relationships | 7.94x, 7.83x and 7.43x, 7.62x | 7.83x, 7.48x and 7.33x, 7.14x |
+| set 1 property by name | 1.91x, 2.13x and 2.56x, 2.40x | 2.19x, 2.40x and 2.51x, 2.14x |
+| set 1,000 properties | 13.9x, 14.4x and 14.2x, 15.3x | 14.3x, 13.4x and 13.4x, 12.9x |
+| merge existing node | 1.25x, 1.24x and 1.30x, 1.25x | 1.06x, 1.12x and 1.05x, 1.12x |
+| merge 1,000 new nodes | 0.86x, 0.89x and 0.88x, 0.88x | 0.83x, 0.80x and 0.83x, 0.76x |
+| delete 1 node | 8.82x, 7.50x and 9.75x, 8.29x | 2.66x, 2.28x and 2.31x, 2.23x |
+| delete 1,000 nodes | 20.4x, 20.6x and 21.3x, 20.5x | 13.5x, 14.5x and 13.4x, 14.4x |
+
+**The same text every run: reads** (`BENCH_INDEXES=1`; three runs before, three now; the times are the first run's
+now):
+
+| Query | Before | Now | smaltcy, smaltdb now (ms) |
+|---|---|---|---|
+| seek by name | 0.80x, 0.79x, 0.83x | 0.84x, 0.79x, 0.80x | 0.016, 0.013 |
+| 1 hop | 0.58x, 0.59x, 0.53x | 0.57x, 0.60x, 0.55x | 0.029, 0.016 |
+| 2 hops | 0.32x, 0.30x, 0.30x | 0.31x, 0.30x, 0.30x | 0.312, 0.093 |
+| 3 hops | 0.27x, 0.26x, 0.27x | 0.26x, 0.27x, 0.27x | 3.854, 1.028 |
+| 1 hop, directed | 0.59x, 0.58x, 0.59x | 0.58x, 0.58x, 0.60x | 0.039, 0.016 |
+| 3 hops, directed | 0.25x, 0.24x, 0.24x | 0.24x, 0.24x, 0.24x | 2.073, 0.499 |
+| 2 hops to a label | 0.24x, 0.22x, 0.22x | 0.23x, 0.22x, 0.22x | 0.676, 0.152 |
+| 2 hops, relationship filter | 0.73x, 0.61x, 0.60x | 0.59x, 0.60x, 0.61x | 0.506, 0.316 |
+| var-length 1..3, distinct | 0.53x, 0.49x, 0.51x | 0.54x, 0.51x, 0.49x | 10.495, 5.511 |
+| shortest path | 0.62x, 0.64x, 0.63x | 0.59x, 0.61x, 0.62x | 0.040, 0.025 |
+| shortest path, 5 hops | 0.16x, 0.15x, 0.16x | 0.17x, 0.15x, 0.16x | 25.873, 4.568 |
+| shortest path, none (out) | 0.88x, 0.85x, 0.85x | 0.84x, 0.84x, 0.85x | 0.027, 0.022 |
+| shortest path, none (all) | 0.22x, 0.22x, 0.23x | 0.25x, 0.22x, 0.22x | 26.169, 7.079 |
+| label scan + filter | 0.47x, 0.46x, 0.46x | 0.48x, 0.46x, 0.47x | 1.823, 0.874 |
+| small label + filter | 1.08x, 1.09x, 1.06x | 0.83x, 0.85x, 0.85x | 0.011, 0.010 |
+| small label | 1.43x, 1.23x, 1.36x | 1.15x, 1.15x, 1.16x | 0.008, 0.009 |
+| group by city | 0.79x, 0.76x, 0.81x | 0.77x, 0.74x, 0.78x | 18.321, 14.308 |
+| all relationships | 0.15x, 0.14x, 0.14x | 0.13x, 0.13x, 0.13x | 15.851, 2.106 |
+| triangles (bounded) | 0.40x, 0.46x, 0.45x | 0.43x, 0.43x, 0.37x | 10.767, 4.751 |
+
+What it says:
+
+- **A node of a small label, found by a property, is under the bar.** Differing, 5.14x to 6.69x before and 0.75x to
+  0.86x now (smaltdb 0.21 to 0.25 ms before, 0.026 to 0.057 ms now). One of the 8 cities by its name, the same text:
+  1.06x to 1.09x before, 0.83x to 0.85x now.
+- **The 8 cities returned are still over it:** 1.23x to 1.43x before, 1.15x to 1.16x now (smaltdb 0.011 ms before,
+  0.009 to 0.010 ms now; smaltcy 0.008 to 0.009 ms). What is left is not the label's scan: smaltdb sorts rows that
+  already come in order, and asks for each node's row through the join (stenhoor/smaltdb#295).
+- **Deleting 1 node, differing, takes a third to a quarter of what it did:** 7.50x to 9.75x before, 2.23x to 2.66x
+  now (smaltdb 0.20 to 0.22 ms before, 0.049 to 0.079 ms now). Its read is the node of a small label above.
+- **Deleting 1,000 nodes takes two thirds of what it did, and is still the write furthest from the bar.** The same
+  text: 29.03x and 28.23x before, 19.14x and 19.99x now (smaltdb 12.6 and 13.0 ms before, 8.6 and 8.3 ms now).
+  Differing: 20.4x to 21.3x before, 13.4x to 14.5x now (13.9 to 14.4 ms before, 9.3 to 9.4 ms now).
+- **Merging 1,000 new nodes stays under the bar,** and smaltdb's own time is lower: the same text 10.5 and 10.2 ms
+  before, 9.5 and 8.9 ms now (0.74x and 0.72x, 0.71x and 0.70x); differing 12.6 to 13.0 ms before, 11.4 to 12.2 ms now
+  (0.86x to 0.89x, 0.76x to 0.83x).
+- **Merging a node that is there reads lower differing, and smaltdb's time did not move:** 1.24x to 1.30x before and
+  1.05x to 1.12x now, with smaltdb at 0.018 to 0.020 ms before and 0.017 to 0.019 ms now, and smaltcy, whose source is
+  the same in both, at 0.014 to 0.016 ms before and 0.016 to 0.018 ms now. With the same text it is 1.15x and 1.15x
+  before, 1.10x and 1.17x now.
+- **No other single write moved, and none is under the bar:** creating 1 node 3.6x to 4.6x now, 1 relationship 2.5x to
+  3.8x, setting 1 property 2.1x to 2.5x. Creating 1 relationship with a parameter read 3.77x in one run now (2.48x and
+  2.76x before, 2.76x in the other run now), so it was run alone with 40 blocks, seven runs before and seven now in
+  turns: with a literal 3.31x to 3.53x before and 3.31x to 3.61x now, with a parameter 2.40x to 2.88x before and 2.63x
+  to 2.86x now; smaltdb's own time, the median of the seven, 0.185 ms before and 0.184 ms now with a literal, 0.139 ms
+  and 0.136 ms with a parameter.
+- **The other writes of 1,000 rows,** in smaltdb's own times, before and now. The same text (two runs each): creating
+  1,000 nodes 7.3 and 7.7 ms, 7.6 and 7.7 ms; 1,000 relationships 11.1 and 11.4 ms, 12.1 and 12.1 ms; setting 1,000
+  properties 6.7 and 7.1 ms, 7.1 and 6.8 ms. Differing (two runs each, a literal and a parameter): creating 1,000 nodes
+  10.0 to 10.9 ms, 9.5 to 9.6 ms; 1,000 relationships 15.6 to 16.2 ms, 14.7 to 15.6 ms; setting 1,000 properties 8.7 to
+  9.2 ms, 8.7 to 9.4 ms. Creating 1,000 relationships with the same text reads higher now and lower differing; the
+  old pin's source read 12.5 and 12.3 ms for it in the series taken the evening before (the same case, two runs), so
+  11.1 to 12.5 ms is what one source gives.
+- **The other reads did not move** beyond their runs' spread, and none of them is over the bar: 0.13x to 0.85x now with
+  the same text, 0.12x to 1.02x differing (the seek by name with a literal, the first case timed, read 1.02x in one
+  run now and 0.89x in the other; 0.92x and 0.93x before).

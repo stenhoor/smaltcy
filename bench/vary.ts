@@ -109,6 +109,15 @@ const CASES: Case[] = [
     params: (i) => ({ age: 20 + i / 10 }),
   },
   {
+    name: 'node of a small label',
+    // One of a label's some 440 nodes, by a property that has no index: a scan of the label on both engines.
+    before: `UNWIND range(0, ${2 * EACH}) AS i CREATE (:Bench {i: i})`,
+    literal: (i) => `MATCH (n:Bench {i: ${i}}) RETURN n.i`,
+    text: 'MATCH (n:Bench {i: $i}) RETURN n.i',
+    params: (i) => ({ i }),
+    after: CLEAN_BENCH,
+  },
+  {
     name: 'create 1 node',
     literal: (i) => `CREATE (:Bench {i: ${i}})`,
     text: 'CREATE (:Bench {i: $i})',
