@@ -222,8 +222,8 @@ describe('a query with other values runs the statement kept for its shape', () =
   });
 });
 
-describe("a write's values are parameters of the statements it runs", () => {
-  /** A graph on both engines, with the texts of the queries smaltdb is given. */
+describe("a write's values are parameters of the statement it runs", () => {
+  /** A graph on both engines, with the texts of the statements that write which smaltdb is given. */
   function pair() {
     const g = social();
     const b = both(g);
@@ -231,7 +231,7 @@ describe("a write's values are parameters of the statements it runs", () => {
     let tables = b.tables;
     const db: SmaltdbDatabase = {
       queryPlan: (stmt, params) => {
-        if ((stmt as { kind: string }).kind === 'query') texts.add(JSON.stringify(stmt));
+        if ((stmt as { kind: string }).kind === 'write') texts.add(JSON.stringify(stmt));
         return b.db.queryPlan(stmt, params as never);
       },
       get inTransaction() {
@@ -247,27 +247,27 @@ describe("a write's values are parameters of the statements it runs", () => {
       expect(theirs.counts, cypher).toEqual(mine.counts);
     };
     const graph = () => expect(onSmaltdb(b.db, tables, 'MATCH (n) RETURN labels(n) AS l, properties(n) AS p ORDER BY id(n)')).toEqual(g.query('MATCH (n) RETURN labels(n) AS l, properties(n) AS p ORDER BY id(n)'));
-    return { run, graph, queries: () => texts.size };
+    return { run, graph, statements: () => texts.size };
   }
 
-  test('a MERGE of a node that is there: the same queries for every name', () => {
+  test('a MERGE of a node that is there: the same statement for every name', () => {
     const p = pair();
     p.run("MERGE (n:Person {name: 'Ada'})");
-    const first = p.queries();
+    expect(p.statements()).toBe(1);
     for (const name of ['Alan', 'Grace', 'Edsger']) p.run(`MERGE (n:Person {name: '${name}'})`);
-    expect(p.queries()).toBe(first);
-    // With a RETURN, the rows the runner found go back into a query of their own: the same rows as smaltcy's.
+    expect(p.statements()).toBe(1);
+    // With a RETURN it is another statement, one for every name again: the same rows as smaltcy's.
     for (const name of ['Ada', 'Barbara', 'Nobody']) p.run(`MERGE (n:Person {name: '${name}'}) RETURN n.born AS born`);
+    expect(p.statements()).toBe(2);
     p.graph();
   });
 
-  test('a SET of a node found by a value: its match is the same query for every value', () => {
+  test('a SET of a node found by a value: the same statement for every value', () => {
     const p = pair();
     p.run("MATCH (n:Person) WHERE n.name = 'Ada' AND n.born < 1900 SET n.seen = 1 RETURN count(*) AS c");
-    const first = p.queries();
+    expect(p.statements()).toBe(1);
     p.run("MATCH (n:Person) WHERE n.name = 'Grace' AND n.born < 1950 SET n.seen = 2 RETURN count(*) AS c");
-    // The match is one query for both; what the runner makes of the rows it found holds their ids and values still.
-    expect(p.queries()).toBeLessThan(2 * first);
+    expect(p.statements()).toBe(1);
     p.graph();
   });
 
@@ -297,7 +297,7 @@ describe("a write's values are parameters of the statements it runs", () => {
 });
 
 describe('a shape is for the graph as it is: labels, types and indexes that come later', () => {
-  /** Runs a statement on both engines and keeps the tables smaltdb's runner gives back. */
+  /** Runs a statement on both engines and keeps the tables `runOnSmaltdb` gives back. */
   class Pair {
     readonly g: Graph = open();
     readonly db: SmaltdbDatabase;

@@ -323,31 +323,38 @@ describe('new ids on smaltdb', () => {
       statements,
     };
   }
-  /** The operators smaltdb runs a query with, from the top, each with the rows it gave (EXPLAIN ANALYZE). */
-  const operators = (db: Database, query: PlanStatementInput): [string, number][] =>
-    (db.queryPlan({ kind: 'explain', mode: 'analyze', query } as never).rows as unknown[][]).map((r) => [String(r[2]), r[5] as number]);
-  type Query = { kind: string; plan: { op: string; input?: { op: string; input?: { op: string; table?: string } } } };
-
-  test("the largest ids are the tables' last rows: read from their ends, no table scanned for them", () => {
+  test('smaltdb numbers what a CREATE makes, as smaltcy does: the statement is all it is given', () => {
     const p = start('social');
     const r = recording(p.db);
     const created = runOnSmaltdb(r.db, compile("CREATE (a:Person {name: 'New'})-[:KNOWS]->(b:City {name: 'Newer'}) RETURN id(a) AS a, id(b) AS b").plan, p.tables);
     const mine = p.g.run("CREATE (a:Person {name: 'New'})-[:KNOWS]->(b:City {name: 'Newer'}) RETURN id(a) AS a, id(b) AS b");
     expect(created.rows).toEqual(mine.rows);
     expect(stateIn(p.db, created.tables)).toEqual(stateOf(p.g));
-    // One lookup for the node table and one for each relationship type's table: its rows by rowid from the last, and
-    // the first of them.
-    const lookups = (r.statements as unknown as Query[]).filter((s) => s.kind === 'query' && s.plan.op === 'limit' && s.plan.input?.op === 'sort' && s.plan.input.input?.op === 'scan');
-    expect(lookups.map((s) => s.plan.input!.input!.table).sort()).toEqual([p.tables.nodes, ...p.tables.types.values()].sort());
-    for (const s of lookups) {
-      const table = s.plan.input!.input!.table!;
-      const ops = operators(p.db, s as unknown as PlanStatementInput);
-      // No sort, and the scan stops at its first row.
-      expect(ops.map(([name]) => name), table).toEqual(['LIMIT', 'PROJECT', `SCAN ${table}`]);
-      expect(ops.map(([, rows]) => rows), table).toEqual([1, 1, 1]);
+    // One statement, the write: none reads a table for its largest id.
+    expect(r.statements.map((s) => (s as { kind: string }).kind)).toEqual(['write']);
+  });
+
+  test('which ids a statement that fails had taken can differ (ADR 0004, known differences)', () => {
+    const next = (p: Pair, cypher: string) => [p.g.run(cypher).rows, runOnSmaltdb(p.db, compile(cypher).plan, p.tables).rows];
+    const fails = (p: Pair, cypher: string, message: string) => {
+      expect(() => p.g.run(cypher), cypher).toThrow(message);
+      expect(() => runOnSmaltdb(p.db, compile(cypher).plan, p.tables), cypher).toThrow(message);
+    };
+    // smaltcy makes a write's rows one at a time: the two before the one that fails took their ids. smaltdb computes
+    // every row's values before it writes any of them, and took none.
+    const rows = start('social');
+    fails(rows, 'UNWIND [1, 2, 0] AS i CREATE (:N {v: 10 / i})', 'Division by zero');
+    expect(next(rows, 'CREATE (x:After) RETURN id(x) AS x')).toEqual([[[9]], [[7]]]);
+    // A relationship to a node the statement deleted: smaltdb took the relationship's id before its rule refused the
+    // row, smaltcy's store looks at the ends first.
+    const gone = start('social');
+    fails(gone, "MATCH (n:Person {name: 'Ada'}) DETACH DELETE n WITH n MATCH (m:Person {name: 'Alan'}) CREATE (m)-[:R]->(n)", 'Node 0 does not exist');
+    expect(next(gone, "MATCH (a:Person {name: 'Alan'}), (b:Person {name: 'Grace'}) CREATE (a)-[r:AFTER]->(b) RETURN id(r) AS r")).toEqual([[[9]], [[10]]]);
+    // On either, no id is given twice.
+    for (const p of [rows, gone]) {
+      const ids = (cypher: string) => (runOnSmaltdb(p.db, compile(cypher).plan, p.tables).rows as number[][]).map((r) => r[0]!);
+      for (const all of [ids('MATCH (n) RETURN id(n) AS id'), ids('MATCH ()-[r]->() RETURN id(r) AS id')]) expect(new Set(all).size).toBe(all.length);
     }
-    // No statement takes a maximum over a table's rows.
-    expect((r.statements as unknown as Query[]).filter((s) => s.kind === 'query' && s.plan.op === 'aggregate' && s.plan.input?.op === 'scan')).toEqual([]);
   });
 
   test('a graph with no node and no relationship: the first ids, as on smaltcy', () => {
@@ -385,5 +392,76 @@ describe('indexes on smaltdb', () => {
       'DROP INDEX ON :Person(name)',
     ]) p.run(cypher);
     expect(indexes(p.db)).toEqual([[`graph_ix_${hex('person')}_${hex('name')}`, 'graph_node']]);
+  });
+});
+
+/**
+ * A write to a node or relationship the statement has deleted. smaltcy's stores fail on some ("Node 0 does not
+ * exist"): a label set or removed, properties replaced, a relationship from or to the node, and a node or relationship
+ * given as a map of properties. Others are no-ops: a property set, removed or merged in, a second DELETE.
+ */
+describe('a write to what the statement deleted', () => {
+  const ADA = "MATCH (n:Person {name: 'Ada'}) DETACH DELETE n";
+  const KNOWS = "MATCH (:Person {name: 'Ada'})-[r:KNOWS]->(m) DELETE r";
+  const AFTER = 'CREATE (x:After)-[r:AFTER]->(y:After) RETURN id(x) AS x, id(r) AS r, id(y) AS y';
+  // A relationship from or to the node that went: smaltdb has taken the relationship's id by the time its rule
+  // refuses it, smaltcy's store has not (ADR 0004, known differences), so only new nodes are compared after these.
+  const TO_GONE: readonly string[] = [
+    `${ADA} CREATE (n)-[:R]->(:X)`,
+    `${ADA} WITH n MATCH (m:Person {name: 'Alan'}) CREATE (m)-[:R]->(n)`,
+    `${ADA} MERGE (n)-[:R]->(n)`,
+    "MATCH (a:Person {name: 'Ada'}), (b:Person {name: 'Alan'}) DETACH DELETE a MERGE (a)-[:R]->(b)",
+  ];
+  const FAILS: readonly string[] = [
+    `${ADA} SET n:Gone`,
+    `${ADA} SET n:Person`,
+    `${ADA} REMOVE n:Person`,
+    `${ADA} REMOVE n:Nope`,
+    `${ADA} SET n = {x: 1}`,
+    `${ADA} SET n = {}`,
+    `${KNOWS} SET r = {x: 1}`,
+    `${ADA} WITH n MATCH (m:Person {name: 'Alan'}) SET m = n`,
+    `${ADA} WITH n MATCH (m:Person {name: 'Alan'}) SET m += n`,
+    `${KNOWS} SET m = r`,
+    `${KNOWS} SET m += r`,
+    ...TO_GONE,
+    `${ADA} WITH n MERGE (m:Zed {k: 1}) ON CREATE SET n:Gone`,
+    `${ADA} WITH n MERGE (m:Zed {k: 1}) ON CREATE SET n = {x: 1}`,
+    // The first row fails, after its node went.
+    'MATCH (n:Person) WITH n ORDER BY n.name LIMIT 2 DETACH DELETE n REMOVE n:Person',
+    // What is there is written, then the row's deleted relationship is read as a map.
+    "MATCH (a:Person {name: 'Ada'})-[r:KNOWS]->(b) DELETE r SET a:Changed, b = {name: 'B'}, a += r",
+  ];
+  test.each(FAILS)('fails as on smaltcy, and is undone: %s', (cypher) => {
+    // It fails: on a graph of its own, so that both engines of the pair run it as often.
+    expect(() => social().run(cypher), cypher).toThrow(/^(Node|Relationship) \d+ does not exist$/);
+    const p = start('social');
+    // The same error on both, and smaltdb's graph as it was (`Pair.run`); the second time by the statement kept.
+    for (let i = 0; i < 2; i++) p.run(cypher);
+    // The ids the statement took before it failed are not given again, on either.
+    p.run(TO_GONE.includes(cypher) ? 'CREATE (x:After) RETURN id(x) AS x' : AFTER);
+  });
+
+  const RUNS: readonly string[] = [
+    `${ADA} SET n.x = 1`,
+    `${ADA} SET n += {x: 1}`,
+    `${ADA} REMOVE n.born`,
+    `${ADA} DETACH DELETE n`,
+    `${KNOWS} SET r.x = 1`,
+    `${KNOWS} SET r += {x: 1}`,
+    `${KNOWS} REMOVE r.since`,
+    `${ADA} WITH n MATCH (m:Person {name: 'Alan'}) SET m.gone = n.name`,
+    // After a DELETE, what is still there is written as ever.
+    "MATCH (a:Person {name: 'Ada'})-[r:KNOWS]->(b) DELETE r SET a:Changed, b = {name: 'B'} REMOVE b:Person",
+    "MATCH (a:Person {name: 'Ada'})-[r:KNOWS]->(b) DELETE r CREATE (a)-[:R {w: r.since}]->(b)",
+    "MATCH (a:Person {name: 'Ada'})-[r:KNOWS]->(b) DELETE r WITH a, b MATCH (a)-[q]->(c) SET q = {w: 1}, c = a RETURN count(*) AS c",
+    // A NULL is no node: nothing is written for it, and it is no error.
+    "OPTIONAL MATCH (z:Nope) WITH z MATCH (a:Person {name: 'Ada'})-[r:KNOWS]->(b) DELETE r SET z:L, z = {a: 1}, b += z",
+  ];
+  test.each(RUNS)('runs as on smaltcy: %s', (cypher) => {
+    const p = start('social');
+    p.run(cypher);
+    p.run(AFTER);
+    p.run('MATCH (n) RETURN labels(n) AS l, properties(n) AS p ORDER BY id(n)');
   });
 });

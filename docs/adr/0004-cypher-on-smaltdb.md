@@ -119,48 +119,76 @@ hops); two variable-length relationships of types that can be the same in one MA
   (`kind`, `id`, `labels` or `type`, `start` and `end`, `properties`; a path's `nodes` and `relationships`).
   `collect()` of nodes is a list of their ids.
 
-**Writes** (`src/smaltdb/write.ts`, `runOnSmaltdb`) run as smaltcy's engine runs them, row by row, on a smaltdb
-`Database` given by type only (its synchronous `queryPlan`). A statement that only reads is one query; one that writes is
-several smaltdb statements, in a savepoint (inside the caller's transaction when there is one), so an error rolls back
-all it wrote, the labels and types it added included:
+**Writes** (`src/smaltdb/write-plan.ts`, `compileWrite`; run by `runOnSmaltdb` in `src/smaltdb/write.ts`) compile to
+one smaltdb statement: a plan of smaltdb's graph writes (`graphCreate`, `graphSet`, `graphDelete`, `graphMerge`;
+smaltdb's ADR 0042, section 1, and its plan reference, "Writing a property graph"), which smaltdb runs through its
+tables' writers. The `Database` is given by type only (its synchronous `queryPlan`, and `preparePlan` where it has
+one). The statement is all or nothing in smaltdb, inside the caller's transaction when there is one: an error undoes
+all it wrote, the labels and types it added included. Until 2026-11-22 a write was run from here, row by row, as
+several smaltdb statements (the last item of this list).
 
-- **Rows stream.** Each row goes through the writes and the operations between them (`project`, `filter`, `unwind`,
-  `match`) before the next row starts, so a write sees what earlier rows wrote (`UNWIND … MERGE` finds what it created
-  for an earlier row; `SET c.n = c.n + 1` counts up), and a LIMIT stops what feeds it, as in smaltcy's engine. The
-  runner holds the rows as the compiler's columns; an operation on a row is a smaltdb query over that row (a `values`
-  plan, with `any` columns as one-element `list<any>` columns, so booleans, lists and maps keep their kind), and EAGER,
-  ORDER BY and aggregates one query over all their rows. What reads before any write, or doesn't read the graph, is one
-  query.
-- **Entities are read live.** A row holds a node's id and a relationship's type and rowid; every query over it reads
-  their properties from their tables again. Values computed before a write keep what they were. Nodes, relationships and
+- **Rows in order.** smaltdb gives a write its input's rows one at a time, each through every operation above it
+  before the next, so a write sees what earlier rows wrote (`UNWIND … MERGE` finds what it created for an earlier row;
+  `SET c.n = c.n + 1` counts up), and a LIMIT stops what feeds it, as in smaltcy's engine. A part of the statement
+  that writes nothing and either reads everything first (the binder's EAGER before a write, ORDER BY, an aggregate) or
+  doesn't read the graph is one query, read to its end before anything above it runs (`eager`).
+- **All rows at once, where no row could tell.** Where nothing above a write, up to an operation that reads all its
+  rows first, reads the graph, writes or stops early, smaltdb writes the write's rows in one pass over each table
+  (smaltdb's ADR 0042, "As built"). The compiler's part is to read nothing there that the statement doesn't ask for
+  (the next item), and to name what a MERGE's rows are matched by (MERGE, below).
+- **Entities are read when they are needed.** A row holds a node's id and a relationship's type and rowid. An operation
+  above a write that reads more than its row's values reads the properties of the row's nodes and relationships from
+  their tables as they are when the row reaches it, and a write's own expressions read them when the row's turn comes,
+  so `SET n.x = 1 RETURN n.x` reads 1. Values computed before a write keep what they were. Nodes, relationships and
   paths in the results are read once the statement is done, as smaltcy's engine reads them (a deleted node with no
   labels or properties, a deleted relationship with no type or ends).
-- **CREATE** appends each new node (`id`, `props`) and its label-index entries, then each relationship to its type's
-  edge table, with the property maps evaluated against the row as it is (a map literal's entries one by one, so each
-  keeps its kind). The ids are chosen by the runner, not by smaltdb: a node's is one more than the largest node id, a
-  relationship's rowid one more than the largest rowid of any edge table (so it stays unique across types, and `id(r)`
-  reads it); within a statement they count on. The largest is its table's last row: the runner asks for the table's
-  rows by rowid from the last and takes the first, which smaltdb reads from the table's end, one row (a `max` over a
-  scan of the table read every row, until 2026-11-21). **New labels and types** are added with `alterPropertyGraph`
-  (`addLabel` / `addType`) the first time a write uses them; the reserved label `smaltcy:node` is refused.
-- **SET and REMOVE** are `update`s of the `props` map in smaltdb (`map_merge`, `map_remove`), so the properties a write
-  doesn't touch keep their stored kind: `n.k = v` sets one key (NULL removes it), `n = map` replaces the map, `n += map`
-  merges it (its NULLs remove keys). A label is an entry in the label index, added or deleted. A NULL target is a no-op
-  (its value not computed), a deleted one too; a value that isn't a node or relationship is smaltcy's type error, and a
-  map or a list of lists as a property its storable-value error.
-- **DELETE** deletes a relationship's row, or a node's after checking it has none (smaltcy's error and message
-  otherwise; smaltdb's own rule backs it); DETACH deletes the node's relationships first. Paths delete their
-  relationships, then their nodes; lists of nodes and of relationships each element. The label index's entries go with
-  the node (smaltdb's rules on a graph's tables).
-- **MERGE** matches the whole pattern for each row (the compiler's match, with its uniqueness); every match goes through
-  ON MATCH, or, with none, the pattern is created (its unbound nodes and its relationships, in the pattern's direction)
-  and goes through ON CREATE.
-- **Counts** are smaltcy's (`nodesCreated` … `labelsRemoved`), counted as its engine counts them (a property set to
-  NULL counts, a label already there doesn't).
+- **CREATE** is a `graphCreate`: each new node (its labels and its property map) and each relationship (its type, its
+  ends and its property map), the maps evaluated against the row as it is (a map literal's entries one by one, so each
+  keeps its kind). smaltdb gives the ids: a node's is one more than the largest node id the graph has had, a
+  relationship's rowid one more than the largest of any of the graph's edge tables (so it stays unique across types,
+  and `id(r)` reads it). It keeps the next ids for the connection, so an id is not given again after a DELETE or a
+  statement that failed, as in smaltcy's stores. **New labels and types** are named in the plan with the tables
+  smaltdb makes for them, numbered past the graph's (`<graph>_l<k>`, `<graph>_t<k>`), so what the plan reads after the
+  write names those tables. smaltdb adds one when a row first needs it; after a statement that named some,
+  `runOnSmaltdb` looks which of them are there, and gives the graph's tables back with those. The reserved label
+  `smaltcy:node` is refused.
+- **SET and REMOVE** are a `graphSet`, which changes the `props` map in smaltdb (`map_merge`, `map_remove`), so the
+  properties a write doesn't touch keep their stored kind: `n.k = v` sets one key (NULL removes it), `n = map` replaces
+  the map, `n += map` merges it (its NULLs remove keys). A label is an entry in the label index, added or deleted. A
+  NULL target is a no-op (its value not computed); a value that isn't a node or relationship is smaltcy's type error,
+  and a map or a list of lists as a property its storable-value error.
+- **What the statement has deleted** is written to as smaltcy's engine writes to it. A property set, removed or
+  merged in (`+=`) is a no-op, and so is a second DELETE. A label set or removed, properties replaced (`SET n = …`),
+  and a deleted node or relationship given as a property map (`SET m = n`) are smaltcy's error, `Node 4 does not
+  exist`: the plan looks whether the node or relationship is still there when the row's turn comes, in a statement
+  where a DELETE comes first and nowhere else. A relationship from or to a deleted node is refused by smaltdb's rule
+  on a graph's tables, and `runOnSmaltdb` gives that error smaltcy's code and message. Until 2026-11-22 these differed
+  on smaltdb: a label removed and properties replaced did nothing, a deleted node given as a map was an empty one,
+  and a label set and a relationship to a deleted node were smaltdb's error under its own code.
+- **DELETE** is a `graphDelete`: a relationship's row, or a node's, which smaltdb refuses while the node has
+  relationships (its rule on a graph's tables; `runOnSmaltdb` gives that error smaltcy's code and message). DETACH
+  deletes the node's relationships first. Paths delete their relationships, then their nodes; lists of nodes and of
+  relationships each element. The label index's entries go with the node.
+- **MERGE** is a `graphMerge`. Its match is the compiler's match of the whole pattern (with its uniqueness) over the
+  row as smaltdb gives it; every match goes through ON MATCH, or, with none, the pattern is created (its unbound nodes
+  and its relationships, in the pattern's direction) and goes through ON CREATE. For a pattern of one new node whose
+  property map reads only the row, the plan names the map's values as the `key` the rows are matched by: rows with
+  the same values match the same nodes, and a row matches what an earlier row made exactly when it has that row's
+  values. With it smaltdb matches all the rows in one query, where no row could tell.
+- **Counts** are smaltdb's for the statement (its result's `graph`: `nodesCreated` … `labelsRemoved`), counted as
+  smaltcy's engine counts them (a property set to NULL counts, a label already there doesn't).
 - **A commit's author and message** (`RunOptions.author`, `message`, as smaltcy's `run(…, { author, message })`): the
-  statement then runs in a transaction of its own (`begin` with them, `commit`), not a savepoint, so smaltdb records
-  them in `smalt_commits` with the commit. Inside the caller's transaction they are refused: its `begin` or `commit`
-  takes them (smaltdb has no way to give them to a savepoint).
+  statement then runs in a transaction of its own (`begin` with them, `commit`), so smaltdb records them in
+  `smalt_commits` with the commit. Inside the caller's transaction they are refused: its `begin` or `commit` takes
+  them.
+- **Until 2026-11-22** a write was run from here by a runner (`Runner` in `write.ts`, 1,296 lines): it held the rows
+  in JavaScript, an operation on a row was a smaltdb query over that row, each write one or more smaltdb write
+  statements, all in a savepoint. Its statements were kept by the write's shape (smaltcy#36), and it chose the new ids
+  itself, read from the tables' ends (smaltcy#33) or kept by the caller (`RunOptions.ids`, gone with it: the numbering
+  that gave is smaltdb's own now). The owner's answer of 2026-11-21 ("The bar for switching", below) put the execution
+  of a plan in smaltdb; smaltdb's ADR 0042 records how, its step 2 (stenhoor/smaltdb#297) made smaltdb run a plan
+  that writes a graph, and this is this repository's part of its step 3. What it measured:
+  docs/research/benchmarks.md, "Writes as one plan".
 
 **History** (smaltcy's [ADR 0002](0002-graph-history.md); smaltdb ADR 0033, decisions 14 to 17):
 
@@ -171,14 +199,14 @@ all it wrote, the labels and types it added included:
   is the commit each write made, and a version between two of the graph's (a commit that wrote other tables, or the
   schema statements that made the graph) reads the graph as of the one before. Version 0 is still the empty graph
   before the first commit. This is the simplest mapping that reads the same graph at every version; numbering 1, 2, 3
-  would need a table the runner writes in each commit, and smaltdb gives no plan the commit's id while it is open.
+  would need a table written in each commit, and smaltdb gives no plan the commit's id while it is open.
 - **A write is a commit.** A Cypher statement (or the caller's transaction around several) is one smaltdb transaction,
   so one commit, one version. A write that changes nothing makes none on either engine: smaltdb makes no commit for a
-  transaction that writes nothing, and the runner writes nothing for a SET whose properties stay what they are (it
-  compares them first, as smaltcy's history compares values), a label already there, or a target that's gone.
+  transaction that writes nothing, and its graph writes write nothing for a SET whose properties stay what they are
+  (they compare them first, as smaltcy's history compares values), a label already there, or a target that's gone.
 - **`AT VERSION v`** reads every scan of the graph's tables (in subqueries too) with `asOf: { commit: v }`, and
-  **`AT TIME t`** (milliseconds, ISO 8601 text or a `Date`, as smaltcy takes it) with `asOf: { time: t }`. The runner
-  finds the version first, as smaltcy's engine does: `AT VERSION` must be between the oldest version kept and the
+  **`AT TIME t`** (milliseconds, ISO 8601 text or a `Date`, as smaltcy takes it) with `asOf: { time: t }`.
+  `runOnSmaltdb` finds the version first, as smaltcy's engine does: `AT VERSION` must be between the oldest version kept and the
   latest (smaltdb would read the present for a later commit, and a query that scans nothing would not see a forgotten
   one), and `AT TIME` reads the last commit at or before then, or the oldest kept when that is later; it then reads
   that commit. The latest is the last commit in `smalt_commits` (smaltdb records every commit that writes a table
@@ -186,8 +214,8 @@ all it wrote, the labels and types it added included:
   smaltcy's error.
 - **The last commit is read from the end of `smalt_commits`** (`lastCommitOf`). smaltdb adds a row for each commit
   as it is made, so the latest is the table's last row, and the last commit at or before a time is the first such row
-  from the end: the read stops there. Every statement outside a transaction looks the latest up, so the runner keeps
-  the statement for it, prepared once for a database (and one for a time, its parameter). Measured on the lookup
+  from the end: the read stops there. Every statement outside a transaction looks the latest up, so the statement
+  for it is kept, prepared once for a database (and one for a time, its parameter). Measured on the lookup
   alone, in turns (three runs): a `max` over a scan of the commits took 2.7 to 4.6 µs at 6 commits, 17 µs at 1,000 and
   286 to 300 µs at 20,000; the kept statement takes 0.4 to 1.2 µs at any of them. A seek by name on a graph of one
   node, against smaltcy's in-memory engine with history (two runs, the engines taking turns): 3.1x and 2.8x at 1,000
@@ -197,10 +225,9 @@ all it wrote, the labels and types it added included:
 - **`forget(v)`** is `forgetOnSmaltdb`: smaltdb's `forget` maintenance statement with `before: { commit: v }`, for each
   of the graph's tables, in one savepoint; a version after the latest is smaltcy's error.
 - **New ids with history** also count the largest id in the graph's past versions (smaltdb's `smalt_versions_<table>`,
-  or `smalt_log_<table>`, scanned for it: the rowid is a column there, not their order), so an id a readable version
-  holds is never given to another node or relationship, as smaltcy's ADR 0002 keeps ids stable across versions. A
-  caller can also keep the next ids itself (`RunOptions.ids`, as smaltcy's store keeps them across statements, rolled
-  back or not): ids then go on as smaltcy's do.
+  or `smalt_log_<table>`, scanned for it the first time a connection writes the graph: the rowid is a column there,
+  not their order), so an id a readable version holds is never given to another node or relationship, as smaltcy's
+  ADR 0002 keeps ids stable across versions.
 
 **Indexes.** smaltcy's `CREATE INDEX FOR (n:L) ON (n.k)` and `DROP INDEX ON :L(k)` (`IndexPlan`) run as smaltdb schema
 statements: an expression index on the node table, on `map_get(props, k)`, named `<graph>_ix_<label>_<key>` with the
@@ -237,27 +264,29 @@ query's values.
   statements. Until then the shape was a text, built for every query and looked up in a map: building it and hashing
   it took most of the time of finding a kept statement (6.5 µs for the benchmark's seek by name, 1.7 µs as tokens;
   docs/research/benchmarks.md, "A kept statement found by its tokens").
-- **Writes are kept by shape too** (`writeByShape`, since 2026-11-21). A statement that writes is run as several
-  smaltdb statements, which the runner makes as it goes: the rows a MATCH below the write finds, a value computed for
-  a row, a row appended, a property set, a node deleted. Each is made once for the write's shape, prepared, and kept
-  with the shape (`Runner.site`: by the part of the Cypher plan it is for, then by what it does there, the table or the
-  label included where a statement serves one). The next statement of the shape runs them. Their parameters are the
-  Cypher statement's values, taken out as a query's are; the row a statement runs over (one row is a `values` of one
-  row of parameters); and the runner's own values: a new node's id, the rowid a SET writes, and a row's properties as
-  one map parameter (smaltdb's ADR 0020, "Parameters"; stenhoor/smaltdb#291). A property map whose entries are
-  all written values or parameters (`{name: $name, age: 30}`) is read in JavaScript, with no query.
-  - **Planned each time, as before:** a write of all its rows at once (a CREATE, SET, REMOVE or DELETE in a batch
-    writes its rows into one statement as columns), but a DELETE of up to eight nodes and relationships, which goes
-    one by one through the statements kept for one; and the rest of a run once it adds a label or a type, since what
-    is kept was made for the graph's tables as they were (the graph with the new label is another shape, which keeps
-    its own from the next statement on).
-  - **Measured** (docs/research/benchmarks.md, "Writes kept by shape"; smaltdb's time over smaltcy's, before and now
-    in turns): creating 1 node 12.2x to 12.9x before, 3.5x to 4.5x now; setting 1 property 6.3x to 7.8x before, 2.4x
-    now; merging a node that is there 5.3x to 5.9x before, 1.17x to 1.26x now; with statements that differ each time,
-    creating 1 relationship 19.0x to 21.6x before, 2.4x to 2.7x now, and deleting 1 node 73x to 85x before, 7.6x to
-    9.5x now. Writes of 1,000 rows did not move. No single write is under the bar: what is left is smaltdb running
-    the statements.
-  - **Before this** the rows the runner itself holds (the ids it found, the values it computed, the rows it appends)
+- **Writes are kept by shape too** (`writeByShape`, since 2026-11-21). A statement that writes has its values taken
+  out as a query's are, and what is kept for its shape is the smaltdb statement it compiles to, prepared: the next
+  statement of the shape runs it with its own values. The graph's tables are part of a shape, so a statement on the
+  graph after it got a label or a type is another shape, compiled once for the graph as it is then.
+  - **Measured as one plan** (docs/research/benchmarks.md, "Writes as one plan"; smaltdb's time over smaltcy's,
+    the runner on `main` and one plan in turns, six turns each): with the same text, creating 1 node 3.71x to 4.35x
+    through the runner and 3.21x to 3.76x as one plan, 1 relationship 2.89x to 3.96x and 2.20x to 2.49x, setting 1
+    property 2.42x to 2.67x and 1.71x to 1.92x, merging a node that is there 1.15x to 1.24x and 1.01x to 1.11x; with
+    statements that differ each time, deleting 1 node 2.45x and 2.29x (a literal and a parameter, the medians) and
+    1.58x and 1.63x, merging a node that is there 1.10x and 1.10x and 1.00x and 0.99x. Writes of 1,000 rows are
+    faster or level, and far from the bar but the merge (creating 1,000 nodes 10.1x to 12.0x and 9.96x to 11.1x).
+    Where a single write's time goes is there too: half to three quarters of it is the smaltdb statement.
+  - **Until 2026-11-22**, when a write was several smaltdb statements made by the runner, each of those was made once
+    for the write's shape, prepared and kept with it (by the part of the Cypher plan it was for, then by what it did
+    there). Their parameters were the Cypher statement's values, the row a statement ran over, and the runner's own
+    values: a new node's id, the rowid a SET wrote, and a row's properties as one map parameter (smaltdb's ADR 0020,
+    "Parameters"; stenhoor/smaltdb#291). A write of all its rows at once was planned each time.
+  - **Measured then** (docs/research/benchmarks.md, "Writes kept by shape"; smaltdb's time over smaltcy's, before and
+    after in turns): creating 1 node 12.2x to 12.9x before, 3.5x to 4.5x after; setting 1 property 6.3x to 7.8x
+    before, 2.4x after; merging a node that is there 5.3x to 5.9x before, 1.17x to 1.26x after; with statements that
+    differ each time, creating 1 relationship 19.0x to 21.6x before, 2.4x to 2.7x after, and deleting 1 node 73x to
+    85x before, 7.6x to 9.5x after. Writes of 1,000 rows did not move. No single write was under the bar.
+  - **Before that** the rows the runner itself held (the ids it found, the values it computed, the rows it appended)
     were written into its statements, and each of those was planned again. The scans that found the largest ids were
     part of that until earlier on 2026-11-21: with the largest ids read from the tables' ends, creating 1 node went
     from 44x to 53x of smaltcy's time to 13x to 14x, and creating 1 relationship from 114x to 120x to 12x to 13x
@@ -375,9 +404,13 @@ The owner added (2026-11-21, stenhoor/smaltdb#274), on the writes that are still
 statement lives: "Need to keep pushing cost down. Comparison should be equivalent, memory to memory, wal will have to be
 optimized but it will obviously be slower." and "cy produces plans that are executed by db, if it is plan execution it
 belongs on db not cy". Read here as: the bar is smaltdb in memory against smaltcy's `MemoryStore`, and what executes
-a plan belongs in smaltdb. The write runner here (`src/smaltdb/write.ts`) executes a write's plan from smaltcy, as
-several smaltdb statements, and the statements kept by shape (`src/smaltdb/shape.ts`) are kept here: by that reading
-both are to move into smaltdb. How they move is smaltdb's to record first; until then they stay as they are.
+a plan belongs in smaltdb. Then, the write runner here executed a write's plan from smaltcy, as several smaltdb
+statements, and the statements kept by shape (`src/smaltdb/shape.ts`) were kept here: by that reading both were to
+move into smaltdb. smaltdb's ADR 0042 records how. Its step 2 (stenhoor/smaltdb#297, 2026-11-22) has smaltdb run a
+plan that writes a graph; since then a write compiles to one such plan here and the runner is gone ("Writes", above:
+the first part of that ADR's step 3). The statements kept by shape are still kept here. They move when smaltdb's
+entry points that take a text take a registered language's, and smaltdb keeps what a language's statement binds to
+under its shape (that ADR's section 4, the rest of its step 3): smaltdb's change first, then this repository's.
 
 ## Consequences
 
@@ -418,12 +451,12 @@ both are to move into smaltdb. How they move is smaltdb's to record first; until
     pays it, unless an index finds the node.
   - `paths` with `anyShortest` searches from the start until every node is reached, with no way to give it the end;
     `paths` runs its input twice. The compiler works around both (above).
-- A write is many smaltdb statements: queries and writes for each row, as the runner streams rows the way smaltcy's
-  engine does. That is slow on large inputs; set-based plans for writes that can't see each other (no reads between
-  them) would be faster, and are left for later. The runner takes a synchronous `queryPlan` (smaltdb's `Database` in a
-  worker), not the client's asynchronous one yet.
+- A write is one smaltdb statement (since 2026-11-22; until then several, made here for each row). `runOnSmaltdb`
+  takes a synchronous `queryPlan` (smaltdb's `Database` in a worker), not the client's asynchronous one yet.
 - **Writes refused** (`Unsupported`): the reserved label;
   DISTINCT with writes before and after it in one pipeline (smaltcy's passes rows on as they come); UNION with writes;
+  a DELETE of a list that is a value, when a row reaches it; a plan built by hand in which a MATCH with no write below
+  it has no EAGER above it before a write (the binder always puts one there);
   MERGE with a parameter as a property map (the compiler's pattern maps); after a DELETE, `labels()`, `properties()`,
   `type()`, `startNode()`, `endNode()`, `nodes()` and `relationships()` (smaltcy's engine fails on a deleted node or
   relationship, smaltdb would give a value), and paths and lists of nodes or relationships in its results (smaltcy's
@@ -446,14 +479,23 @@ both are to move into smaltdb. How they move is smaltdb's to record first; until
   - A `-0.0` a write stores (`SET n.v = -0.0`, `CREATE (:T {v: $x})` with -0) is read back as `0` on smaltdb and as
     `-0` on smaltcy (found 2026-11-20; a query that only reads gives `-0` on both). Not guarded.
   - Strings in lists and maps compare as strings do: by UTF-8 bytes on smaltdb (above).
-  - The errors above have smaltcy's codes and messages, and so do the runner's own checks (deleting a node with
-    relationships, a relationship to NULL, values that can't be properties); the tests compare them. Errors smaltdb
+  - The errors above have smaltcy's codes and messages, and so do a write's own checks (a relationship to NULL and
+    values that can't be properties are expressions in the plan that raise them; deleting a node with relationships
+    is smaltdb's error, given smaltcy's code and message); the tests compare them. Errors smaltdb
     raises itself (an integer overflow, a limit) have smaltdb's codes and messages. Where several rows would fail, the
     one reported is the first the engine reaches, which can differ (the planner's order, below).
-  - New ids are one more than the largest: smaltcy's stores count on from the largest id they ever gave, so after the
-    node (or relationship) with the largest id is deleted, or a statement that created some fails, smaltdb gives that
-    id again where smaltcy gives the next one. With history, ids in past versions count (so only an id no version
-    holds, or one from before a `forget`, comes again); with `RunOptions.ids`, the numbering is smaltcy's.
+  - New ids. On both an id is given once: not again after its node or relationship is deleted, nor after the
+    statement that gave it fails. smaltcy's stores count on from the largest id they ever gave, and smaltdb keeps a
+    graph's next ids for the connection (its ADR 0042, "As built"), so after statements that run the two give the
+    same ids (tested). After a statement that fails they can differ, in which ids it had taken by then. smaltcy's
+    engine makes a write's rows one at a time and has taken the ids of the rows before the one that fails; smaltdb,
+    writing all the rows of a write at once, computes every row's values first and has taken none (after `UNWIND
+    [1, 2, 0] AS i CREATE (:N {v: 10 / i})` smaltcy's next node is two further on). And for a relationship to a node
+    the statement deleted, smaltdb has taken the relationship's id when its rule refuses the row, where smaltcy's
+    store looks at the ends first. Both are tested as they are. Until 2026-11-22 the ids were read from the tables'
+    ends for each statement, and an id came again after a delete or a failure unless the caller kept the ids
+    (`RunOptions.ids`). The next ids are not stored: a database opened again counts on from the largest id its tables
+    hold, and their past versions where they keep history.
   - smaltcy's versions count 1, 2, 3 …; on smaltdb they are commit ids, which skip the commits that didn't write the
     graph (the schema statements that made it, other tables' writes). A commit's time is smaltdb's clock
     (`Date.now()`, never earlier than the commit before), so several commits can have the same millisecond, and `AT
@@ -479,7 +521,7 @@ both are to move into smaltdb. How they move is smaltdb's to record first; until
   empty edge source as `values` with `rows: []`.
 - A third workaround went once smaltdb fixed it (stenhoor/smaltdb#263): an `update` whose input joins the target with a
   `values` plan (`UPDATE … FROM`) failed with `SMALT_INTERNAL` ("the physical planner declined a write") when the
-  join had `ordered: true`; the runner's SET joins with `ordered: true` again.
+  join had `ordered: true`; the runner's SET joined with `ordered: true` again, while there was a runner.
 - A fourth workaround and a refusal went once smaltdb added what they lacked: errors were raised as a strict
   conversion of a `smaltcy:` message to an integer (`cast_integer_strict`, an `SMALT_MISMATCH` error; now
   `raise_error`, stenhoor/smaltdb#264), and graphs with labels or types that differ only in case were refused, when
