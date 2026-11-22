@@ -27,8 +27,8 @@ const LAYERS: Record<string, { runtime: string[]; types?: string[] }> = {
   client: { runtime: ['worker', 'errors', 'values'], types: ['store'] },
   index: { runtime: ['cypher', 'engine', 'store', 'history', 'plan', 'worker', 'errors', 'values'] },
   // The compiler to smaltdb plans (docs/adr/0004-cypher-on-smaltdb.md): internal, no entry point yet. It reads graph
-  // plans and builds smaltdb's as data, importing smaltdb's types only (PACKAGES). The write runner walks graph plans
-  // with plan's helpers (which slots an expression reads) to decide when a write can run all its rows at once.
+  // plans and builds smaltdb's as data, importing smaltdb's types only (PACKAGES). The write compiler walks graph plans
+  // with plan's helpers (which slots an expression reads) to say where a write may write all its rows at once.
   smaltdb: { runtime: ['errors', 'plan'], types: ['values'] },
 };
 

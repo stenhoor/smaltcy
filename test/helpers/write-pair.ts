@@ -8,7 +8,7 @@ import { compile } from '../../src/cypher/index.js';
 import { open, type Graph } from '../../src/index.js';
 import { Unsupported } from '../../src/smaltdb/compile.js';
 import type { GraphTables } from '../../src/smaltdb/schema.js';
-import { runOnSmaltdb, type NextIds, type SmaltdbDatabase } from '../../src/smaltdb/write.js';
+import { runOnSmaltdb, type SmaltdbDatabase } from '../../src/smaltdb/write.js';
 import { social } from './graphs.js';
 import { both, dataOf } from './smaltdb.js';
 
@@ -51,22 +51,15 @@ export class Pair {
   readonly db: Database;
   tables: GraphTables;
 
-  /** The database the runner is given: the engine's, or with `through`, what that makes of it (one that counts, say). */
+  /** The database statements are run on: the engine's, or with `through`, what that makes of it (one that counts, say). */
   readonly given: SmaltdbDatabase;
 
-  /**
-   * With `numbering`: the next ids, kept across statements as smaltcy's store keeps them, so a new node's id is the
-   * one smaltcy gives after a DELETE or a statement that failed (without, smaltdb takes the id after the largest).
-   */
-  readonly ids: NextIds | undefined;
-
-  constructor(g: Graph, through?: (db: Database) => SmaltdbDatabase, numbering = false) {
+  constructor(g: Graph, through?: (db: Database) => SmaltdbDatabase) {
     const b = both(g);
     this.g = g;
     this.db = b.db;
     this.tables = b.tables;
     this.given = through ? through(b.db) : b.db;
-    this.ids = numbering ? { node: 0, relationship: 0 } : undefined;
   }
 
   /** Runs a statement on both: the same rows and counts, or both fail and smaltdb's graph is as it was; then the same graphs. */
@@ -82,7 +75,7 @@ export class Pair {
     let theirs: ReturnType<typeof runOnSmaltdb> | undefined;
     let theirsError: unknown;
     try {
-      theirs = runOnSmaltdb(this.given, compile(cypher).plan, this.tables, { params, ...(this.ids ? { ids: this.ids } : {}) });
+      theirs = runOnSmaltdb(this.given, compile(cypher).plan, this.tables, { params });
       this.tables = theirs.tables;
     } catch (e) {
       theirsError = e;
@@ -90,7 +83,7 @@ export class Pair {
     if (theirsError instanceof Unsupported) throw theirsError;
     if (mineError !== undefined) {
       expect(theirsError, `${cypher}: fails on smaltcy (${String(mineError)}), not on smaltdb`).toBeDefined();
-      // The same error: smaltcy's code and message, whether the runner or the plan (smaltdb's raise_error) raised it.
+      // The same error: smaltcy's code and message, raised by the plan (smaltdb's raise_error) or reworded from smaltdb's.
       const { code, message } = mineError as { code: string; message: string };
       expect({ code: (theirsError as { code: string }).code, message: (theirsError as Error).message }, cypher).toEqual({ code, message });
       expect(stateIn(this.db, this.tables), `${cypher}: rolled back`).toEqual(before);
@@ -104,5 +97,5 @@ export class Pair {
   }
 }
 
-export const start = (graph: 'empty' | 'social', through?: (db: Database) => SmaltdbDatabase, numbering = false) => new Pair(graph === 'social' ? social() : open(), through, numbering);
+export const start = (graph: 'empty' | 'social', through?: (db: Database) => SmaltdbDatabase) => new Pair(graph === 'social' ? social() : open(), through);
 

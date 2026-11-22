@@ -5,7 +5,7 @@ import { HistoryStore, open, SmaltcyError, type Graph } from '../src/index.js';
 import { social } from '../src/datasets/index.js';
 import { compileQuery, lastCommitOf, lit, paramValues, Unsupported } from '../src/smaltdb/compile.js';
 import { graphTables, graphTablesFor, loadStatements, schemaStatements, type GraphTables } from '../src/smaltdb/schema.js';
-import { forgetOnSmaltdb, latestVersion, runOnSmaltdb, type NextIds, type RunOptions, type SmaltdbDatabase } from '../src/smaltdb/write.js';
+import { forgetOnSmaltdb, latestVersion, runOnSmaltdb, type RunOptions, type SmaltdbDatabase } from '../src/smaltdb/write.js';
 import { EVOLVING, randomSteps, type CommitOptions, type HistoryStep } from './helpers/history-cases.js';
 import { dataOf } from './helpers/smaltdb.js';
 
@@ -25,8 +25,6 @@ const commit = (action: string, more: object = {}) => ({ kind: 'transaction', ac
 class Pair {
   readonly db = Database.openMemory();
   tables: GraphTables;
-  /** The next ids, kept across statements as smaltcy's store keeps them (it doesn't take back the ids of a rollback). */
-  readonly ids: NextIds = { node: 0, relationship: 0 };
   /** smaltcy's versions, and the smaltdb commit each made. */
   readonly commits = new Map<number, number>([[0, 0]]);
 
@@ -51,7 +49,7 @@ class Pair {
   }
 
   private smaltdb(cypher: string, options: RunOptions = {}) {
-    const r = runOnSmaltdb(this.db, compile(cypher).plan, this.tables, { ...options, ids: this.ids });
+    const r = runOnSmaltdb(this.db, compile(cypher).plan, this.tables, options);
     this.tables = r.tables;
     return r;
   }
@@ -233,7 +231,7 @@ describe('the last commit is read from the end of smalt_commits', () => {
     const p = randomPair(11, 12);
     for (const { time } of p.recorded()) {
       for (const t of [time + 0.5, time - 0.5]) {
-        // Through the runner, which finds the version first; then compiled as it is, where version() finds it.
+        // Through `runOnSmaltdb`, which finds the version first; then compiled as it is, where version() finds it.
         const r = runOnSmaltdb(p.db, compile('AT TIME $t RETURN version() AS v').plan, p.tables, { params: { t } });
         expect([r.rows, r.version], String(t)).toEqual([[[lastOf(p, t)]], lastOf(p, t)]);
         const q = compileQuery(compile('AT TIME $t RETURN version() AS v').plan, p.tables, { params: { t } });
@@ -262,7 +260,7 @@ describe('the last commit is read from the end of smalt_commits', () => {
       expect([mine.rows, mine.version], q).toEqual([theirs.rows, lastOf(p, time)]);
     }
     expect(runOnSmaltdb(plain, compile(NODES).plan, p.tables).version).toBe(lastOf(p));
-    const wrote = runOnSmaltdb(plain, compile('CREATE (:Z)').plan, p.tables, { ids: p.ids });
+    const wrote = runOnSmaltdb(plain, compile('CREATE (:Z)').plan, p.tables);
     expect(wrote.version).toBe(lastOf(p));
     expect(wrote.version).toBe(latestVersion(p.db));
     const text = statements.map((x) => JSON.stringify(x));
