@@ -13,6 +13,13 @@ import { dumpGraph } from '../src/engine/io.js';
 import { open } from '../src/index.js';
 import { graphTablesFor, loadStatements, schemaStatements } from '../src/smaltdb/schema.js';
 import { indexStatement, runOnSmaltdb } from '../src/smaltdb/write.js';
+import { registerLanguage } from 'smaltdb-src/engine/plan/language.js';
+import { cypherLanguage } from '../src/smaltdb/language.js';
+
+// PROTOTYPE: BENCH_LANGUAGE=1 gives smaltdb the Cypher as text, through the language registered with it.
+const AS_TEXT = !!process.env.BENCH_LANGUAGE;
+if (AS_TEXT) registerLanguage(cypherLanguage() as never);
+const NONE = { nodesCreated: 0, nodesDeleted: 0, relationshipsCreated: 0, relationshipsDeleted: 0, propertiesSet: 0, labelsAdded: 0, labelsRemoved: 0 };
 import { QUERIES } from './queries.js';
 import { METHOD, ROUNDS, rounds, timed } from './timing.js';
 
@@ -41,7 +48,7 @@ console.log(`${METHOD} (each run includes compiling the Cypher)\n`);
 console.log('query'.padEnd(28), 'smaltcy'.padStart(10), 'smaltdb'.padStart(10), 'ratio'.padStart(8), ' rows');
 
 // As an application runs a query (`runOnSmaltdb`).
-const onDb = (cypher: string) => [...runOnSmaltdb(db, compile(cypher).plan, tables).rows] as unknown[];
+const onDb = (cypher: string) => (AS_TEXT ? (db.query(cypher, undefined, { language: 'cypher' }).rows as unknown[]) : ([...runOnSmaltdb(db, compile(cypher).plan, tables).rows] as unknown[]));
 const results: Record<string, { smaltcy: number; smaltdb: number | null; ratio?: number; note?: string }> = {};
 for (const [name, q] of QUERIES) {
   const a = [...mem.run(q).rows] as unknown[];

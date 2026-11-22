@@ -13,6 +13,13 @@ import { dumpGraph } from '../src/engine/io.js';
 import { open } from '../src/index.js';
 import { graphTablesFor, loadStatements, schemaStatements, type GraphTables } from '../src/smaltdb/schema.js';
 import { indexStatement, runOnSmaltdb } from '../src/smaltdb/write.js';
+import { registerLanguage } from 'smaltdb-src/engine/plan/language.js';
+import { cypherLanguage } from '../src/smaltdb/language.js';
+
+// PROTOTYPE: BENCH_LANGUAGE=1 gives smaltdb the Cypher as text, through the language registered with it.
+const AS_TEXT = !!process.env.BENCH_LANGUAGE;
+if (AS_TEXT) registerLanguage(cypherLanguage() as never);
+const NONE = { nodesCreated: 0, nodesDeleted: 0, relationshipsCreated: 0, relationshipsDeleted: 0, propertiesSet: 0, labelsAdded: 0, labelsRemoved: 0 };
 import { METHOD, ROUNDS, rounds, timed } from './timing.js';
 
 const PEOPLE = Number(process.env.BENCH_PEOPLE ?? 20000);
@@ -51,6 +58,7 @@ for (const ix of raw.indexes ?? []) db.queryPlan(indexStatement({ kind: 'createI
 
 const onMem = (cypher: string) => mem.run(cypher).counts;
 const onDb = (cypher: string) => {
+  if (AS_TEXT) return (db.query(cypher, undefined, { language: 'cypher' }) as { graph?: typeof NONE }).graph ?? NONE;
   const r = runOnSmaltdb(db, compile(cypher).plan, tables);
   tables = r.tables;
   return r.counts;

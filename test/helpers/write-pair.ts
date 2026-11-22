@@ -9,7 +9,29 @@ import { open, type Graph } from '../../src/index.js';
 import { Unsupported } from '../../src/smaltdb/compile.js';
 import type { GraphTables } from '../../src/smaltdb/schema.js';
 import { runOnSmaltdb, type SmaltdbDatabase } from '../../src/smaltdb/write.js';
+import { registerLanguage } from 'smaltdb-src/engine/plan/language.js';
+import { cypherLanguage, tablesOf } from '../../src/smaltdb/language.js';
+import { SmaltcyError } from '../../src/errors.js';
 import { social } from './graphs.js';
+
+// PROTOTYPE: statements go to smaltdb as Cypher text, through the registered language.
+registerLanguage(cypherLanguage() as never);
+const viaLanguage = (db: Database, cypher: string, params: Readonly<Record<string, unknown>>): ReturnType<typeof runOnSmaltdb> => {
+  try {
+    const r = db.query(cypher, params as never, { language: 'cypher' }) as { columns: string[]; rows: unknown[][]; graph?: Record<string, number> };
+    const none = { nodesCreated: 0, nodesDeleted: 0, relationshipsCreated: 0, relationshipsDeleted: 0, propertiesSet: 0, labelsAdded: 0, labelsRemoved: 0 };
+    return { columns: r.columns, rows: r.rows, counts: r.graph ?? none, tables: tablesOf({ catalog: db.catalog as never }, undefined) } as ReturnType<typeof runOnSmaltdb>;
+  } catch (e) {
+    const err = e as { code?: string; message?: string };
+    if (err?.code === 'SMALT_CONSTRAINT_FOREIGNKEY' && typeof err.message === 'string') {
+      const has = /can't delete node (-?\d+) of/.exec(err.message);
+      if (has) throw new SmaltcyError('SMALTCY_CONSTRAINT', `Cannot delete node ${has[1]}: it still has relationships (use DETACH DELETE)`);
+      const gone = / = (-?\d+) is not a node of the graph$/.exec(err.message);
+      if (gone) throw new SmaltcyError('SMALTCY_NOT_FOUND', `Node ${gone[1]} does not exist`);
+    }
+    throw e;
+  }
+};
 import { both, dataOf } from './smaltdb.js';
 
 export interface State {
@@ -75,7 +97,7 @@ export class Pair {
     let theirs: ReturnType<typeof runOnSmaltdb> | undefined;
     let theirsError: unknown;
     try {
-      theirs = runOnSmaltdb(this.given, compile(cypher).plan, this.tables, { params });
+      theirs = viaLanguage(this.db, cypher, params);
       this.tables = theirs.tables;
     } catch (e) {
       theirsError = e;

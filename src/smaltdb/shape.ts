@@ -48,7 +48,7 @@ const MAX_HOLES = 64;
 /** The most shapes kept for one database; the oldest goes first. */
 const MAX_SHAPES = 256;
 /** A parameter's name where a value was taken out: no name Cypher can write, then the value's number. */
-const HOLE = '\u0000';
+export const HOLE = '\u0000';
 
 interface Kept {
   readonly columns: readonly string[];
@@ -138,6 +138,37 @@ let building = 0;
 /** Set for the map the walk reaches next when it is a pattern's property map. */
 let conditions = false;
 
+/** PROTOTYPE: the parameters the walk meets, and those of them whose values are part of the shape. */
+let seen: string[] | null = null;
+let pinnedSeen: string[] | null = null;
+
+/**
+ * PROTOTYPE (smaltdb ADR 0042, section 4): a statement's shape for a language registered with smaltdb. The graph's
+ * tables are no part of it (smaltdb binds a kept statement again when the schema changes), nor what its parameters
+ * hold (their kinds are the statement's variant).
+ */
+export function statementShape(gp: QueryPlan): { hash: number; tokens: unknown[]; values: unknown[]; params: string[]; pinned: string[]; asWritten: boolean } {
+  seen = [];
+  pinnedSeen = [];
+  n = 0;
+  hash = 0;
+  values = [];
+  given = {};
+  build = false;
+  asWritten = false;
+  building = 0;
+  conditions = false;
+  walk(gp);
+  const out = { hash, tokens: toks.slice(0, n), values, params: seen, pinned: pinnedSeen, asWritten };
+  seen = pinnedSeen = null;
+  return out;
+}
+
+/** PROTOTYPE: a statement's plan with a parameter where each value was taken out (`statementShape`'s values, in order). */
+export function holedPlan(gp: QueryPlan): QueryPlan {
+  return withHoles(gp, {});
+}
+
 /** A mark, or a value there are few of (true, false, NULL): `code` is what the hash takes for it. */
 function mark(m: symbol | boolean | null, code: number): void {
   toks[n++] = m;
@@ -169,6 +200,10 @@ function literal(x: { readonly k: 'lit'; readonly v: unknown }): unknown {
 
 /** A parameter: its name and the kind of its value, and with `pinned` the value. */
 function parameter(x: { readonly k: 'param'; readonly name: string }, pinned: boolean): void {
+  if (seen !== null) {
+    if (!seen.includes(x.name)) seen.push(x.name);
+    if (pinned && !pinnedSeen!.includes(x.name)) pinnedSeen!.push(x.name);
+  }
   const v = given[x.name];
   mark(PARAM, 5);
   str(x.name);
