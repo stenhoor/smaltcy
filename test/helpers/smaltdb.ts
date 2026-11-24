@@ -2,10 +2,33 @@
  * smaltcy's graphs in smaltdb, for the tests that run Cypher on both engines (test/smaltdb-differential.test.ts,
  * test/smaltdb-writes.test.ts).
  */
-import { Database } from 'smaltdb-src/engine/database.js';
+import { Database, type DatabaseOptions } from 'smaltdb-src/engine/database.js';
+import { registerLanguage, type LanguageStatement } from 'smaltdb-src/engine/plan/language.js';
 import { dumpGraph } from '../../src/engine/io.js';
 import type { Graph } from '../../src/index.js';
-import { graphTablesFor, loadStatements, schemaStatements, type GraphData, type GraphTables } from '../../src/smaltdb/schema.js';
+import { cypherLanguage } from '../../src/smaltdb/language.js';
+import { graphTablesFor, graphTablesIn, loadStatements, schemaStatements, type GraphData, type GraphTables } from '../../src/smaltdb/schema.js';
+
+// Cypher, registered with smaltdb as an application registers it, for every test that gives smaltdb a statement's
+// text. The tests count what smaltdb has the language bind: it keeps what a statement bound to (by its text, its shape
+// and the kinds of its parameters' values), so a statement it has kept one for binds nothing.
+let bound = 0;
+const cypher = cypherLanguage();
+const counted = (st: LanguageStatement): LanguageStatement => {
+  const bind = st.bind;
+  st.bind = function (this: LanguageStatement, ctx, params) {
+    bound++;
+    return bind.call(this, ctx, params);
+  };
+  return st;
+};
+registerLanguage({ ...cypher, parseOne: (text) => counted(cypher.parseOne!(text)), parse: (text) => cypher.parse!(text).map(counted) });
+
+/** How many times smaltdb has had a Cypher statement bound, in every database: tests read the difference. */
+export const binds = (): number => bound;
+
+/** The graph's tables in a database as its catalog has them now: with the labels and types statements added. */
+export const tablesIn = (db: Database): GraphTables => graphTablesIn(db.catalog);
 
 /** A store's graph to load, with its relationship ids (`dumpGraph` gives relationships in id order, without them). */
 export function dataOf(g: Graph): GraphData {
@@ -16,10 +39,10 @@ export function dataOf(g: Graph): GraphData {
 }
 
 /** A smaltcy graph and the same graph in a smaltdb database. */
-export function both(g: Graph): { g: Graph; db: Database; tables: GraphTables } {
+export function both(g: Graph, options?: DatabaseOptions): { g: Graph; db: Database; tables: GraphTables } {
   const data = dataOf(g);
   const tables = graphTablesFor(data);
-  const db = Database.openMemory();
+  const db = Database.openMemory(options);
   for (const st of [...schemaStatements(tables), ...loadStatements(data, tables)]) db.queryPlan(st);
   return { g, db, tables };
 }

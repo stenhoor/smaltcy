@@ -1,12 +1,13 @@
 /**
- * Queries kept by their shape (ADR 0004, "Statements kept by shape").
+ * A statement's shape (ADR 0004, "Statements kept by shape"; smaltdb's ADR 0042, section 4).
  *
- * An application's queries differ from each other in their values: `MATCH (p:Person {name: 'Ada'})`, then the same with
- * `'Alan'`. Compiled as written, each is a plan of its own, which smaltdb plans from nothing. Here a query's strings and
- * numbers are taken out of it before it is compiled: what is left is its shape, compiled once with a parameter where
- * each of them was, and the statement smaltdb prepared for it is kept by that shape and run with each query's values.
+ * An application's statements differ from each other in their values: `MATCH (p:Person {name: 'Ada'})`, then the same
+ * with `'Alan'`. Bound as written, each is a plan of its own, which smaltdb plans from nothing. So a statement's strings
+ * and numbers are taken out of it: what is left is its shape. smaltdb keeps what the first statement of a shape bound
+ * to (its plan with a parameter where each value was, `holedPlan`) and runs it for the next one with that one's values.
+ * Keeping them is smaltdb's; what the shape of a Cypher statement is, is said here (language.ts gives it to smaltdb).
  *
- * What a shape holds, so that a query runs a statement compiled for it and no other:
+ * What a shape holds, so that a statement runs what was bound for one like it and nothing else:
  *
  * - **The plan**, without the strings and numbers smaltdb compares as the values they are (`paramKind`: a string, a
  *   whole number JavaScript holds exactly, a float that isn't whole or NaN), and **the kind of each** of those, which the
@@ -14,92 +15,45 @@
  *   a list or a map the query builds (`[1, 2]`, `{a: 1}`): smaltdb makes such a list once when all of it is written
  *   out (an `IN` over one is then a lookup), and types its elements by what is written. A pattern's property map
  *   (`{name: 'Ada'}`) is conditions, not a value: its values are taken out.
- * - **The kind of each parameter** the query was given, for the same reason.
- * - **SKIP and LIMIT with their values.** The compiler checks them when it compiles (a whole number, not negative).
- * - **The graph's tables**: its labels and types and the tables they are, which a plan names.
+ * - **Its parameters' names.** What they hold is no part of it: a statement is bound for the kinds of its parameters'
+ *   values, which is its variant (language.ts).
+ * - **SKIP and LIMIT as written.** The compiler checks them when it compiles (a whole number, not negative): a count
+ *   written out stays in the shape, and one given as a parameter is marked (`pinned`), its value part of the variant.
  *
- * A query that reads the past (`AT VERSION`, `AT TIME`) isn't kept: its version is found before it is compiled. Where
- * the compiler needs a value written out (the direction and type of `degree()`), it refuses the query with its values
- * taken out: that shape is remembered as one to compile as written, as every query was before.
+ * The graph's tables are no part of a shape: smaltdb binds what it kept again when the schema changes.
  *
- * A statement that writes has a shape too (`writeByShape`): what is kept for its shape is its plan with a parameter
- * where each value was, and what its caller makes of that plan (write.ts: the smaltdb statement it compiles to,
- * prepared), which the next statement of the shape runs with its own values.
+ * Where the compiler needs a value written out (the direction and type of `degree()`), the statement is bound as it is
+ * written (`asWritten`), and so is one with more values than a statement takes (`MAX_HOLES`): smaltdb keeps those by
+ * their text alone.
  */
-import type { PlanStatementInput } from 'smaltdb/engine';
 import type { QueryPlan } from '../plan/ops.js';
-import { compileQuery, paramKind, Unsupported, type CompiledQuery } from './compile.js';
-import type { GraphTables } from './schema.js';
+import { paramKind } from './compile.js';
 
-/** What a shape needs of a smaltdb database: `Database.preparePlan`, or failing that `Database.queryPlan`. */
-export interface ShapeDatabase {
-  queryPlan(stmt: PlanStatementInput, params?: readonly unknown[]): { readonly rows: readonly (readonly unknown[])[] };
-  preparePlan?(stmt: PlanStatementInput): { result(params?: readonly never[]): { readonly rows: readonly (readonly unknown[])[] } };
-}
-
-/** A query run by its shape: its rows and column names. */
-export interface ShapeResult {
-  readonly columns: readonly string[];
-  readonly rows: readonly (readonly unknown[])[];
-}
-
-/** The most values taken out of one query: past this it is compiled as written (smaltdb limits a statement's parameters). */
-const MAX_HOLES = 64;
-/** The most shapes kept for one database; the oldest goes first. */
-const MAX_SHAPES = 256;
+/** The most values taken out of one statement: past this it is bound as written (smaltdb limits a statement's parameters). */
+export const MAX_HOLES = 64;
 /** A parameter's name where a value was taken out: no name Cypher can write, then the value's number. */
-const HOLE = '\u0000';
+export const HOLE = '\u0000';
 
-interface Kept {
-  readonly columns: readonly string[];
-  /** The statement's parameters in order: the number of a value taken out, or a parameter's name. */
-  readonly order: readonly (number | string)[];
-  readonly run: (values: readonly unknown[]) => { readonly rows: readonly (readonly unknown[])[] };
-}
-
-/**
- * What is kept for a statement that writes (`writeByShape`): its plan with a parameter where each value was, and what
- * its caller made of that plan (`made`, the caller's to set: nothing until it does).
- */
-export interface KeptWrite {
-  readonly plan: QueryPlan;
-  made?: unknown;
-}
-
-/** A shape kept for a database: what it is found by, and its statement (`null`: one to compile as written). */
-interface Entry {
+/** A statement's shape, and what was taken out of the statement to leave it. */
+export interface Shape {
+  /** A number the statements of one shape share. */
   readonly hash: number;
+  /** The shape itself: two statements have one shape when their tokens are the same. */
   readonly tokens: readonly unknown[];
-  readonly kept: Kept | null;
-  /** For a statement that writes: what is kept for it (`null`: it is run as written). */
-  readonly write?: KeptWrite | null;
-}
-
-/** A database's shapes: by their hash, and in the order they were kept (the oldest first). */
-interface Shapes {
-  readonly byHash: Map<number, Entry[]>;
-  readonly inOrder: Entry[];
-}
-
-const shapes = new WeakMap<object, Shapes>();
-/** What a plan depends on in a graph's tables, as text. */
-const signatures = new WeakMap<GraphTables, string>();
-
-function signature(t: GraphTables): string {
-  let s = signatures.get(t);
-  if (s === undefined) {
-    const names = (m: ReadonlyMap<string, string>) => [...m].map(([name, table]) => `${name.length}:${name}=${table}`).join(',');
-    s = `${t.graph}|${t.nodes}|${t.labels}|${names(t.labelTables)}|${names(t.types)}|${t.relationshipIds ? 1 : 0}|${t.history ?? ''}`;
-    signatures.set(t, s);
-  }
-  return s;
+  /** The values taken out, in the order `holedPlan` numbers the parameters put in their place. */
+  readonly values: readonly (string | number)[];
+  /** The statement's own parameters by name, in the order it first reads them. */
+  readonly params: readonly string[];
+  /** Those of them that are a SKIP's or a LIMIT's count: their values are part of what the statement compiles to. */
+  readonly pinned: readonly string[];
+  /** Whether the compiler needs a value of the statement written out. */
+  readonly asWritten: boolean;
 }
 
 // A shape is a list of tokens: the plan's names, strings and numbers in the order the walk meets them, with a mark
-// where a list or an object opens and closes, and a mark of its kind where a value was taken out. Two queries have one
-// shape when their tokens are the same. No text is built for it (building one and hashing it took most of the time of
-// finding a kept statement): a query's tokens are written into `toks` as the walk goes and hashed as they are written,
-// and compared with those of the shapes kept under that hash.
+// where a list or an object opens and closes, and a mark of its kind where a value was taken out. Two statements have
+// one shape when their tokens are the same. No text is built for it (building one and hashing it took most of the time
+// of finding a kept statement): the tokens are written into `toks` as the walk goes and hashed as they are written.
 //
 // A mark is a symbol, which no value of a plan is, so a mark is never taken for a name or a value.
 const LIST = Symbol('list');
@@ -111,9 +65,8 @@ const INT = Symbol('int');
 const REAL = Symbol('real');
 /** A value that stays written comes next. */
 const WRITTEN = Symbol('written');
-/** A parameter: its name and the kind of its value come next (`MISSING` for one not given), then `PINNED` and its value where that is part of the shape. */
+/** A parameter: its name comes next, then `PINNED` where its value is part of what the statement compiles to. */
 const PARAM = Symbol('parameter');
-const MISSING = Symbol('missing');
 const PINNED = Symbol('pinned');
 /** Numbers `===` gets wrong: -0 (equal to 0) and NaN (unequal to itself). */
 const MINUS_ZERO = Symbol('-0');
@@ -124,12 +77,13 @@ const OTHER = Symbol('other');
 // One walk does both jobs, so they can't disagree on which values are taken out or in which order: it writes the
 // shape's tokens and `values`, what was taken out; with `build`, it also returns the plan with a parameter in each
 // one's place.
-/** The tokens of the query walked last: the first `n` of `toks`, which is used again for the next. */
+/** The tokens of the statement walked last: the first `n` of `toks`, which is used again for the next. */
 const toks: unknown[] = [];
 let n = 0;
 let hash = 0;
-let values: unknown[] = [];
-let given: Readonly<Record<string, unknown>> = {};
+let values: (string | number)[] = [];
+let params: string[] = [];
+let pinned: string[] = [];
 let build = false;
 /** Set by the walk when the plan holds a value the compiler needs written out (`degree()`'s direction and type). */
 let asWritten = false;
@@ -151,7 +105,7 @@ function str(s: string): void {
   hash = (Math.imul(hash, 31) + (l > 0 ? (l << 16) ^ (s.charCodeAt(0) << 8) ^ s.charCodeAt(l - 1) : 0)) | 0;
 }
 
-/** A value written in the query: taken out if smaltdb compares it as the value it is, else part of the shape. */
+/** A value written in the statement: taken out if smaltdb compares it as the value it is, else part of the shape. */
 function literal(x: { readonly k: 'lit'; readonly v: unknown }): unknown {
   const v = x.v;
   const kind = building === 0 && (typeof v === 'string' || typeof v === 'number') ? paramKind(v) : '';
@@ -159,7 +113,7 @@ function literal(x: { readonly k: 'lit'; readonly v: unknown }): unknown {
     if (kind === 'text') mark(TEXT, 1);
     else if (kind === 'int') mark(INT, 2);
     else mark(REAL, 3);
-    values.push(v);
+    values.push(v as string | number);
     return build ? { k: 'param', name: HOLE + (values.length - 1) } : x;
   }
   mark(WRITTEN, 4);
@@ -167,16 +121,14 @@ function literal(x: { readonly k: 'lit'; readonly v: unknown }): unknown {
   return x;
 }
 
-/** A parameter: its name and the kind of its value, and with `pinned` the value. */
-function parameter(x: { readonly k: 'param'; readonly name: string }, pinned: boolean): void {
-  const v = given[x.name];
+/** A parameter: its name, and with `pin` that its value is part of what the statement compiles to. */
+function parameter(x: { readonly k: 'param'; readonly name: string }, pin: boolean): void {
   mark(PARAM, 5);
   str(x.name);
-  if (x.name in given) str(paramKind(v));
-  else mark(MISSING, 6);
-  if (pinned) {
+  if (!params.includes(x.name)) params.push(x.name);
+  if (pin) {
     mark(PINNED, 7);
-    plain(v);
+    if (!pinned.includes(x.name)) pinned.push(x.name);
   }
 }
 
@@ -269,150 +221,33 @@ function walk(x: unknown): unknown {
   return out ?? x;
 }
 
-/** Walks a query for its shape: its tokens (`toks`, `n`, `hash`) and the values taken out of it (`values`). */
-function shapeOf(gp: QueryPlan, tables: GraphTables, params: Readonly<Record<string, unknown>>): void {
+/** Before a walk: nothing written yet; `plan`: the walk also returns the plan with its values taken out. */
+function start(plan: boolean): void {
   n = 0;
   hash = 0;
   values = [];
-  given = params;
-  build = false;
-  building = 0;
-  conditions = false;
-  str(signature(tables));
-  walk(gp);
-}
-
-/** The shape kept whose tokens are those of the query walked last. */
-function found(all: Shapes): Entry | undefined {
-  const under = all.byHash.get(hash);
-  if (under === undefined) return undefined;
-  next: for (let e = 0; e < under.length; e++) {
-    const tokens = under[e]!.tokens;
-    if (tokens.length !== n) continue;
-    for (let i = 0; i < n; i++) if (tokens[i] !== toks[i]) continue next;
-    return under[e];
-  }
-  return undefined;
-}
-
-/** Keeps a shape; past `MAX_SHAPES` the oldest goes. */
-function add(all: Shapes, entry: Entry): void {
-  const under = all.byHash.get(entry.hash);
-  if (under) under.push(entry);
-  else all.byHash.set(entry.hash, [entry]);
-  all.inOrder.push(entry);
-  if (all.inOrder.length <= MAX_SHAPES) return;
-  const oldest = all.inOrder.shift()!;
-  const its = all.byHash.get(oldest.hash)!;
-  if (its.length === 1) all.byHash.delete(oldest.hash);
-  else its.splice(its.indexOf(oldest), 1);
-}
-
-/** For tests: how many shapes are kept for a database, and how many hashes they are under. */
-export function keptShapes(db: object): { shapes: number; hashes: number } {
-  const all = shapes.get(db);
-  return { shapes: all?.inOrder.length ?? 0, hashes: all?.byHash.size ?? 0 };
-}
-
-/** A query with a parameter where each value was taken out: `shapeOf`'s values, under the names `HOLE` and their number. */
-function withHoles(gp: QueryPlan, params: Readonly<Record<string, unknown>>): QueryPlan {
-  n = 0;
-  hash = 0;
-  values = [];
-  given = params;
-  build = true;
+  params = [];
+  pinned = [];
+  build = plan;
   asWritten = false;
   building = 0;
   conditions = false;
+}
+
+/** A statement's shape. */
+export function statementShape(gp: QueryPlan): Shape {
+  start(false);
+  walk(gp);
+  return { hash, tokens: toks.slice(0, n), values, params, pinned, asWritten };
+}
+
+/**
+ * A statement with a parameter where each value was taken out: `statementShape`'s values, under the names `HOLE` and
+ * their number. What the first statement of a shape is bound as.
+ */
+export function holedPlan(gp: QueryPlan): QueryPlan {
+  start(true);
   const out = walk(gp) as QueryPlan;
   build = false;
   return out;
-}
-
-/**
- * A statement that writes, by its shape: its plan with a parameter where each of its values was (taken out as a
- * query's are), its parameters with those values among them, and what is kept for the shape (`kept`), where the
- * caller keeps what it makes of the plan. `kept` is null, and the statement as it is, where the compiler needs one of
- * its values written out or it holds more values than a statement takes: the caller then keeps nothing.
- */
-export function writeByShape(db: object, gp: QueryPlan, tables: GraphTables, params: Readonly<Record<string, unknown>>): { plan: QueryPlan; params: Readonly<Record<string, unknown>>; kept: KeptWrite | null } {
-  shapeOf(gp, tables, params);
-  const taken = values;
-  if (taken.length > MAX_HOLES) return { plan: gp, params, kept: null };
-  let all = shapes.get(db);
-  if (!all) shapes.set(db, (all = { byHash: new Map(), inOrder: [] }));
-  let entry = found(all);
-  if (entry === undefined) {
-    // Its tokens are copied before its values are taken out: that walks it again, into `toks`.
-    const tokens = toks.slice(0, n);
-    const under = hash;
-    let write: KeptWrite | null = { plan: gp };
-    if (taken.length > 0) {
-      const plan = withHoles(gp, params);
-      write = asWritten ? null : { plan };
-    }
-    entry = { hash: under, tokens, kept: null, write };
-    add(all, entry);
-  }
-  const write = entry.write;
-  if (!write) return { plan: gp, params, kept: null };
-  if (taken.length === 0) return { plan: write.plan, params, kept: write };
-  const withValues: Record<string, unknown> = { ...params };
-  for (let i = 0; i < taken.length; i++) withValues[HOLE + i] = taken[i];
-  return { plan: write.plan, params: withValues, kept: write };
-}
-
-/**
- * Runs a query that only reads by its shape: the statement kept for the shape, compiled and prepared the first time.
- * `undefined` for a query that isn't kept (it reads the past, has too many values, or the compiler refuses its shape):
- * the caller compiles it as written.
- */
-export function runByShape(db: ShapeDatabase, gp: QueryPlan, tables: GraphTables, params: Readonly<Record<string, unknown>>): ShapeResult | undefined {
-  if (gp.asOf) return undefined;
-  shapeOf(gp, tables, params);
-  const taken = values;
-  if (taken.length > MAX_HOLES) return undefined;
-  let all = shapes.get(db);
-  if (!all) shapes.set(db, (all = { byHash: new Map(), inOrder: [] }));
-  let entry = found(all);
-  if (entry === undefined) {
-    // Its tokens are copied before it is compiled: compiling it walks it again, into `toks`.
-    const tokens = toks.slice(0, n);
-    const under = hash;
-    entry = { hash: under, tokens, kept: keep(db, gp, tables, params, taken) };
-    add(all, entry);
-  }
-  const kept = entry.kept;
-  if (kept === null) return undefined;
-  const order = kept.order;
-  const bound: unknown[] = new Array(order.length);
-  for (let i = 0; i < order.length; i++) {
-    const p = order[i]!;
-    if (typeof p === 'number') bound[i] = taken[p];
-    else {
-      const v = params[p];
-      bound[i] = typeof v === 'boolean' ? (v ? 1 : 0) : v;
-    }
-  }
-  return { columns: kept.columns, rows: kept.run(bound).rows };
-}
-
-/** Compiles a shape and prepares its statement; `null` when the compiler refuses the query with its values taken out. */
-function keep(db: ShapeDatabase, gp: QueryPlan, tables: GraphTables, params: Readonly<Record<string, unknown>>, taken: readonly unknown[]): Kept | null {
-  let q: CompiledQuery;
-  if (taken.length === 0) q = compileQuery(gp, tables, { params });
-  else {
-    const all: Record<string, unknown> = { ...params };
-    taken.forEach((v, i) => (all[HOLE + i] = v));
-    try {
-      q = compileQuery(withHoles(gp, params), tables, { params: all });
-    } catch (e) {
-      // Something the compiler needs written out: this shape is compiled as written, each time.
-      if (e instanceof Unsupported) return null;
-      throw e;
-    }
-  }
-  const order = q.params.map((name) => (name.startsWith(HOLE) ? Number(name.slice(HOLE.length)) : name));
-  const prepared = db.preparePlan?.(q.statement);
-  return { columns: q.columns, order, run: prepared ? (bound) => prepared.result(bound as readonly never[]) : (bound) => db.queryPlan(q.statement, bound) };
 }

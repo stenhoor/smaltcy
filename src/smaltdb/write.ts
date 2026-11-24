@@ -4,8 +4,10 @@
  * - **A statement is one smaltdb statement.** A query that only reads is one query (`compileQuery`); a statement that
  *   writes is one plan of smaltdb's graph writes (`compileWrite`, write-plan.ts), which smaltdb runs: its rows in
  *   order, each through every write before the next, so a write sees what earlier rows wrote.
- * - **Statements are kept by their shape** (shape.ts): what a statement compiles to is prepared once and run again by
- *   the next statement of the shape, with its own values.
+ * - **smaltdb is given the statement's text**, as Cypher, the language registered with it (language.ts), and keeps
+ *   what it bound to: by its text, by its shape (shape.ts) and by the kinds of its parameters' values. Nothing is kept
+ *   here. A statement that reads the past (`AT VERSION`, `AT TIME`) is the one compiled here, each time: the version
+ *   it reads is found first.
  * - **All or nothing.** A statement is one statement to smaltdb, inside the caller's transaction if there is one: an
  *   error undoes everything it wrote, the new labels and types included. Given an author or a message, it runs in a
  *   transaction of its own, which carries them to its commit (`smalt_commits`).
@@ -27,12 +29,14 @@
  * are refused, where smaltdb would give a value.
  */
 import type { plan, PlanStatementInput } from 'smaltdb/engine';
+import type { StatementParams } from 'smaltdb/language';
+import { compile } from '../cypher/index.js';
+import { readsThePast } from '../cypher/parser.js';
 import { SmaltcyError } from '../errors.js';
 import type { GraphPlan } from '../plan/ops.js';
-import type { GraphTables } from './schema.js';
-import { runByShape, writeByShape } from './shape.js';
+import { graphTablesIn, LANGUAGE, type GraphCatalog, type GraphTables } from './schema.js';
 import { asOfOf, call, colRef, compileQuery, eq, lastCommitOf, lit, noHistory, paramValues, PROPS, Unsupported, type AsOf } from './compile.js';
-import { compileWrite, writes, type CompiledWrite } from './write-plan.js';
+import { writes } from './write-plan.js';
 
 type PlanOp = plan.PlanOp;
 type PlanExpr = plan.PlanExpr;
@@ -50,13 +54,21 @@ export interface WriteCounts {
 
 const emptyCounts = (): WriteCounts => ({ nodesCreated: 0, nodesDeleted: 0, relationshipsCreated: 0, relationshipsDeleted: 0, propertiesSet: 0, labelsAdded: 0, labelsRemoved: 0 });
 
-/** What a statement is run on: a smaltdb database's `Database.queryPlan` of `smaltdb/engine` (synchronous). */
+/**
+ * What a statement is run on: a smaltdb database (`Database` of `smaltdb/engine`, synchronous) that Cypher is
+ * registered with (`registerLanguage(cypherLanguage())`, language.ts).
+ */
 export interface SmaltdbDatabase {
+  /** `Database.query`, given the registered language's name: what runs a statement, and keeps what it bound to. */
+  query(text: string, params: StatementParams | undefined, options: { readonly language: string }): { readonly columns: readonly string[]; readonly rows: readonly (readonly unknown[])[]; readonly graph?: WriteCounts };
+  /** `Database.queryPlan`: what is not a Cypher statement (a transaction's begin and end, `forget`), and a read of the past. */
   queryPlan(stmt: PlanStatementInput, params?: readonly unknown[]): { readonly rows: readonly (readonly unknown[])[] };
-  /** `Database.preparePlan`: with it, a query's statement is prepared once for its shape and kept (shape.ts). */
+  /** `Database.preparePlan`: with it, the lookups of the last commit are prepared once and kept. */
   preparePlan?(stmt: PlanStatementInput): { result(params?: readonly never[]): { readonly rows: readonly (readonly unknown[])[] } };
   /** Whether a transaction is open (`Database.inTransaction`): a statement with an author or a message needs none. */
   readonly inTransaction?: boolean;
+  /** `Database.catalog`: the graph's tables as they are. */
+  readonly catalog: GraphCatalog;
 }
 
 export interface RunResult {
@@ -64,8 +76,6 @@ export interface RunResult {
   /** Rows as smaltcy's engine gives them: nodes, relationships and paths as maps of their data. */
   readonly rows: readonly (readonly unknown[])[];
   readonly counts: WriteCounts;
-  /** The graph's tables after the statement: with the labels and types it added. */
-  readonly tables: GraphTables;
   /**
    * On a graph that keeps history: the version the statement read (`AT VERSION`, `AT TIME`), or the latest once it is
    * done (a smaltdb commit id; 0 before the first). Not given for a statement inside an open transaction.
@@ -82,68 +92,75 @@ export interface RunOptions {
    */
   readonly author?: string;
   readonly message?: string;
+  /** The property graph, where Cypher was registered for one by name (`cypherLanguage(graph)`). */
+  readonly graph?: string;
 }
 
 const SAVEPOINT = 'smaltcy_write';
+const AS_CYPHER = { language: LANGUAGE } as const;
 
 export { writes };
 
-/** What is kept for a write's shape: its compiled statement, prepared where the database prepares. */
-interface KeptWrite {
-  readonly w: CompiledWrite;
-  readonly prepared: ReturnType<NonNullable<SmaltdbDatabase['preparePlan']>> | undefined;
+/**
+ * Runs a Cypher statement on smaltdb: given as text, in the language registered with it, which binds a query that
+ * only reads to one query and a statement that writes to one plan. Returns its rows and what it wrote.
+ */
+export function runOnSmaltdb(db: SmaltdbDatabase, cypher: string, options: RunOptions = {}): RunResult {
+  if (readsThePast(cypher)) return readThePast(db, cypher, options);
+  if ((options.author !== undefined || options.message !== undefined) && writesGraph(cypher)) return writeAsCommit(db, cypher, options);
+  let out: ReturnType<SmaltdbDatabase['query']>;
+  try {
+    out = db.query(cypher, options.params as StatementParams | undefined, AS_CYPHER);
+  } catch (e) {
+    throw reworded(e);
+  }
+  return result(db, out, options.graph);
+}
+
+/** A statement's result, with the graph's latest version where it keeps history and no transaction is open. */
+function result(db: SmaltdbDatabase, out: ReturnType<SmaltdbDatabase['query']>, graph: string | undefined): RunResult {
+  const counts = out.graph ?? emptyCounts();
+  if (graphTablesIn(db.catalog, graph).history === undefined || db.inTransaction) return { columns: out.columns, rows: out.rows, counts };
+  return { columns: out.columns, rows: out.rows, counts, version: latestVersion(db) };
+}
+
+/** Whether a statement writes the graph: an author and a message are a commit's, and a read makes none. */
+function writesGraph(cypher: string): boolean {
+  const gp = compile(cypher).plan;
+  return gp.kind === 'query' && writes(gp.root);
+}
+
+/** A write in a transaction of its own, whose commit records the author and the message given. */
+function writeAsCommit(db: SmaltdbDatabase, cypher: string, options: RunOptions): RunResult {
+  if (db.inTransaction) throw new Unsupported("an author or a message for a statement inside a transaction (give them to the transaction's begin or commit)");
+  const transaction = (action: string, more: object = {}) => db.queryPlan({ kind: 'transaction', action, ...more } as PlanStatementInput);
+  transaction('begin', { mode: 'deferred', ...(options.author !== undefined ? { author: options.author } : {}), ...(options.message !== undefined ? { message: options.message } : {}) });
+  let out: ReturnType<SmaltdbDatabase['query']>;
+  try {
+    out = db.query(cypher, options.params as StatementParams | undefined, AS_CYPHER);
+  } catch (e) {
+    transaction('rollback');
+    throw reworded(e);
+  }
+  transaction('commit');
+  return result(db, out, options.graph);
 }
 
 /**
- * Runs a Cypher statement's graph plan on smaltdb, on the graph whose tables are `tables`: a query that only reads as
- * one query, a statement that writes as one plan. Returns its rows and what it wrote, and the tables as they are after
- * it (with the labels and types it added; the caller's `tables` are left as they were).
+ * A query of the past (`AT VERSION`, `AT TIME`): the version it reads is found first, as smaltcy's engine finds it
+ * (`versionRead`), and the query is compiled to read that commit. Not given to smaltdb as text, and not kept.
  */
-export function runOnSmaltdb(db: SmaltdbDatabase, gp: GraphPlan, tables: GraphTables, options: RunOptions = {}): RunResult {
+function readThePast(db: SmaltdbDatabase, cypher: string, options: RunOptions): RunResult {
+  const { plan: gp, explain } = compile(cypher);
+  if (explain) throw new Unsupported('EXPLAIN (smaltdb explains the plan a statement binds to)');
   const params = options.params ?? {};
-  const own = options.author !== undefined || options.message !== undefined;
-  if (gp.kind !== 'query') {
-    db.queryPlan(indexStatement(gp, tables));
-    return { columns: [], rows: [], counts: emptyCounts(), tables };
-  }
-  if (!writes(gp.root)) {
-    const asOf = asOfOf(gp, params);
-    if (asOf && !tables.history) noHistory();
-    const version = asOf ? versionRead(db, tables, asOf) : undefined;
-    // By its shape, where it has one that is kept (shape.ts); else compiled as written.
-    let r = runByShape(db, gp, tables, params);
-    if (!r) {
-      const q = compileQuery(gp, tables, { params, ...(version !== undefined ? { asOf: { commit: version } } : {}) });
-      r = { columns: q.columns, rows: db.queryPlan(q.statement, paramValues(q, params)).rows };
-    }
-    const read = version ?? (tables.history && !db.inTransaction ? latestVersion(db) : undefined);
-    return { columns: r.columns, rows: r.rows, counts: emptyCounts(), tables, ...(read !== undefined ? { version: read } : {}) };
-  }
-  if (gp.asOf) throw new Unsupported('AT VERSION and AT TIME');
-  if (own && db.inTransaction) throw new Unsupported("an author or a message for a statement inside a transaction (give them to the transaction's begin or commit)");
-  // The statement with its values as parameters, and what is kept for its shape (shape.ts): one statement of a shape
-  // and the next differ only in their parameters, so the plan is compiled, and prepared, once for the shape.
-  const stated = writeByShape(db, gp, tables, params);
-  let kept = stated.kept?.made as KeptWrite | undefined;
-  if (!kept) {
-    const compiled = compileWrite(stated.plan, tables, stated.params);
-    kept = { w: compiled, prepared: stated.kept ? db.preparePlan?.(compiled.statement) : undefined };
-    if (stated.kept) stated.kept.made = kept;
-  }
-  const w = kept.w;
-  const bound = paramValues(w, stated.params);
-  const transaction = (action: string, more: object = {}) => db.queryPlan({ kind: 'transaction', action, ...more } as PlanStatementInput);
-  if (own) transaction('begin', { mode: 'deferred', ...(options.author !== undefined ? { author: options.author } : {}), ...(options.message !== undefined ? { message: options.message } : {}) });
-  let out: { readonly rows: readonly (readonly unknown[])[]; readonly graph?: WriteCounts };
-  try {
-    out = (kept.prepared ? kept.prepared.result(bound as unknown as readonly never[]) : db.queryPlan(w.statement, bound)) as typeof out;
-  } catch (e) {
-    if (own) transaction('rollback');
-    throw reworded(e);
-  }
-  if (own) transaction('commit');
-  const version = tables.history && !db.inTransaction ? latestVersion(db) : undefined;
-  return { columns: w.columns, rows: out.rows.map((r) => [...r]), counts: out.graph ?? emptyCounts(), tables: tablesAfter(db, tables, w.named), ...(version !== undefined ? { version } : {}) };
+  const tables = graphTablesIn(db.catalog, options.graph);
+  const asOf = asOfOf(gp, params);
+  if (asOf === undefined) throw new SmaltcyError('SMALTCY_PLAN', 'a statement that opens with AT VERSION or AT TIME reads the past');
+  if (!tables.history) noHistory();
+  const version = versionRead(db, tables, asOf);
+  const q = compileQuery(gp, tables, { params, asOf: { commit: version } });
+  return { columns: q.columns, rows: db.queryPlan(q.statement, paramValues(q, params)).rows, counts: emptyCounts(), version };
 }
 
 /**
@@ -158,26 +175,6 @@ function reworded(e: unknown): unknown {
   if (has) return new SmaltcyError('SMALTCY_CONSTRAINT', `Cannot delete node ${has[1]}: it still has relationships (use DETACH DELETE)`);
   const gone = / = (-?\d+) is not a node of the graph$/.exec(err.message);
   return gone ? new SmaltcyError('SMALTCY_NOT_FOUND', `Node ${gone[1]} does not exist`) : e;
-}
-
-/**
- * The graph's tables after a statement that named labels or types the graph hadn't: with those a row needed, which
- * smaltdb added. The ones given, the same object, while none was.
- */
-function tablesAfter(db: SmaltdbDatabase, tables: GraphTables, named: CompiledWrite['named']): GraphTables {
-  // Whether smaltdb has the table: a statement no row of which reached the write made none.
-  const there = (table: string): boolean => {
-    try {
-      db.queryPlan({ kind: 'query', plan: { op: 'limit', input: { op: 'scan', table, columns: [-1] }, count: lit(0) } } as PlanStatementInput);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-  const labels = named.labels.filter(([, table]) => there(table));
-  const types = named.types.filter(([, table]) => there(table));
-  if (!labels.length && !types.length) return tables;
-  return { ...tables, labelTables: new Map([...tables.labelTables, ...labels]), types: new Map([...tables.types, ...types]) };
 }
 
 /**

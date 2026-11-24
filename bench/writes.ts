@@ -7,13 +7,16 @@
  */
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { Database } from 'smaltdb-src/engine/database.js';
-import { compile } from '../src/cypher/index.js';
+import { registerLanguage } from 'smaltdb-src/engine/plan/language.js';
 import { network } from '../src/datasets/index.js';
 import { dumpGraph } from '../src/engine/io.js';
 import { open } from '../src/index.js';
-import { graphTablesFor, loadStatements, schemaStatements, type GraphTables } from '../src/smaltdb/schema.js';
+import { cypherLanguage } from '../src/smaltdb/language.js';
+import { graphTablesFor, loadStatements, schemaStatements } from '../src/smaltdb/schema.js';
 import { indexStatement, runOnSmaltdb } from '../src/smaltdb/write.js';
 import { METHOD, ROUNDS, rounds, timed } from './timing.js';
+
+registerLanguage(cypherLanguage());
 
 const PEOPLE = Number(process.env.BENCH_PEOPLE ?? 20000);
 // BENCH_ONLY: run only the cases whose name contains it.
@@ -44,17 +47,13 @@ const raw = dumpGraph(mem.store);
 const ids: number[] = [];
 mem.store.scanRels(null, (id) => void ids.push(id));
 const data = { ...raw, relationships: raw.relationships.map((r, i) => ({ ...r, id: ids[i]! })) };
-let tables: GraphTables = graphTablesFor(data);
+const tables = graphTablesFor(data);
 const db = Database.openMemory();
 for (const st of [...schemaStatements(tables), ...loadStatements(data, tables)]) db.queryPlan(st);
 for (const ix of raw.indexes ?? []) db.queryPlan(indexStatement({ kind: 'createIndex', label: ix.label, key: ix.key } as never, tables));
 
 const onMem = (cypher: string) => mem.run(cypher).counts;
-const onDb = (cypher: string) => {
-  const r = runOnSmaltdb(db, compile(cypher).plan, tables);
-  tables = r.tables;
-  return r.counts;
-};
+const onDb = (cypher: string) => runOnSmaltdb(db, cypher).counts;
 
 /** One run of a case on an engine: its setup, the write, its cleanup. The time is the write's. */
 const once = (run: (c: string) => unknown, c: Case) => (): number => {
@@ -66,7 +65,7 @@ const once = (run: (c: string) => unknown, c: Case) => (): number => {
 
 const st = mem.store.stats();
 console.log(`network(${PEOPLE}): ${st.nodes} nodes, ${st.rels} relationships`);
-console.log(`${METHOD} (each run includes compiling the Cypher)\n`);
+console.log(`${METHOD} (each run gives the engine the statement's text)\n`);
 console.log('write'.padEnd(28), 'smaltcy'.padStart(10), 'smaltdb'.padStart(10), 'ratio'.padStart(8), ' counts');
 const results: Record<string, { smaltcy: number; smaltdb: number; ratio: number }> = {};
 const ONLY = process.env.BENCH_ONLY;

@@ -122,8 +122,9 @@ hops); two variable-length relationships of types that can be the same in one MA
 **Writes** (`src/smaltdb/write-plan.ts`, `compileWrite`; run by `runOnSmaltdb` in `src/smaltdb/write.ts`) compile to
 one smaltdb statement: a plan of smaltdb's graph writes (`graphCreate`, `graphSet`, `graphDelete`, `graphMerge`;
 smaltdb's ADR 0042, section 1, and its plan reference, "Writing a property graph"), which smaltdb runs through its
-tables' writers. The `Database` is given by type only (its synchronous `queryPlan`, and `preparePlan` where it has
-one). The statement is all or nothing in smaltdb, inside the caller's transaction when there is one: an error undoes
+tables' writers. The `Database` is given by type only (its synchronous `query`, which takes the statement's text in
+the language registered with it, and `queryPlan`). The statement is all or nothing in smaltdb, inside the caller's
+transaction when there is one: an error undoes
 all it wrote, the labels and types it added included. Until 2026-11-22 a write was run from here, row by row, as
 several smaltdb statements (the last item of this list).
 
@@ -149,8 +150,9 @@ several smaltdb statements (the last item of this list).
   and `id(r)` reads it). It keeps the next ids for the connection, so an id is not given again after a DELETE or a
   statement that failed, as in smaltcy's stores. **New labels and types** are named in the plan with the tables
   smaltdb makes for them, numbered past the graph's (`<graph>_l<k>`, `<graph>_t<k>`), so what the plan reads after the
-  write names those tables. smaltdb adds one when a row first needs it; after a statement that named some,
-  `runOnSmaltdb` looks which of them are there, and gives the graph's tables back with those. The reserved label
+  write names those tables. smaltdb adds one when a row first needs it, and the next statement is compiled for the
+  graph's tables as smaltdb's catalog has them then (`graphTablesIn`; until 2026-11-24 `runOnSmaltdb` looked which
+  of the tables a statement named were there, and gave the graph's tables back with those). The reserved label
   `smaltcy:node` is refused.
 - **SET and REMOVE** are a `graphSet`, which changes the `props` map in smaltdb (`map_merge`, `map_remove`), so the
   properties a write doesn't touch keep their stored kind: `n.k = v` sets one key (NULL removes it), `n = map` replaces
@@ -237,37 +239,42 @@ label index, and a match by label stays a semi-join on it. Creating an index tha
 do nothing, as in smaltcy's stores. Indexes don't change results; on a graph that keeps history they don't change its
 versions.
 
-**Statements kept by shape** (`src/smaltdb/shape.ts`; smaltdb's issue 274, step 1). An application's queries differ
+**Statements kept by shape** (`src/smaltdb/shape.ts`; smaltdb's issue 274, step 1). An application's statements differ
 from each other in their values, and a plan with a value written into it is planned by smaltdb from nothing: 0.74 ms
-for a seek that takes 0.06 ms when its text repeats (docs/research/benchmarks.md). So a query that only reads is
-compiled with its strings and numbers taken out, a parameter in each one's place. What is left is its shape. The
-statement smaltdb prepares for a shape (`Database.preparePlan`) is kept, 256 shapes a database, and run with each
-query's values.
+for a seek that takes 0.06 ms when its text repeats (docs/research/benchmarks.md). So a statement is compiled with
+its strings and numbers taken out, a parameter in each one's place. What is left is its shape. What the first
+statement of a shape compiles to is kept, 256 shapes a database, and run for the next one with that one's values.
+smaltdb keeps it since 2026-11-24 ("A language of smaltdb", below); until then it was kept here, as the statement
+smaltdb prepared for the shape (`Database.preparePlan`). What the shape of a statement is, is said here.
 
 - **A parameter is compared as a literal of its kind is** (`paramKind`): a string, a whole number JavaScript holds
   exactly, or a float that isn't whole or NaN compiles to the plain comparison, which smaltdb seeks with an index and
   checks on a row's stored bytes before it decodes the row (for a parameter since smaltdb `1c2fce8`). The plan is then
-  for values of those kinds, so a shape holds the kind of every value taken out and of every parameter given: a value
-  of another kind is another statement.
+  for values of those kinds, so a shape holds the kind of every value taken out, and a statement is compiled once for
+  each kind its parameters' values come in (its variant, which smaltdb keeps under the statement): a value of another
+  kind is another statement.
 - **What stays in a shape:** NULL, booleans and every other literal; the values inside a list or a map the query
   builds (`[1, 2]`, `{a: 1}`: smaltdb makes one once when all of it is written out, so an `IN` over it is a lookup, and
   types its elements by what is written; a pattern's property map is conditions, and its values are taken out); SKIP
-  and LIMIT with their values, which the compiler checks as it compiles; the graph's labels and types with their
-  tables.
-- **Not kept:** a query that reads the past (its version is found before it is compiled), and one with more than 64
-  values. Where the compiler needs a value written out (the direction and type of `degree()`), it refuses the query
-  with its values taken out, and that shape is compiled as written from then on, as every query was before.
+  and LIMIT with their values, which the compiler checks as it compiles (a count given as a parameter is part of the
+  statement's variant, with its value). The graph's labels and types with their tables were part of a shape while
+  shapes were kept here. smaltdb compiles what it kept again when the schema changes, so they are no part of one now.
+- **No shape:** a statement with more than 64 values, and one where the compiler needs a value written out (the
+  direction and type of `degree()`). Such a statement is compiled as written, and smaltdb keeps it by its text alone.
+  A query that reads the past is not given to smaltdb as text at all: its version is found first, and it is compiled
+  for that version each time.
 - **How a kept statement is found** (2026-11-21). The walk that takes a query's values out writes its shape as a list
   of tokens: the plan's names, strings and numbers in the order it meets them, a mark where a list or an object opens
   and closes, and a mark of its kind where a value was taken out. It hashes the tokens as it writes them. The query's
   statement is the one kept under that hash whose tokens are the same, so two shapes with one hash stay two
   statements. Until then the shape was a text, built for every query and looked up in a map: building it and hashing
   it took most of the time of finding a kept statement (6.5 µs for the benchmark's seek by name, 1.7 µs as tokens;
-  docs/research/benchmarks.md, "A kept statement found by its tokens").
-- **Writes are kept by shape too** (`writeByShape`, since 2026-11-21). A statement that writes has its values taken
-  out as a query's are, and what is kept for its shape is the smaltdb statement it compiles to, prepared: the next
-  statement of the shape runs it with its own values. The graph's tables are part of a shape, so a statement on the
-  graph after it got a label or a type is another shape, compiled once for the graph as it is then.
+  docs/research/benchmarks.md, "A kept statement found by its tokens"). smaltdb finds a statement so now: a statement
+  gives it the hash, and compares its tokens with those of the statements kept under it (`same`).
+- **Writes are kept by shape too** (since 2026-11-21). A statement that writes has its values taken out as a query's
+  are, and what is kept for its shape is the smaltdb statement it compiles to: the next statement of the shape runs
+  it with its own values. After the graph gets a label or a type, what is kept is compiled again, once, for the graph
+  as it is then.
   - **Measured as one plan** (docs/research/benchmarks.md, "Writes as one plan"; smaltdb's time over smaltcy's,
     the runner on `main` and one plan in turns, six turns each): with the same text, creating 1 node 3.71x to 4.35x
     through the runner and 3.21x to 3.76x as one plan, 1 relationship 2.89x to 3.96x and 2.20x to 2.49x, setting 1
@@ -295,6 +302,49 @@ query's values.
 - **A kept statement keeps its plan** until smaltdb plans it again (a schema change, or a table four times larger or
   smaller). A statement planned anew each time follows the data more closely: one case measures slower for it
   (docs/research/benchmarks.md, "Statements kept by shape").
+
+**A language of smaltdb** (`src/smaltdb/language.ts`, `cypherLanguage`; smaltdb's ADR 0015, and ADR 0042, section 4,
+whose step 3 this ends; since 2026-11-24). Cypher is registered with smaltdb as a language (`registerLanguage`, from
+`smaltdb/language`), and smaltdb's entry points that take a statement's text take Cypher by the language's name:
+`db.query(text, params, { language: 'cypher' })`. `runOnSmaltdb` gives smaltdb the text. Until then it was given the
+Cypher compiled to a graph plan, and what was kept was kept here (`shape.ts` held the statements; it now only says
+what a shape is).
+
+- **smaltdb keeps what a statement compiled to**, and nothing is kept here: by its text (a text it has seen is not
+  parsed again; 64 texts), by its shape (above; 256 shapes), and by the kinds of its parameters' values (16 for a
+  statement). A statement of a kept shape whose text is new is parsed, which is where its shape comes from, and
+  compiled no further. smaltdb keeps such a text when it comes a second time (stenhoor/smaltdb#305).
+- **A statement binds to plan data** (`plans: 'data'`): what the compiler gives, for the graph's tables as smaltdb's
+  catalog has them when the statement binds (`graphTablesIn`: the graph named when the language is registered, else
+  the database's one graph made as `schemaStatements` makes it). Nothing here follows the graph's tables any more.
+  smaltdb binds a statement again when the schema changes, which is when a label, a type or an index is added. A
+  relationship's rowid is its id in such a graph: smaltdb gives each new one a rowid no other of the graph has.
+- **Parameters** are given by name, with or without the `$`, or by position in the order the statement first reads
+  them. One that is not given fails as the compiler fails it, each time.
+- **What `runOnSmaltdb` still does** around the statement smaltdb runs. It finds the version a read of the past
+  reads and compiles that query itself (History, above): such a text is told by its first words (`readsThePast`,
+  beside the parser, read as the lexer reads them) and is not given to smaltdb. It runs a write that has an author
+  or a message in a transaction of its own. It gives smaltdb's errors for a graph's rules smaltcy's code and
+  message. On a graph that keeps history it reads the latest version for the result.
+- **Refused by the language** (`Unsupported`): `EXPLAIN`, which smaltdb answers for the plan a statement binds to,
+  and `AT VERSION` and `AT TIME` in a text given to smaltdb directly, which has nothing to find the version with.
+- **In the database's process only.** smaltdb's worker and client do not take a language's name yet (its ADR 0042,
+  "As built"), so `runOnSmaltdb` runs where the database is.
+- **`src/smaltdb` imports the Cypher parser now** (`test/modules.test.ts`): a language is given text. The compiler
+  itself (`compile.ts`, `write-plan.ts`) still reads graph plans and nothing else.
+- **Measured** (docs/research/benchmarks.md, "Cypher as a language of smaltdb"; smaltdb's time over smaltcy's, `main`'s
+  way and this one in turns on the same smaltdb, four turns each, three for the reads). With the same text every run, 25
+  of the 28 queries and writes are under the bar, from 20: creating 1 node 1.55x to 1.71x before and 0.73x to 0.86x now,
+  1 relationship 1.31x to 1.37x and 0.63x to 0.69x, setting 1 property 1.14x to 1.21x and 0.43x to 0.48x, merging a node
+  that is there 1.01x to 1.11x and 0.45x to 0.55x, a small label's nodes returned 1.03x to 1.16x and 0.50x to 0.56x.
+  smaltdb does not parse a text it has kept; smaltcy's engine compiles every statement. With a parameter that differs,
+  19 of 23 are under it, from 15. With a literal that differs every text is new and nothing is gained, and three reads
+  that take little read higher in the benchmark, under the bar both ways: 1 hop 0.45x to 0.51x and 0.53x to 0.59x, 2
+  hops 0.30x to 0.31x and 0.32x to 0.35x, 2 hops with a relationship filter 0.63x to 0.66x and 0.67x to 0.72x. Seek by
+  name with a literal is over the bar both ways (1.03x to 1.08x and 1.01x to 1.19x). Compared with each other in one
+  process, before the pin's commit was there, the two ways took the same time on seek by name and 1 hop (1.00x to
+  1.07x). The writes of 1,000 rows are where they were (creating 1,000 nodes 1.11x to 1.26x, setting 1,000 properties
+  1.81x to 2.22x, deleting 1,000 nodes 1.29x to 1.54x).
 
 It keeps Cypher's meaning:
 
@@ -360,11 +410,17 @@ more sequences of writes on both engines, comparing after each statement the row
 labels in order, properties, relationships), statements that fail on both (smaltdb rolled back, new labels and types
 included; the same error code and message as smaltcy's), and the writes it refuses. `test/smaltdb-kept-writes.test.ts`
 runs those write cases again and again on the graph they leave, where the second run is by the statements kept, and on a
-database that prepares nothing; writes of one shape with other values, counting the statements prepared (none once the
-shape is kept); writes over many rows, counting the statements run (as many for 40 rows as for 20); a label or a type
+database that keeps no statement; writes of one shape with other values, counting what smaltdb has the language bind
+(nothing once the shape is kept: `test/helpers/smaltdb.ts` registers the language and counts); writes over many rows,
+counting the statements smaltdb is given (one for 20 rows, and for 40); a label or a type
 added while a statement runs; statements that fail with others kept; a DELETE of one to thirty nodes and
 relationships; and values of every kind as parameters. Each compares both engines after every statement, as above
-(`test/helpers/write-pair.ts`). Two more sets run queries on both engines and
+(`test/helpers/write-pair.ts`). `test/smaltdb-shape.test.ts` does the same for reads: which statements share what is
+bound, which do not (another kind of value, a list that stays written, SKIP and LIMIT, 257 shapes), and that a
+statement kept reads the graph as it is after a label, a type or an index came. `test/smaltdb-language.test.ts` is the
+language's own: the entry points that take its text, parameters by name and by position, what it refuses, a read of
+the past told by its first words as the parser tells it, and the graph's tables read from the catalog. Two more sets
+run queries on both engines and
 compare their rows: over properties of every kind (and the errors values of the wrong kind raise: the same code and
 message on both), over labels and types spelled two ways (`Person` and `person`, `KNOWS` and `knows`, read and
 written), and over relationships on a graph with self-loops, parallel
@@ -408,9 +464,11 @@ a plan belongs in smaltdb. Then, the write runner here executed a write's plan f
 statements, and the statements kept by shape (`src/smaltdb/shape.ts`) were kept here: by that reading both were to
 move into smaltdb. smaltdb's ADR 0042 records how. Its step 2 (stenhoor/smaltdb#297, 2026-11-22) has smaltdb run a
 plan that writes a graph; since then a write compiles to one such plan here and the runner is gone ("Writes", above:
-the first part of that ADR's step 3). The statements kept by shape are still kept here. They move when smaltdb's
-entry points that take a text take a registered language's, and smaltdb keeps what a language's statement binds to
-under its shape (that ADR's section 4, the rest of its step 3): smaltdb's change first, then this repository's.
+the first part of that ADR's step 3). The statements kept by shape were kept here until 2026-11-24. smaltdb's entry
+points that take a text take a registered language's since stenhoor/smaltdb#299, and smaltdb keeps what a language's
+statement binds to under its shape (that ADR's section 4); Cypher is registered as that language since then ("A
+language of smaltdb", above), which is the rest of that ADR's step 3. Nothing that runs a plan or keeps a statement is
+left here.
 
 ## Consequences
 
@@ -452,7 +510,8 @@ under its shape (that ADR's section 4, the rest of its step 3): smaltdb's change
   - `paths` with `anyShortest` searches from the start until every node is reached, with no way to give it the end;
     `paths` runs its input twice. The compiler works around both (above).
 - A write is one smaltdb statement (since 2026-11-22; until then several, made here for each row). `runOnSmaltdb`
-  takes a synchronous `queryPlan` (smaltdb's `Database` in a worker), not the client's asynchronous one yet.
+  takes smaltdb's `Database` in the process it is in (its synchronous `query`, with the language's name), not the
+  client's asynchronous one yet: smaltdb's worker and client take no language's name yet.
 - **Writes refused** (`Unsupported`): the reserved label;
   DISTINCT with writes before and after it in one pipeline (smaltcy's passes rows on as they come); UNION with writes;
   a DELETE of a list that is a value, when a row reaches it; a plan built by hand in which a MATCH with no write below

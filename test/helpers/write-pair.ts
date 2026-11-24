@@ -3,14 +3,13 @@
  * the two must agree (test/smaltdb-writes.test.ts, test/smaltdb-kept-writes.test.ts).
  */
 import { expect } from 'vitest';
-import type { Database } from 'smaltdb-src/engine/database.js';
-import { compile } from '../../src/cypher/index.js';
+import type { Database, DatabaseOptions } from 'smaltdb-src/engine/database.js';
 import { open, type Graph } from '../../src/index.js';
 import { Unsupported } from '../../src/smaltdb/compile.js';
 import type { GraphTables } from '../../src/smaltdb/schema.js';
 import { runOnSmaltdb, type SmaltdbDatabase } from '../../src/smaltdb/write.js';
 import { social } from './graphs.js';
-import { both, dataOf } from './smaltdb.js';
+import { both, dataOf, tablesIn } from './smaltdb.js';
 
 export interface State {
   nodes: { id: number; labels: string[]; properties: Record<string, unknown> }[];
@@ -49,17 +48,20 @@ export function stateIn(db: Database, t: GraphTables): State {
 export class Pair {
   readonly g: Graph;
   readonly db: Database;
-  tables: GraphTables;
 
   /** The database statements are run on: the engine's, or with `through`, what that makes of it (one that counts, say). */
   readonly given: SmaltdbDatabase;
 
-  constructor(g: Graph, through?: (db: Database) => SmaltdbDatabase) {
-    const b = both(g);
+  constructor(g: Graph, through?: (db: Database) => SmaltdbDatabase, options?: DatabaseOptions) {
+    const b = both(g, options);
     this.g = g;
     this.db = b.db;
-    this.tables = b.tables;
     this.given = through ? through(b.db) : b.db;
+  }
+
+  /** The graph's tables in smaltdb as they are now. */
+  get tables(): GraphTables {
+    return tablesIn(this.db);
   }
 
   /** Runs a statement on both: the same rows and counts, or both fail and smaltdb's graph is as it was; then the same graphs. */
@@ -75,8 +77,7 @@ export class Pair {
     let theirs: ReturnType<typeof runOnSmaltdb> | undefined;
     let theirsError: unknown;
     try {
-      theirs = runOnSmaltdb(this.given, compile(cypher).plan, this.tables, { params });
-      this.tables = theirs.tables;
+      theirs = runOnSmaltdb(this.given, cypher, { params });
     } catch (e) {
       theirsError = e;
     }
@@ -97,5 +98,5 @@ export class Pair {
   }
 }
 
-export const start = (graph: 'empty' | 'social', through?: (db: Database) => SmaltdbDatabase) => new Pair(graph === 'social' ? social() : open(), through);
+export const start = (graph: 'empty' | 'social', through?: (db: Database) => SmaltdbDatabase, options?: DatabaseOptions) => new Pair(graph === 'social' ? social() : open(), through, options);
 
