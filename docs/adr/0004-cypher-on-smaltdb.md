@@ -381,13 +381,13 @@ would give, with its own values, and is not parsed.
   statement of every test that runs on smaltdb, checked the same way against a parse of its text
   (`test/helpers/smaltdb.ts`).
 - **Measured** (docs/research/benchmarks.md, "A statement told from its text"; smaltdb's time over smaltcy's, before and
-  now in turns, four turns each). With a literal that differs, 19 of the 23 statements are under the bar, from 14: seek
-  by name 1.08x to 1.20x before and 0.42x to 0.50x now, creating 1 relationship 1.17x to 1.47x and 0.76x to 0.95x,
-  setting 1 property 1.25x to 1.31x and 0.86x to 0.92x, merging a node that is there 1.16x to 1.36x and 0.74x to 0.97x,
-  deleting 1 node 0.94x to 1.06x and 0.55x to 0.78x. Creating 1 node is faster and still over it (2.02x to 2.27x and
-  1.45x to 1.48x), as it is with a parameter; the other three over it are writes of 1,000 rows. On smaltdb alone a
-  statement told from its text takes 0.34x to 0.65x of the time of one that is parsed. Statements with the same text,
-  and with a parameter, read as they did.
+  now in turns, four turns each, on the pin `a315b55`). With a literal that differs, 19 of the 23 statements are under
+  the bar, from 14: seek by name 1.05x to 1.11x before and 0.42x to 0.48x now, creating 1 relationship 1.33x to 1.90x
+  and 0.89x to 0.96x, setting 1 property 1.26x to 1.46x and 0.71x to 0.89x, merging a node that is there 1.17x to 1.24x
+  and 0.85x to 0.92x, deleting 1 node 0.92x to 1.08x and 0.65x to 0.69x. Creating 1 node is faster and still over it
+  (2.11x to 2.30x and 1.53x to 1.57x), as it is with a parameter; the other three over it are writes of 1,000 rows. On
+  smaltdb alone a statement told from its text takes 0.34x to 0.66x of the time of one that is parsed. Statements with
+  the same text, and with a parameter, read as they did.
 It keeps Cypher's meaning:
 
 - **Comparisons by kind:** `=` is NULL with a NULL and false across kinds (`true = 1` is false), `<` is NULL across
