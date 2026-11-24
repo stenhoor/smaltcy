@@ -312,8 +312,9 @@ what a shape is).
 
 - **smaltdb keeps what a statement compiled to**, and nothing is kept here: by its text (a text it has seen is not
   parsed again; 64 texts), by its shape (above; 256 shapes), and by the kinds of its parameters' values (16 for a
-  statement). A statement of a kept shape whose text is new is parsed, which is where its shape comes from, and
-  compiled no further. smaltdb keeps such a text when it comes a second time (stenhoor/smaltdb#305).
+  statement). A statement of a kept shape whose text is new is compiled no further than its shape, which a parse
+  gives, or the text itself where it is a known one but for its values ("A statement told from its text", below).
+  smaltdb keeps such a text when it comes a second time (stenhoor/smaltdb#305).
 - **A statement binds to plan data** (`plans: 'data'`): what the compiler gives, for the graph's tables as smaltdb's
   catalog has them when the statement binds (`graphTablesIn`: the graph named when the language is registered, else
   the database's one graph made as `schemaStatements` makes it). Nothing here follows the graph's tables any more.
@@ -344,6 +345,47 @@ what a shape is).
   (1.00x to 1.07x). The writes of 1,000 rows are where they were (creating 1,000 nodes 1.11x to 1.27x, setting 1,000
   properties 2.11x to 2.31x, deleting 1,000 nodes 1.47x to 1.49x).
 
+**A statement told from its text** (`src/smaltdb/template.ts`; `scanLiterals`, beside the parser; since 2026-11-24).
+Given every statement as text, smaltdb finds one whose text it has kept, and one whose text is new was parsed, bound and
+walked for its shape before smaltdb could tell that it had a statement of that shape: 284 ms of parse and bind and 60 ms
+for the shape, of the 643 ms of 34,000 seeks by name each with a new name (docs/research/benchmarks.md, "Cypher as a
+language of smaltdb"). An application's statements are such texts, the same ones but for their strings and numbers. So
+the language keeps a template for a text's skeleton, the text outside its strings and numbers: the shape that skeleton
+gives, and which value of the shape each string and number is. A text with a known skeleton is the statement its parse
+would give, with its own values, and is not parsed.
+
+- **What a parse reads of a string or a number,** which a template holds as its statement has it: its kind (a string, a
+  number, or a number written with a point or an exponent, which divides as a float whatever its value); whether its
+  value is taken out of the shape, and as what kind (`paramKind`); a `-` before it folded into it (`-5` is one value);
+  and which of the others it is equal to (the binder reads an ORDER BY's expression as a returned item where the two are
+  written alike). One that stays written (a count of hops, a LIMIT, a value inside a list the query builds, the name of
+  a column with no alias) is in the template with its text: a statement has that text there, or is parsed.
+- **A template is found by parsing, not written from the parser's code.** The statement it is made from is parsed again
+  with other values in the places of its strings and numbers, equal ones staying equal. Where that gives the same shape
+  with those values taken out, the places are the shape's values; where it does not, each value is tried alone, and one
+  that changes the shape stays written. A skeleton whose parse does not come out so gets no template, and is not tried
+  again. So a template says no more than the parser does.
+- **When one is made:** by the second statement of a shape that is parsed. It costs a parse or more, and a statement
+  whose shape comes once pays nothing for it. 256 templates are kept for a registered language, four for one skeleton
+  (they differ in what stays written, or in which values are equal); the oldest go first.
+- **Not told from their text:** a statement with more than 16 strings and numbers, one with a number that is not finite,
+  and one none of whose values is taken out (smaltdb keeps that by its text alone).
+- **It is the language's, not smaltdb's.** A template is what a text means, which is the parser's to say. What a
+  statement binds to, and every statement kept to be run, stays smaltdb's (above). `cypherLanguage(graph, { templates:
+  false })` parses every text smaltdb has not kept, as before.
+- **Checked** (`test/smaltdb-templates.test.ts`): `scanLiterals` against the lexer's own tokens, on 40,000 texts made of
+  the pieces a lexer has to tell apart; the statements of the read and write cases with other values in them, each given
+  to the language with templates and to one without, which must give one statement or refuse it alike; and every
+  statement of every test that runs on smaltdb, checked the same way against a parse of its text
+  (`test/helpers/smaltdb.ts`).
+- **Measured** (docs/research/benchmarks.md, "A statement told from its text"; smaltdb's time over smaltcy's, before and
+  now in turns, four turns each). With a literal that differs, 19 of the 23 statements are under the bar, from 14: seek
+  by name 1.08x to 1.20x before and 0.42x to 0.50x now, creating 1 relationship 1.17x to 1.47x and 0.76x to 0.95x,
+  setting 1 property 1.25x to 1.31x and 0.86x to 0.92x, merging a node that is there 1.16x to 1.36x and 0.74x to 0.97x,
+  deleting 1 node 0.94x to 1.06x and 0.55x to 0.78x. Creating 1 node is faster and still over it (2.02x to 2.27x and
+  1.45x to 1.48x), as it is with a parameter; the other three over it are writes of 1,000 rows. On smaltdb alone a
+  statement told from its text takes 0.34x to 0.65x of the time of one that is parsed. Statements with the same text,
+  and with a parameter, read as they did.
 It keeps Cypher's meaning:
 
 - **Comparisons by kind:** `=` is NULL with a NULL and false across kinds (`true = 1` is false), `<` is NULL across

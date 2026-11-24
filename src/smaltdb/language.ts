@@ -3,7 +3,7 @@
  * section 4). Registered (`registerLanguage(cypherLanguage())`, from `smaltdb/language`), smaltdb's entry points that
  * take a statement's text take Cypher: `db.query(text, params, { language: 'cypher' })`.
  *
- * Nothing here runs a statement or keeps one: smaltdb does both. It keeps what a statement bound to
+ * Nothing here runs a statement or keeps what one bound to: smaltdb does both. It keeps what a statement bound to
  *
  * - **by its text:** a text it has seen is not parsed again;
  * - **by its shape** (shape.ts): a statement that differs from one it has seen in its strings and numbers runs what
