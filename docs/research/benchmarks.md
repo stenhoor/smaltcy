@@ -1507,3 +1507,143 @@ What it says:
   to 0.172 before; smaltcy's own time is the one that differs, 0.694 to 0.893 ms now and 0.712 to 0.745 before), and
   3 hops, directed 0.33x and 0.35x in two (smaltdb 0.545 to 0.627 ms now, 0.534 to 0.605 before). The 8 cities
   returned are where they were, over the bar: 1.17x to 1.26x before, 1.17x to 1.21x now.
+
+## Cypher as a language of smaltdb (2026-11-24)
+
+stenhoor/smaltdb#274; smaltdb's ADR 0042, step 3, this repository's second part, which ends the step. Cypher is
+registered with smaltdb as a language, and `runOnSmaltdb` gives smaltdb a statement's text (ADR 0004, "A language of
+smaltdb"). smaltdb keeps what the statement bound to, by its text, by its shape and by the kinds of its parameters'
+values; what was kept here by shape is gone. The pin moves from `38118db` to the merge of stenhoor/smaltdb#305 (**in
+progress:** it is not merged yet, and its commit is written here when it is; the series ran on its branch, `6c4c1ee`):
+smaltdb's `main` with stenhoor/smaltdb#298 (the property maps' page list is not read past its end), stenhoor/smaltdb#299
+(its entry points take a language's name, and it keeps a language's statements), stenhoor/smaltdb#300 (in memory, a
+graph's writes land in its index and its tables are written behind) and stenhoor/smaltdb#305 (a text of a kept shape is
+kept by its text from the second time it comes).
+
+The same method. Before and now were run in turns in one series, both bundled with the new pin's smaltdb source, so the
+two differ in this change alone. **Before** is smaltcy's `main` (`c3303d8`): the caller compiles the Cypher, statements
+are kept by shape here, and smaltdb is given plans. **Now** is this change. Four turns each way for the writes and for
+the statements that differ, three for the reads. A ratio is smaltdb's time over the time of smaltcy's in-memory engine
+on the same Cypher; the bar is 1.00x. What the pin's move alone does is not in this series: it is the difference between
+the "Now" of "Writes as one plan" above and this section's "Before", and smaltdb's ADR 0042 has its measurements ("Step
+3: its gate", "Step 4: its gate").
+
+What a run gives each engine is the statement's text. smaltcy's engine compiles it on every run. smaltdb parses a text
+it has not kept, and finds one it has. So with the same text every run, and with one text whose parameter differs,
+smaltdb does not parse the Cypher again, where before the caller compiled it for every run. With a literal that differs
+every text is new, and it is parsed as before.
+
+**The same text every run: writes** (`BENCH_ENTRY=bench/writes.ts`; four turns before, four now):
+
+| Write | Before | Now | smaltdb before, now (ms, medians) |
+|---|---|---|---|
+| create 1 node | 1.58x, 1.54x, 1.59x, 1.60x | 0.83x, 0.76x, 0.82x, 0.82x | 0.009, 0.005 |
+| create 1,000 nodes | 1.36x, 1.28x, 1.30x, 1.34x | 1.21x, 1.11x, 1.15x, 1.27x | 0.957, 0.924 |
+| create 1 relationship | 1.33x, 1.25x, 1.34x, 1.26x | 0.62x, 0.61x, 0.63x, 0.64x | 0.015, 0.007 |
+| create 1,000 relationships | 0.68x, 0.70x, 0.70x, 0.69x | 0.65x, 0.63x, 0.64x, 0.64x | 1.12, 0.986 |
+| set 1 property by name | 1.10x, 1.13x, 1.09x, 1.11x | 0.43x, 0.43x, 0.43x, 0.43x | 0.011, 0.004 |
+| set 1,000 properties | 2.13x, 2.40x, 2.12x, 2.32x | 2.30x, 2.31x, 2.13x, 2.11x | 1.25, 1.20 |
+| merge existing node | 1.01x, 1.00x, 1.05x, 1.04x | 0.48x, 0.48x, 0.47x, 0.48x | 0.009, 0.004 |
+| merge 1,000 new nodes | 0.14x, 0.14x, 0.15x, 0.14x | 0.13x, 0.14x, 0.15x, 0.14x | 1.44, 1.59 |
+| delete 1,000 nodes | 1.60x, 1.49x, 1.56x, 1.61x | 1.49x, 1.47x, 1.47x, 1.48x | 0.735, 0.652 |
+
+**Statements that differ** (`BENCH_ENTRY=bench/vary.ts`; four turns before, four now; the median of the four turns, with
+the lowest and the highest):
+
+| Statement | Before: a literal | Now: a literal | Before: a parameter | Now: a parameter |
+|---|---|---|---|---|
+| seek by name | 1.01x (0.96 to 1.09) | 1.10x (1.06 to 1.16) | 0.94x (0.90 to 0.98) | 0.32x (0.31 to 0.33) |
+| 1 hop | 0.47x (0.45 to 0.48) | 0.56x (0.53 to 0.59) | 0.51x (0.48 to 0.55) | 0.23x (0.21 to 0.26) |
+| 2 hops | 0.32x (0.30 to 0.37) | 0.36x (0.35 to 0.40) | 0.33x (0.32 to 0.38) | 0.21x (0.19 to 0.23) |
+| 3 hops | 0.23x (0.23 to 0.26) | 0.26x (0.25 to 0.27) | 0.26x (0.26 to 0.27) | 0.25x (0.22 to 0.25) |
+| 3 hops, directed | 0.29x (0.27 to 0.30) | 0.30x (0.28 to 0.35) | 0.35x (0.31 to 0.37) | 0.22x (0.21 to 0.22) |
+| 2 hops to a label | 0.20x (0.19 to 0.20) | 0.21x (0.20 to 0.27) | 0.20x (0.19 to 0.21) | 0.15x (0.14 to 0.16) |
+| 2 hops, relationship filter | 0.65x (0.61 to 0.70) | 0.68x (0.64 to 0.75) | 0.62x (0.59 to 0.62) | 0.48x (0.41 to 0.52) |
+| var-length 1..3, distinct | 0.45x (0.43 to 0.50) | 0.45x (0.44 to 0.46) | 0.44x (0.42 to 0.46) | 0.41x (0.37 to 0.47) |
+| shortest path | 0.11x (0.10 to 0.12) | 0.11x (0.11 to 0.12) | 0.13x (0.11 to 0.13) | 0.11x (0.11 to 0.11) |
+| shortest path, directed | 0.82x (0.80 to 0.89) | 0.83x (0.80 to 0.86) | 0.66x (0.57 to 0.67) | 0.29x (0.22 to 0.36) |
+| shortest path, none | 0.18x (0.16 to 0.20) | 0.17x (0.17 to 0.18) | 0.17x (0.16 to 0.18) | 0.17x (0.17 to 0.17) |
+| label scan + filter | 0.56x (0.47 to 0.62) | 0.53x (0.48 to 0.64) | 0.41x (0.39 to 0.44) | 0.40x (0.36 to 0.44) |
+| node of a small label | 0.83x (0.82 to 0.85) | 0.88x (0.82 to 0.89) | 0.80x (0.76 to 0.84) | 0.52x (0.51 to 0.53) |
+| create 1 node | 2.02x (1.98 to 2.24) | 2.17x (1.97 to 2.34) | 1.94x (1.90 to 2.57) | 1.43x (1.32 to 1.45) |
+| create 1,000 nodes | 1.47x (1.40 to 1.61) | 1.52x (1.48 to 1.57) | 1.44x (1.42 to 1.51) | 1.46x (1.43 to 1.52) |
+| create 1 relationship | 1.40x (1.29 to 1.46) | 1.30x (1.23 to 1.45) | 1.37x (1.33 to 1.38) | 0.74x (0.69 to 0.77) |
+| create 1,000 relationships | 0.81x (0.76 to 0.86) | 0.87x (0.84 to 0.88) | 0.77x (0.75 to 0.79) | 0.78x (0.77 to 0.81) |
+| set 1 property by name | 1.31x (1.22 to 1.41) | 1.37x (1.23 to 1.40) | 1.23x (1.18 to 1.45) | 0.66x (0.60 to 0.68) |
+| set 1,000 properties | 5.53x (5.41 to 5.69) | 5.51x (5.45 to 5.59) | 5.37x (5.26 to 5.51) | 5.04x (4.71 to 5.67) |
+| merge existing node | 1.08x (0.98 to 1.12) | 1.11x (0.99 to 1.13) | 1.12x (1.04 to 1.23) | 0.62x (0.57 to 0.66) |
+| merge 1,000 new nodes | 0.16x (0.15 to 0.17) | 0.16x (0.16 to 0.18) | 0.15x (0.15 to 0.16) | 0.15x (0.15 to 0.17) |
+| delete 1 node | 1.04x (0.94 to 1.10) | 1.04x (0.99 to 1.08) | 0.99x (0.94 to 1.07) | 0.65x (0.63 to 0.67) |
+| delete 1,000 nodes | 2.40x (2.01 to 2.49) | 2.29x (2.08 to 2.52) | 2.44x (1.99 to 2.58) | 2.30x (2.03 to 2.45) |
+
+**The same text every run: reads** (`BENCH_INDEXES=1`; three turns before, three now; the times are the medians of the
+three turns now):
+
+| Query | Before | Now | smaltcy, smaltdb now (ms) |
+|---|---|---|---|
+| seek by name | 0.80x, 0.83x, 0.81x | 0.28x, 0.29x, 0.27x | 0.020, 0.006 |
+| 1 hop | 0.56x, 0.52x, 0.60x | 0.22x, 0.22x, 0.22x | 0.029, 0.006 |
+| 2 hops | 0.25x, 0.29x, 0.24x | 0.25x, 0.27x, 0.22x | 0.265, 0.070 |
+| 3 hops | 0.19x, 0.20x, 0.24x | 0.18x, 0.19x, 0.18x | 4.54, 0.861 |
+| 1 hop, directed | 0.54x, 0.53x, 0.57x | 0.21x, 0.22x, 0.20x | 0.024, 0.005 |
+| 3 hops, directed | 0.18x, 0.17x, 0.18x | 0.17x, 0.17x, 0.17x | 1.93, 0.415 |
+| 2 hops to a label | 0.21x, 0.15x, 0.17x | 0.13x, 0.15x, 0.14x | 0.747, 0.114 |
+| 2 hops, relationship filter | 0.53x, 0.52x, 0.52x | 0.46x, 0.47x, 0.41x | 0.507, 0.251 |
+| var-length 1..3, distinct | 0.42x, 0.44x, 0.41x | 0.40x, 0.39x, 0.41x | 11.80, 5.31 |
+| shortest path | 0.61x, 0.60x, 0.60x | 0.23x, 0.21x, 0.21x | 0.040, 0.008 |
+| shortest path, 5 hops | 0.13x, 0.14x, 0.13x | 0.14x, 0.13x, 0.12x | 34.26, 4.18 |
+| shortest path, none (out) | 0.83x, 0.82x, 0.82x | 0.26x, 0.26x, 0.24x | 0.025, 0.006 |
+| shortest path, none (all) | 0.16x, 0.16x, 0.17x | 0.17x, 0.16x, 0.15x | 35.51, 6.04 |
+| label scan + filter | 0.36x, 0.35x, 0.39x | 0.34x, 0.34x, 0.34x | 2.15, 0.731 |
+| small label + filter | 0.82x, 0.84x, 0.81x | 0.25x, 0.26x, 0.26x | 0.011, 0.002 |
+| small label | 1.11x, 1.12x, 1.18x | 0.56x, 0.57x, 0.52x | 0.008, 0.004 |
+| group by city | 0.60x, 0.64x, 0.49x | 0.60x, 0.65x, 0.55x | 17.67, 11.65 |
+| all relationships | 0.10x, 0.10x, 0.10x | 0.10x, 0.10x, 0.10x | 14.06, 1.77 |
+| triangles (bounded) | 0.29x, 0.29x, 0.31x | 0.30x, 0.34x, 0.33x | 12.05, 4.21 |
+
+What it says:
+
+- **With the same text, 25 of the 28 queries and writes are under the bar** (20 before, and one at it). The four single
+  writes are under it now: creating 1 node 1.54x to 1.60x before and 0.76x to 0.83x now, 1 relationship 1.25x to 1.34x
+  and 0.61x to 0.64x, setting 1 property 1.09x to 1.13x and 0.43x, merging a node that is there 1.00x to 1.05x and 0.47x
+  to 0.48x. So is the one read that was over it, a small label's nodes returned: 1.11x to 1.18x and 0.52x to 0.57x. The
+  reads that take least gain as much: seek by name 0.80x to 0.83x and 0.27x to 0.29x, 1 hop 0.52x to 0.60x and 0.22x.
+  These are the runs where smaltcy's engine compiles the Cypher and smaltdb no longer does.
+- **Over the bar with the same text: three of the five writes of 1,000 rows.** Creating 1,000 nodes 1.28x to 1.36x
+  before and 1.11x to 1.27x now, setting 1,000 properties 2.12x to 2.40x and 2.11x to 2.31x, deleting 1,000 nodes 1.49x
+  to 1.61x and 1.47x to 1.49x. This change does not touch the work on the rows. Creating 1,000 relationships (0.63x to
+  0.65x) and merging 1,000 new nodes (0.13x to 0.15x) are under it, as they were.
+- **With a parameter that differs, 19 of the 23 are under the bar** (15 before, and one at it). The text is the same
+  each time, so smaltdb finds it: setting 1 property 1.18x to 1.45x before and 0.60x to 0.68x now, deleting 1 node 0.94x
+  to 1.07x and 0.63x to 0.67x, creating 1 relationship 1.33x to 1.38x and 0.69x to 0.77x, merging a node that is there
+  1.04x to 1.23x and 0.57x to 0.66x. Creating 1 node is faster and still over it: 1.90x to 2.57x and 1.32x to 1.45x. The
+  other three over it are writes of 1,000 rows: creating 1,000 nodes 1.43x to 1.52x, setting 1,000 properties 4.71x to
+  5.67x, deleting 1,000 nodes 2.03x to 2.45x.
+- **With a literal that differs, nothing is gained, and the reads that take least read higher.** Every text is new, so
+  it is parsed either way. Of the 23 lines, 22 have ranges that overlap before and now; 1 hop does not (0.45x to 0.48x
+  and 0.53x to 0.59x). By the medians of the four turns the reads that take least are all higher: seek by name 1.01x and
+  1.10x (0.96x to 1.09x, and 1.06x to 1.16x: over the bar in every turn now, where it was at it), 2 hops 0.32x and
+  0.36x, a node of a small label 0.83x and 0.88x. The writes do not move: creating 1 node 1.98x to 2.24x and 1.97x to
+  2.34x, setting 1 property 1.22x to 1.41x and 1.23x to 1.40x. Seven lines are over the bar with a literal: seek by
+  name, creating 1 node, 1,000 nodes and 1 relationship, setting 1 property and 1,000 properties, and deleting 1,000
+  nodes.
+  - **Looked at further.** The benchmark times a case's first 200 statements, after 20 that warm it up, the engines
+    taking turns in blocks of 10. With 3,000 statements timed (`BENCH_BLOCKS=300`, six runs each way) seek by name with
+    a literal reads 0.81x to 0.84x before and 0.88x to 0.92x now, so it is not the first statements alone. Then the two
+    ways were compared with each other in one process, each on a smaltdb database of its own, taking turns in blocks of
+    100 statements (three runs of 60 pairs of blocks; the median of the pairs' ratios, now over before): seek by name
+    1.00x to 1.03x, 1 hop 1.00x to 1.07x, creating 1 node 0.99x to 1.01x, setting 1 property 0.97x to 1.00x. So the
+    benchmark has now at 1.09 times before on seek by name and 1.18 times on 1 hop (the medians of the four turns), and
+    the two ways side by side have it at 1.00 to 1.07 times. The two differ in what a statement on smaltdb comes
+    between: statements on smaltcy's engine, every 10, in the benchmark, and statements on the other database, every
+    100, side by side. Which an application is like is not known.
+  - **Where the time is.** A profile of the two ways in that process (34,000 seeks by name each way, every text new; on
+    smaltdb's `main` before stenhoor/smaltdb#305, where now read 1.04x to 1.17x of before) has the engine's run of the
+    statement the same in both (222 and 221 ms) and the Cypher's parse and bind the same (291 and 284 ms). The rest is
+    99 ms before and 137 ms now. Making the statement's shape is 58 and 60 ms of it. The other 41 and 77 ms are what
+    keeps and finds statements, here before and in smaltdb now: the text is looked up among those kept, a statement is
+    made for it, and its shape is looked up. No one function has the difference. Two things changed after that profile,
+    and the series has both: stenhoor/smaltdb#305, and the test for a read of the past (`readsThePast`), 14.5 of the 77
+    ms, which no longer makes strings (7.9 ms over 44,000 statements in a later profile).
+  - **What is left to take** is the parse: the Cypher's parse and bind are 284 of the 643 ms now, for a text whose shape
+    smaltdb already has. Finding such a statement from its text without parsing it is not built.

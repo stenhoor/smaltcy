@@ -59,9 +59,12 @@ installs the tarball with `npm install --no-save`, so it never reaches `package.
 smaltdb change, run `node scripts/fetch-packed.mjs --local smaltdb=../smaltdb`. When 0.9.0 is published, the script
 and `packed.json` are deleted and the pin becomes a dependency.
 
-`src/smaltdb` imports smaltdb's types only (`import type … from 'smaltdb/engine'`) and builds its plans as data, so
-smaltdb is not a runtime dependency; it isn't an entry point yet, and the build leaves it out. Tests run smaltdb from
-the source in its packed build (`smaltdb-src/…`, aliased in `vitest.config.ts`). `test/smaltdb-differential.test.ts`
+`src/smaltdb` imports smaltdb's types only (`import type … from 'smaltdb/engine'` and `'smaltdb/language'`) and builds
+its plans as data, so smaltdb is not a runtime dependency; it isn't an entry point yet, and the build leaves it out.
+Cypher is a language registered with smaltdb (`cypherLanguage`, `src/smaltdb/language.ts`): whoever has the engine
+registers it (the tests in `test/helpers/smaltdb.ts`, each benchmark at its top), and `runOnSmaltdb` gives smaltdb a
+statement's text. smaltdb keeps statements; nothing here does. Tests run smaltdb from the source in its packed build
+(`smaltdb-src/…`, aliased in `vitest.config.ts`). `test/smaltdb-differential.test.ts`
 runs the Cypher read cases on both engines: a case the compiler can't compile yet is listed there, and refused with
 `Unsupported`, never answered differently.
 
