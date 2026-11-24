@@ -6,6 +6,9 @@ describe('syntax errors', () => {
     ['MATCH (n RETURN n', /Expected '\)'/],
     ['MATCH (n) RETURN', /Expected an expression/],
     ["RETURN 'abc", /Unterminated string/],
+    // Without the check the lexer started over from the text's start, for ever.
+    ['RETURN $`abc', /Unterminated \$`name`/],
+    ['RETURN $`', /Unterminated \$`name`/],
     ['MATCH (a)<-[:R]->(b) RETURN a', /one direction/],
     ['FOO (n)', /Expected a clause/],
   ])('%s', (text, msg) => {

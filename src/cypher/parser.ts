@@ -132,6 +132,7 @@ export function lex(src: string): Token[] {
       i++;
       if (src[i] === '`') {
         const e = src.indexOf('`', i + 1);
+        if (e < 0) syntaxError(src, start, 'Unterminated $`name`');
         out.push({ k: 'param', v: src.slice(i + 1, e), start, end: e + 1 });
         i = e + 1;
         continue;
