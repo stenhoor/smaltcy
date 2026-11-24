@@ -211,6 +211,223 @@ export function readsThePast(src: string): boolean {
   return isKeyword(src, from, to, 'version') || isKeyword(src, from, to, 'time');
 }
 
+/** A string, a number, and a number written with a point or an exponent (a float, even where its value is whole). */
+export const LIT_STRING = 1;
+export const LIT_NUMBER = 2;
+export const LIT_FLOAT = 3;
+
+/** A statement's strings and numbers, as `scanLiterals` finds them. */
+export interface LiteralScan {
+  /** How many there are. */
+  count: number;
+  /** A number that statements differing only in their strings and numbers share: of the text outside them, and of each one's kind. */
+  hash: number;
+  /** Where each one starts and ends in the text. */
+  readonly start: number[];
+  readonly end: number[];
+  /** Each one's kind: `LIT_STRING`, `LIT_NUMBER` or `LIT_FLOAT`. */
+  readonly kind: number[];
+  /** Each one's value, as its token has it: a number's has no sign (a `-` before it is a token of its own). */
+  readonly value: (string | number)[];
+}
+
+const isDigit = (c: number): boolean => c >= 48 && c <= 57;
+const isWordStart = (c: number): boolean => (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
+const isWord = (c: number): boolean => isWordStart(c) || isDigit(c);
+const isHexDigit = (c: number): boolean => isDigit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102);
+
+/** What follows a `\` in a string, by its character code (`lex`'s table), or undefined. */
+function escaped(c: number): string | undefined {
+  switch (c) {
+    case 110: return '\n';
+    case 116: return '\t';
+    case 114: return '\r';
+    case 98: return '\b';
+    case 102: return '\f';
+    case 92: return '\\';
+    case 39: return "'";
+    case 34: return '"';
+    default: return undefined;
+  }
+}
+
+/**
+ * The strings and numbers of a statement, found without making its tokens: read as `lex` reads them, so each is one
+ * of `lex`'s `str` or `num` tokens, with that token's place and value, and nothing else of the text is one. What can
+ * tell a statement from its text alone asks this (src/smaltdb/template.ts).
+ *
+ * False for a text `lex` refuses, for one with a number that isn't finite, and for one with more than `max` strings
+ * and numbers: `out` is then not to be read.
+ */
+export function scanLiterals(src: string, out: LiteralScan, max: number): boolean {
+  const n = src.length;
+  let i = 0;
+  let count = 0;
+  let hash = 0;
+  /** Where the text after the last string or number starts. */
+  let from = 0;
+  while (i < n) {
+    const c = src.charCodeAt(i);
+    // A space, a tab, a line end.
+    if (c === 32 || (c >= 9 && c <= 13)) {
+      i++;
+      continue;
+    }
+    if (isWordStart(c)) {
+      i++;
+      while (i < n && isWord(src.charCodeAt(i))) i++;
+      continue;
+    }
+    const after = src.charCodeAt(i + 1);
+    if (isDigit(c) || (c === 46 && isDigit(after))) {
+      const start = i;
+      let value: number;
+      let float = false;
+      if (c === 48 && (after === 120 || after === 88)) {
+        i += 2;
+        while (i < n && isHexDigit(src.charCodeAt(i))) i++;
+        value = parseInt(src.slice(start + 2, i), 16);
+      } else {
+        while (i < n && isDigit(src.charCodeAt(i))) i++;
+        // `1..3` is a range, not a float.
+        if (src.charCodeAt(i) === 46 && src.charCodeAt(i + 1) !== 46 && isDigit(src.charCodeAt(i + 1))) {
+          i++;
+          while (i < n && isDigit(src.charCodeAt(i))) i++;
+          float = true;
+        }
+        const e = src.charCodeAt(i);
+        const sign = src.charCodeAt(i + 1);
+        if ((e === 101 || e === 69) && (isDigit(sign) || sign === 43 || sign === 45)) {
+          i += 2;
+          while (i < n && isDigit(src.charCodeAt(i))) i++;
+          float = true;
+        }
+        value = Number(src.slice(start, i));
+      }
+      if (count === max || !Number.isFinite(value)) return false;
+      for (let k = from; k < start; k++) hash = (Math.imul(hash, 31) + src.charCodeAt(k)) | 0;
+      const kind = float ? LIT_FLOAT : LIT_NUMBER;
+      hash = (Math.imul(hash, 31) + kind) | 0;
+      out.start[count] = start;
+      out.end[count] = i;
+      out.kind[count] = kind;
+      out.value[count] = value;
+      count++;
+      from = i;
+      continue;
+    }
+    if (c === 39 || c === 34) {
+      const start = i;
+      i++;
+      /** The string so far, once it has an escape; `run`: where the characters not yet added to it start. */
+      let value: string | undefined;
+      let run = i;
+      for (;;) {
+        if (i >= n) return false;
+        const d = src.charCodeAt(i);
+        if (d === c) break;
+        if (d !== 92) {
+          i++;
+          continue;
+        }
+        value = (value ?? '') + src.slice(run, i);
+        const e = src.charCodeAt(i + 1);
+        if (e === 117) {
+          value += String.fromCharCode(parseInt(src.slice(i + 2, i + 6), 16));
+          i += 6;
+        } else {
+          const to = escaped(e);
+          if (to === undefined) return false;
+          value += to;
+          i += 2;
+        }
+        run = i;
+      }
+      const text = value === undefined ? src.slice(run, i) : value + src.slice(run, i);
+      i++;
+      if (count === max) return false;
+      for (let k = from; k < start; k++) hash = (Math.imul(hash, 31) + src.charCodeAt(k)) | 0;
+      hash = (Math.imul(hash, 31) + LIT_STRING) | 0;
+      out.start[count] = start;
+      out.end[count] = i;
+      out.kind[count] = LIT_STRING;
+      out.value[count] = text;
+      count++;
+      from = i;
+      continue;
+    }
+    switch (c) {
+      case 96: // A `name`.
+        i++;
+        for (;;) {
+          if (i >= n) return false;
+          if (src.charCodeAt(i) !== 96) i++;
+          else if (src.charCodeAt(i + 1) === 96) i += 2;
+          else break;
+        }
+        i++;
+        continue;
+      case 36: // A parameter.
+        i++;
+        if (src.charCodeAt(i) === 96) {
+          const e = src.indexOf('`', i + 1);
+          if (e < 0) return false;
+          i = e + 1;
+        } else {
+          const first = i;
+          while (i < n && isWord(src.charCodeAt(i))) i++;
+          if (i === first) return false;
+        }
+        continue;
+      case 47: // A comment, or a division.
+        if (after === 47) {
+          while (i < n && src.charCodeAt(i) !== 10) i++;
+        } else if (after === 42) {
+          const e = src.indexOf('*/', i + 2);
+          if (e < 0) return false;
+          i = e + 2;
+        } else i++;
+        continue;
+      // Punctuation, as `lex` takes it: the longest of `PUNCT` that starts here. What a mark of two characters
+      // takes with it starts no token of its own (the second point of `..` starts no number, the `=` of `<=` no `=~`).
+      case 46: // `.` or `..`
+        i += after === 46 ? 2 : 1;
+        continue;
+      case 60: // `<`, `<>`, `<=` or `<-`
+        i += after === 62 || after === 61 || after === 45 ? 2 : 1;
+        continue;
+      case 62: // `>` or `>=`
+      case 43: // `+` or `+=`
+        i += after === 61 ? 2 : 1;
+        continue;
+      case 45: // `-` or `->`
+        i += after === 62 ? 2 : 1;
+        continue;
+      case 61: // `=` or `=~`: a `~` is nothing alone.
+        i += after === 126 ? 2 : 1;
+        continue;
+      case 33: // `!=`: a `!` is nothing alone.
+        if (after !== 61) return false;
+        i += 2;
+        continue;
+      // ( ) [ ] { } , : | ; * % ^
+      case 40: case 41: case 91: case 93: case 123: case 125: case 44: case 58: case 124: case 59: case 42: case 37: case 94:
+        i++;
+        continue;
+    }
+    // Any other white space, as `lex` tells it; nothing else starts a token.
+    if (c > 127 && /\s/.test(src[i]!)) {
+      i++;
+      continue;
+    }
+    return false;
+  }
+  for (let k = from; k < n; k++) hash = (Math.imul(hash, 31) + src.charCodeAt(k)) | 0;
+  out.count = count;
+  out.hash = hash;
+  return true;
+}
+
 const CLAUSE_START = new Set(['MATCH', 'OPTIONAL', 'UNWIND', 'WITH', 'RETURN', 'CREATE', 'MERGE', 'SET', 'REMOVE', 'DELETE', 'DETACH', 'UNION']);
 
 export function parse(src: string): Statement {
