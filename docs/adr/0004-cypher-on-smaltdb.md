@@ -335,15 +335,17 @@ what a shape is).
   itself (`compile.ts`, `write-plan.ts`) still reads graph plans and nothing else.
 - **Measured** (docs/research/benchmarks.md, "Cypher as a language of smaltdb"; smaltdb's time over smaltcy's, `main`'s
   way and this one in turns on the same smaltdb, four turns each, three for the reads). With the same text every run, 25
-  of the 28 queries and writes are under the bar, from 20: creating 1 node 1.54x to 1.60x before and 0.76x to 0.83x now,
-  1 relationship 1.25x to 1.34x and 0.61x to 0.64x, setting 1 property 1.09x to 1.13x and 0.43x, merging a node that is
-  there 1.00x to 1.05x and 0.47x to 0.48x, a small label's nodes returned 1.11x to 1.18x and 0.52x to 0.57x. smaltdb
-  does not parse a text it has kept; smaltcy's engine compiles every statement. With a parameter that differs, 19 of 23
-  are under it, from 15. With a literal that differs every text is new and nothing is gained, and the reads that take
-  least read higher in the benchmark: 1 hop 0.45x to 0.48x and 0.53x to 0.59x, seek by name 0.96x to 1.09x and 1.06x to
-  1.16x, which is over the bar now. Compared with each other in one process the two ways take the same time on them
-  (1.00x to 1.07x). The writes of 1,000 rows are where they were (creating 1,000 nodes 1.11x to 1.27x, setting 1,000
-  properties 2.11x to 2.31x, deleting 1,000 nodes 1.47x to 1.49x).
+  of the 28 queries and writes are under the bar, from 20: creating 1 node 1.55x to 1.71x before and 0.73x to 0.86x now,
+  1 relationship 1.31x to 1.37x and 0.63x to 0.69x, setting 1 property 1.14x to 1.21x and 0.43x to 0.48x, merging a node
+  that is there 1.01x to 1.11x and 0.45x to 0.55x, a small label's nodes returned 1.03x to 1.16x and 0.50x to 0.56x.
+  smaltdb does not parse a text it has kept; smaltcy's engine compiles every statement. With a parameter that differs,
+  19 of 23 are under it, from 15. With a literal that differs every text is new and nothing is gained, and three reads
+  that take little read higher in the benchmark, under the bar both ways: 1 hop 0.45x to 0.51x and 0.53x to 0.59x, 2
+  hops 0.30x to 0.31x and 0.32x to 0.35x, 2 hops with a relationship filter 0.63x to 0.66x and 0.67x to 0.72x. Seek by
+  name with a literal is over the bar both ways (1.03x to 1.08x and 1.01x to 1.19x). Compared with each other in one
+  process, before the pin's commit was there, the two ways took the same time on seek by name and 1 hop (1.00x to
+  1.07x). The writes of 1,000 rows are where they were (creating 1,000 nodes 1.11x to 1.26x, setting 1,000 properties
+  1.81x to 2.22x, deleting 1,000 nodes 1.29x to 1.54x).
 
 **A statement told from its text** (`src/smaltdb/template.ts`; `scanLiterals`, beside the parser; since 2026-11-24).
 Given every statement as text, smaltdb finds one whose text it has kept, and one whose text is new was parsed, bound and
