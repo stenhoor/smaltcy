@@ -100,6 +100,71 @@ export function graphTablesFor(data: GraphData, graph = 'graph'): GraphTables {
   );
 }
 
+/** The name Cypher is registered with smaltdb under (language.ts): `db.query(text, params, { language: LANGUAGE })`. */
+export const LANGUAGE = 'cypher';
+
+/** A property graph as smaltdb's catalog describes it: what `graphTablesIn` reads of it. */
+interface CatalogGraph {
+  readonly name: string;
+  readonly nodes: readonly { readonly label: string; readonly table: string }[];
+  readonly edges: readonly { readonly type: string; readonly table: string }[];
+  readonly labels?: { readonly table: string };
+  readonly history?: 'versions' | 'log';
+}
+
+/** smaltdb's catalog, as far as a graph's tables are read from it: `Database.catalog`, or a bind context's. */
+export interface GraphCatalog {
+  graphs(): readonly CatalogGraph[];
+}
+
+/** A graph made as `schemaStatements` makes one: every node in one table under the reserved label, with a label index. */
+const isOurs = (g: CatalogGraph): boolean => g.labels !== undefined && g.nodes.some((n) => n.label === NODE_LABEL);
+
+/** What was read of a catalog's graph: the catalog gives the same description until the schema changes. */
+const tablesOfGraph = new WeakMap<CatalogGraph, GraphTables>();
+
+/**
+ * A graph's tables as smaltdb's catalog has them now, with the labels and types that statements added: the graph
+ * named, or the database's only graph made for Cypher. A relationship's rowid is its id (`relationshipIds`): smaltdb
+ * gives each new relationship one no other of the graph has.
+ */
+export function graphTablesIn(catalog: GraphCatalog, graph?: string): GraphTables {
+  const all = catalog.graphs();
+  // Asked for every statement: the database's one graph, read before, is the common case.
+  if (graph === undefined && all.length === 1) {
+    const read = tablesOfGraph.get(all[0]!);
+    if (read !== undefined) return read;
+  }
+  let g: CatalogGraph | undefined;
+  if (graph !== undefined) {
+    const lower = graph.toLowerCase();
+    g = all.find((x) => x.name.toLowerCase() === lower);
+    if (g === undefined) throw new SmaltcyError('SMALTCY_NOT_FOUND', `The database has no property graph ${graph}`);
+    if (!isOurs(g)) unsupported(`The property graph ${g.name} was not made for Cypher (schemaStatements makes one)`);
+  } else {
+    for (const x of all) {
+      if (!isOurs(x)) continue;
+      if (g !== undefined) throw new SmaltcyError('SMALTCY_NOT_FOUND', `The database has more than one graph made for Cypher (${g.name}, ${x.name}): register Cypher for one of them by name`);
+      g = x;
+    }
+    if (g === undefined) throw new SmaltcyError('SMALTCY_NOT_FOUND', 'The database has no graph made for Cypher (schemaStatements makes one)');
+  }
+  let t = tablesOfGraph.get(g);
+  if (t === undefined) {
+    t = {
+      graph: g.name,
+      nodes: g.nodes.find((n) => n.label === NODE_LABEL)!.table,
+      labels: g.labels!.table,
+      labelTables: new Map(g.nodes.filter((n) => n.label !== NODE_LABEL).map((n) => [n.label, n.table])),
+      types: new Map(g.edges.map((e) => [e.type, e.table])),
+      relationshipIds: true,
+      ...(g.history ? { history: g.history } : {}),
+    };
+    tablesOfGraph.set(g, t);
+  }
+  return t;
+}
+
 const schema = (op: plan.SchemaOp): PlanStatementInput => ({ kind: 'schema', op }) as PlanStatementInput;
 
 /**

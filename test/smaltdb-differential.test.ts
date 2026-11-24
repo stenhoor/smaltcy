@@ -27,17 +27,18 @@ const UNSUPPORTED = new Map<string, string>([
 
 /**
  * Runs a Cypher query on smaltdb: its rows as objects keyed by column, as `Graph.query` gives them. Compiled as
- * written, and then as an application's query runs (`runOnSmaltdb`: by its shape, src/smaltdb/shape.ts), twice, the
- * second time with the statement kept: the same rows each way.
+ * written and given to smaltdb as a plan, and then as an application's query runs (`runOnSmaltdb`: smaltdb is given
+ * its text, in the language registered with it), twice, the second time with the statement kept: the same rows each
+ * way.
  */
 function onSmaltdb(db: Database, tables: GraphTables, cypher: string, params: Record<string, unknown> = {}, options: CompileOptions = {}) {
   const q = compileQuery(compile(cypher).plan, tables, { ...options, params });
   const r = db.queryPlan(q.statement, paramValues(q, params) as never);
   if (Object.keys(options).length === 0) {
     for (let i = 0; i < 2; i++) {
-      const s = runOnSmaltdb(db, compile(cypher).plan, tables, { params });
-      expect(s.columns, `${cypher}: by its shape`).toEqual(q.columns);
-      expect(s.rows, `${cypher}: by its shape`).toEqual(r.rows);
+      const s = runOnSmaltdb(db, cypher, { params });
+      expect(s.columns, `${cypher}: as text`).toEqual(q.columns);
+      expect(s.rows, `${cypher}: as text`).toEqual(r.rows);
     }
   }
   return r.rows.map((row) => Object.fromEntries(q.columns.map((c, i) => [c, row[i]])));
@@ -511,7 +512,7 @@ function seekable(): { db: Database; tables: GraphTables } {
   g.run("UNWIND range(1, 200) AS i CREATE (:T {k: 'more', v: i + 5000})");
   g.run("UNWIND range(1, 500) AS i CREATE (:U {k: 'filler', v: i + 1000})");
   const { db, tables } = both(g);
-  runOnSmaltdb(db, compile('CREATE INDEX FOR (n:T) ON (n.v)').plan, tables);
+  runOnSmaltdb(db, 'CREATE INDEX FOR (n:T) ON (n.v)');
   return { db, tables };
 }
 
@@ -560,7 +561,7 @@ describe('comparisons with literals: both engines give the same rows', () => {
     h.run(KINDS);
     h.run("UNWIND range(1, 500) AS i CREATE (:U {k: 'filler', v: i + 1000})");
     const { db: idb, tables: it } = both(h);
-    runOnSmaltdb(idb, compile('CREATE INDEX FOR (n:T) ON (n.v)').plan, it);
+    runOnSmaltdb(idb, 'CREATE INDEX FOR (n:T) ON (n.v)');
     for (const [, cypher] of cases) expect(onSmaltdb(idb, it, cypher), cypher).toEqual(h.query(cypher));
     // The seek, where the label has more nodes than these 17: so few, smaltdb reads from its graph index, which
     // costs it less than a seek (its ADR 0041).
@@ -611,7 +612,7 @@ describe('comparisons with parameters: both engines give the same rows', () => {
     h.run(KINDS);
     h.run("UNWIND range(1, 500) AS i CREATE (:U {k: 'filler', v: i + 1000})");
     const { db: idb, tables: it } = both(h);
-    runOnSmaltdb(idb, compile('CREATE INDEX FOR (n:T) ON (n.v)').plan, it);
+    runOnSmaltdb(idb, 'CREATE INDEX FOR (n:T) ON (n.v)');
     for (const [name, cypher, x] of all) expect(onSmaltdb(idb, it, cypher, { x }), name).toEqual(h.query(cypher, { x }));
     // The seek, where the label has more nodes than these 17 (see the same test with literals).
     const { db: sdb, tables: st } = seekable();

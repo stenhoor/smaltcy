@@ -16,13 +16,16 @@
  */
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { Database } from 'smaltdb-src/engine/database.js';
-import { compile } from '../src/cypher/index.js';
+import { registerLanguage } from 'smaltdb-src/engine/plan/language.js';
 import { network } from '../src/datasets/index.js';
 import { dumpGraph } from '../src/engine/io.js';
 import { open } from '../src/index.js';
-import { graphTablesFor, loadStatements, schemaStatements, type GraphTables } from '../src/smaltdb/schema.js';
+import { cypherLanguage } from '../src/smaltdb/language.js';
+import { graphTablesFor, loadStatements, schemaStatements } from '../src/smaltdb/schema.js';
 import { indexStatement, runOnSmaltdb } from '../src/smaltdb/write.js';
 import { median } from './timing.js';
+
+registerLanguage(cypherLanguage());
 
 const PEOPLE = Number(process.env.BENCH_PEOPLE ?? 20000);
 const BLOCKS = Number(process.env.BENCH_BLOCKS ?? 20);
@@ -62,7 +65,7 @@ const raw = dumpGraph(mem.store);
 const ids: number[] = [];
 mem.store.scanRels(null, (id) => void ids.push(id));
 const data = { ...raw, relationships: raw.relationships.map((r, i) => ({ ...r, id: ids[i]! })) };
-let tables: GraphTables = graphTablesFor(data);
+const tables = graphTablesFor(data);
 const db = Database.openMemory();
 for (const st of [...schemaStatements(tables), ...loadStatements(data, tables)]) db.queryPlan(st);
 for (const ix of raw.indexes ?? []) db.queryPlan(indexStatement({ kind: 'createIndex', label: ix.label, key: ix.key } as never, tables));
@@ -199,8 +202,7 @@ const onMem = (cypher: string, params?: Params): Outcome => {
   return { rows: r.rows, counts: r.counts };
 };
 const onDb = (cypher: string, params?: Params): Outcome => {
-  const r = runOnSmaltdb(db, compile(cypher).plan, tables, params ? { params } : {});
-  tables = r.tables;
+  const r = runOnSmaltdb(db, cypher, params ? { params } : {});
   return { rows: r.rows, counts: r.counts };
 };
 type Engine = (cypher: string, params?: Params) => Outcome;

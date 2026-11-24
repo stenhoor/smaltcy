@@ -157,6 +157,59 @@ export function lex(src: string): Token[] {
   return out;
 }
 
+/** Where the next token starts, at or after `i`: past white space and comments, as `lex` passes them. */
+function tokenStart(src: string, i: number): number {
+  const n = src.length;
+  while (i < n) {
+    const c = src.charCodeAt(i);
+    // A space, a tab, a line end; any other white space as `lex` tells it.
+    if (c === 32 || (c >= 9 && c <= 13) || (c > 127 && /\s/.test(src[i]!))) i++;
+    else if (c === 47 && src.charCodeAt(i + 1) === 47) {
+      while (i < n && src.charCodeAt(i) !== 10) i++;
+    } else if (c === 47 && src.charCodeAt(i + 1) === 42) {
+      const e = src.indexOf('*/', i + 2);
+      if (e < 0) return n;
+      i = e + 2;
+    } else break;
+  }
+  return i;
+}
+
+/** Where the plain word that starts at `i` ends (`i` where none does): letters, digits after the first, `_`. */
+function wordEnd(src: string, i: number): number {
+  const n = src.length;
+  for (let k = i; k < n; k++) {
+    const c = src.charCodeAt(k);
+    const letter = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95;
+    if (!letter && !(k > i && c >= 48 && c <= 57)) return k;
+  }
+  return n;
+}
+
+/** Whether `src` from `from` to `to` is the keyword `kw` (given in lower case), in any case. */
+function isKeyword(src: string, from: number, to: number, kw: string): boolean {
+  if (to - from !== kw.length) return false;
+  for (let k = 0; k < kw.length; k++) if ((src.charCodeAt(from + k) | 32) !== kw.charCodeAt(k)) return false;
+  return true;
+}
+
+/**
+ * Whether a statement reads the past: it opens with `AT VERSION` or `AT TIME`, after `EXPLAIN` where it has one
+ * (`Parser.statement`). Told from its first words alone, read as `lex` reads them, so what runs a statement can tell
+ * without parsing it (src/smaltdb/write.ts): it is asked of every statement, and makes nothing.
+ */
+export function readsThePast(src: string): boolean {
+  let from = tokenStart(src, 0);
+  let to = wordEnd(src, from);
+  if (isKeyword(src, from, to, 'explain')) {
+    from = tokenStart(src, to);
+    to = wordEnd(src, from);
+  }
+  if (!isKeyword(src, from, to, 'at')) return false;
+  from = tokenStart(src, to);
+  to = wordEnd(src, from);
+  return isKeyword(src, from, to, 'version') || isKeyword(src, from, to, 'time');
+}
 
 const CLAUSE_START = new Set(['MATCH', 'OPTIONAL', 'UNWIND', 'WITH', 'RETURN', 'CREATE', 'MERGE', 'SET', 'REMOVE', 'DELETE', 'DETACH', 'UNION']);
 

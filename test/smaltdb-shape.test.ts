@@ -1,133 +1,130 @@
 import { describe, expect, test } from 'vitest';
 import type { Database } from 'smaltdb-src/engine/database.js';
-import { compile } from '../src/cypher/index.js';
 import { open, type Graph } from '../src/index.js';
 import { Unsupported } from '../src/smaltdb/compile.js';
-import type { GraphTables } from '../src/smaltdb/schema.js';
-import { keptShapes } from '../src/smaltdb/shape.js';
-import { runOnSmaltdb, type SmaltdbDatabase } from '../src/smaltdb/write.js';
+import { runOnSmaltdb } from '../src/smaltdb/write.js';
 import { social } from './helpers/graphs.js';
 import { READ_CASES, READ_PARAMS } from './helpers/read-cases.js';
-import { both } from './helpers/smaltdb.js';
+import { binds, both } from './helpers/smaltdb.js';
 
 /**
- * Queries kept by their shape (src/smaltdb/shape.ts; ADR 0004, "Statements kept by shape"): a query that differs from
- * one run before only in its strings and numbers runs the statement prepared for that one. Each must give the rows
- * smaltcy's engine gives, whichever statement it runs.
+ * Statements kept by their shape (src/smaltdb/shape.ts; ADR 0004, "Statements kept by shape" and "A language of
+ * smaltdb"): a statement that differs from one run before only in its strings and numbers runs what smaltdb kept for
+ * that one, and the language binds nothing for it (`binds`). Each must give the rows smaltcy's engine gives, whatever
+ * it runs.
  */
 
-/** A smaltdb database that counts the statements it is asked to prepare. */
-function counting(db: Database): { db: SmaltdbDatabase; prepared: () => number } {
-  let n = 0;
-  return {
-    db: {
-      queryPlan: (stmt, params) => db.queryPlan(stmt, params as never),
-      preparePlan: (stmt) => {
-        n++;
-        return db.preparePlan(stmt);
-      },
-      get inTransaction() {
-        return db.inTransaction;
-      },
-    },
-    prepared: () => n,
-  };
-}
-
 /** A query's rows on smaltdb as objects keyed by column, as `Graph.query` gives them. */
-function onSmaltdb(db: SmaltdbDatabase, tables: GraphTables, cypher: string, params: Record<string, unknown> = {}) {
-  const r = runOnSmaltdb(db, compile(cypher).plan, tables, { params });
+function onSmaltdb(db: Database, cypher: string, params: Record<string, unknown> = {}) {
+  const r = runOnSmaltdb(db, cypher, { params });
   return r.rows.map((row) => Object.fromEntries(r.columns.map((c, i) => [c, row[i]])));
 }
 
-describe('the read cases, each run twice: by a shape made for it, then by the shape kept', () => {
-  const { db, tables } = both(social());
+/** What smaltdb had bound while `run` ran. */
+function bound(run: () => void): number {
+  const before = binds();
+  run();
+  return binds() - before;
+}
+
+describe('the read cases, each run twice: bound, then by what smaltdb kept', () => {
+  const { db } = both(social());
   test.each(READ_CASES)('%s', (name, cypher, expected) => {
     if (name === 'labels and keys') {
       // Refused (test/smaltdb-differential.test.ts), the second time as the first.
-      for (let i = 0; i < 2; i++) expect(() => onSmaltdb(db, tables, cypher, READ_PARAMS)).toThrow(Unsupported);
+      for (let i = 0; i < 2; i++) expect(() => onSmaltdb(db, cypher, READ_PARAMS)).toThrow(Unsupported);
       return;
     }
-    expect(onSmaltdb(db, tables, cypher, READ_PARAMS)).toEqual(expected);
-    expect(onSmaltdb(db, tables, cypher, READ_PARAMS)).toEqual(expected);
+    expect(onSmaltdb(db, cypher, READ_PARAMS)).toEqual(expected);
+    // The text is one smaltdb has: nothing is bound for it.
+    expect(bound(() => expect(onSmaltdb(db, cypher, READ_PARAMS)).toEqual(expected))).toBe(0);
   });
 });
 
 describe('a query with other values runs the statement kept for its shape', () => {
   const g = social();
   const b = both(g);
-  const same = (db: SmaltdbDatabase, cypher: string, params: Record<string, unknown> = {}) => expect(onSmaltdb(db, b.tables, cypher, params), cypher).toEqual(g.query(cypher, params));
+  const db = b.db;
+  const same = (cypher: string, params: Record<string, unknown> = {}) => expect(onSmaltdb(db, cypher, params), cypher).toEqual(g.query(cypher, params));
 
   test('strings: one statement for every name', () => {
-    const { db, prepared } = counting(b.db);
-    for (const name of ['Ada', 'Alan', 'Grace', 'Nobody', '', "O'Hara", 'Ada']) same(db, `MATCH (p:Person {name: ${JSON.stringify(name)}}) RETURN p.born AS born`);
-    expect(prepared()).toBe(1);
+    const n = bound(() => {
+      for (const name of ['Ada', 'Alan', 'Grace', 'Nobody', '', "O'Hara", 'Ada']) same(`MATCH (p:Person {name: ${JSON.stringify(name)}}) RETURN p.born AS born`);
+    });
+    expect(n).toBe(1);
   });
 
   test('numbers: one statement for whole numbers, one for floats', () => {
-    const { db, prepared } = counting(b.db);
-    for (const year of [1815, 1912, 0, -3, 2000]) same(db, `MATCH (p:Person) WHERE p.born < ${year} RETURN p.name AS name ORDER BY name`);
-    expect(prepared()).toBe(1);
-    for (const year of [1815.5, 1912.25, -0.5]) same(db, `MATCH (p:Person) WHERE p.born < ${year} RETURN p.name AS name ORDER BY name`);
-    expect(prepared()).toBe(2);
+    const q = (year: number) => `MATCH (p:Person) WHERE p.born < ${year} RETURN p.name AS name ORDER BY name`;
+    expect(bound(() => [1815, 1912, 0, -3, 2000].forEach((year) => same(q(year))))).toBe(1);
+    expect(bound(() => [1815.5, 1912.25, -0.5].forEach((year) => same(q(year))))).toBe(1);
   });
 
-  test('a value of another kind is another shape', () => {
-    const { db, prepared } = counting(b.db);
-    for (const v of ["'Ada'", '1912', '1912.5', 'true', 'null', "'Alan'", '1815', '0.25', 'false']) same(db, `MATCH (p:Person) WHERE p.name = ${v} OR p.born = ${v} RETURN p.name AS name ORDER BY name`);
-    // Text, whole numbers, floats, true, NULL and false.
-    expect(prepared()).toBe(6);
+  test('a value of another kind is another statement', () => {
+    const n = bound(() => {
+      for (const v of ["'Ada'", '1912', '1912.5', 'true', 'null', "'Alan'", '1815', '0.25', 'false']) same(`MATCH (p:Person) WHERE p.name = ${v} OR p.born = ${v} RETURN p.name AS name ORDER BY name`);
+    });
+    // Text, whole numbers and floats, a shape each; true, NULL and false stay written, each text a statement.
+    expect(n).toBe(6);
   });
 
   test('several values, and the same value twice', () => {
-    const { db, prepared } = counting(b.db);
-    for (const [x, y, z] of [['Ada', 1900, 'a'], ['Grace', 1815, 'b'], ['Ada', 1, 'Ada']] as const) {
-      same(db, `MATCH (p:Person {name: '${x}'}) WHERE p.born > ${y} OR p.name < '${z}' RETURN p.name AS name, '${z}' AS z, ${y} + 1 AS y ORDER BY name`);
-    }
-    expect(prepared()).toBe(1);
+    const n = bound(() => {
+      for (const [x, y, z] of [['Ada', 1900, 'a'], ['Grace', 1815, 'b'], ['Ada', 1, 'Ada']] as const) {
+        same(`MATCH (p:Person {name: '${x}'}) WHERE p.born > ${y} OR p.name < '${z}' RETURN p.name AS name, '${z}' AS z, ${y} + 1 AS y ORDER BY name`);
+      }
+    });
+    expect(n).toBe(1);
   });
 
   test('a list or a map the query builds stays written: another list is another statement', () => {
-    const { db, prepared } = counting(b.db);
-    for (const [x, y, z] of [['Ada', 1900, 'a'], ['Grace', 1815, 'b'], ['Ada', 1, 'Ada']] as const) {
-      same(db, `MATCH (p:Person) WHERE p.name IN ['${x}', '${z}'] RETURN p.name AS name, {k: '${x}', n: ${y}} AS m, ['${z}', ${y}, []] AS l ORDER BY name`);
-    }
-    expect(prepared()).toBe(3);
+    const lists = bound(() => {
+      for (const [x, y, z] of [['Ada', 1900, 'a'], ['Grace', 1815, 'b'], ['Ada', 1, 'Ada']] as const) {
+        same(`MATCH (p:Person) WHERE p.name IN ['${x}', '${z}'] RETURN p.name AS name, {k: '${x}', n: ${y}} AS m, ['${z}', ${y}, []] AS l ORDER BY name`);
+      }
+    });
+    expect(lists).toBe(3);
     // The lists the same and a value beside them another: one statement.
-    for (const year of [1900, 1815, 1]) same(db, `MATCH (p:Person) WHERE p.name IN ['Ada', 'Alan'] AND p.born > ${year} RETURN p.name AS name, [1, []] AS l ORDER BY name`);
-    expect(prepared()).toBe(4);
+    const beside = bound(() => {
+      for (const year of [1900, 1815, 1]) same(`MATCH (p:Person) WHERE p.name IN ['Ada', 'Alan'] AND p.born > ${year} RETURN p.name AS name, [1, []] AS l ORDER BY name`);
+    });
+    expect(beside).toBe(1);
     // Lists of lists with an empty one among them, whose elements smaltdb types by what is written.
-    same(db, 'UNWIND [[1, 2], [1], [], [2, 0], [1, null]] AS x RETURN min(x) AS lo, max(x) AS hi');
+    same('UNWIND [[1, 2], [1], [], [2, 0], [1, null]] AS x RETURN min(x) AS lo, max(x) AS hi');
   });
 
-  test('parameters: one statement for values of one kind, another for another kind', () => {
-    const { db, prepared } = counting(b.db);
+  test('parameters: bound once for values of one kind, again for another kind', () => {
     const cypher = 'MATCH (p:Person) WHERE p.name = $x OR p.born = $x RETURN p.name AS name ORDER BY name';
-    for (const x of ['Ada', 'Alan', 'Nobody']) same(db, cypher, { x });
-    expect(prepared()).toBe(1);
-    for (const x of [1912, 1815]) same(db, cypher, { x });
-    expect(prepared()).toBe(2);
-    for (const x of [null, true, 1912.5, NaN, 'Grace']) same(db, cypher, { x });
-    expect(prepared()).toBe(6);
+    expect(bound(() => ['Ada', 'Alan', 'Nobody'].forEach((x) => same(cypher, { x })))).toBe(1);
+    expect(bound(() => [1912, 1815].forEach((x) => same(cypher, { x })))).toBe(1);
+    // NULL, a boolean, a float and NaN are four more; a text is the first again.
+    expect(bound(() => [null, true, 1912.5, NaN, 'Grace'].forEach((x) => same(cypher, { x })))).toBe(4);
   });
 
   test('a parameter and values written in the query together', () => {
-    const { db, prepared } = counting(b.db);
-    for (const [year, name] of [[1900, 'Ada'], [1930, 'Grace'], [1800, 'Edsger']] as const) {
-      same(db, `MATCH (p:Person) WHERE p.born < $year AND p.name <> '${name}' RETURN p.name AS name ORDER BY name`, { year });
-    }
-    expect(prepared()).toBe(1);
+    const n = bound(() => {
+      for (const [year, name] of [[1900, 'Ada'], [1930, 'Grace'], [1800, 'Edsger']] as const) {
+        same(`MATCH (p:Person) WHERE p.born < $year AND p.name <> '${name}' RETURN p.name AS name ORDER BY name`, { year });
+      }
+    });
+    expect(n).toBe(1);
+    // The same shape with a year of another kind: bound again, for every name once.
+    const floats = bound(() => {
+      for (const [year, name] of [[1900.5, 'Ada'], [1930.5, 'Grace']] as const) {
+        same(`MATCH (p:Person) WHERE p.born < $year AND p.name <> '${name}' RETURN p.name AS name ORDER BY name`, { year });
+      }
+    });
+    expect(floats).toBe(1);
   });
 
-  test('SKIP and LIMIT are part of the shape: each count its own statement, checked as it is compiled', () => {
-    const { db, prepared } = counting(b.db);
+  test('SKIP and LIMIT are part of what a statement compiles to: each count its own, checked as it is compiled', () => {
     const page = (skip: number | string, limit: number | string) => `MATCH (p:Person) WHERE p.born > 1800 RETURN p.name AS name ORDER BY name SKIP ${skip} LIMIT ${limit}`;
-    same(db, page(0, 2));
-    same(db, page(2, 2));
-    same(db, page(0, 2));
-    expect(prepared()).toBe(2);
-    for (const n of [1, 3]) same(db, page('$s', '$n'), { s: 1, n });
-    expect(prepared()).toBe(4);
+    expect(bound(() => [page(0, 2), page(2, 2), page(0, 2)].forEach((q) => same(q)))).toBe(2);
+    // Counts written out and a year that differs: the shape of each page is kept.
+    const year = (y: number) => page(0, 2).replace('1800', String(y));
+    expect(bound(() => [1810, 1900].forEach((y) => same(year(y))))).toBe(0);
+    // Counts given as parameters: bound for each pair of them.
+    expect(bound(() => [1, 3, 1].forEach((n) => same(page('$s', '$n'), { s: 1, n })))).toBe(2);
     // A count that isn't one fails as it does on smaltcy's engine, after one that is ran.
     for (const bad of [-1, 1.5, 'x']) {
       let mine: unknown;
@@ -137,137 +134,104 @@ describe('a query with other values runs the statement kept for its shape', () =
         mine = e;
       }
       expect(mine, String(bad)).toBeDefined();
-      expect(() => onSmaltdb(db, b.tables, page('$s', '$n'), { s: 0, n: bad }), String(bad)).toThrow((mine as Error).message);
+      for (let i = 0; i < 2; i++) expect(() => onSmaltdb(db, page('$s', '$n'), { s: 0, n: bad }), String(bad)).toThrow((mine as Error).message);
     }
+    same(page('$s', '$n'), { s: 1, n: 3 });
   });
 
-  test('a parameter that is missing fails, after a query that had it ran', () => {
-    const { db } = counting(b.db);
+  test('a parameter that is missing fails, after a query that had it ran, and each time', () => {
     const cypher = "MATCH (p:Person) WHERE p.born < $year AND p.name <> 'Ada' RETURN p.name AS name ORDER BY name";
-    same(db, cypher, { year: 1900 });
-    expect(() => onSmaltdb(db, b.tables, cypher)).toThrow(/year/);
-    same(db, cypher, { year: 1930 });
+    same(cypher, { year: 1900 });
+    for (const params of [{}, { year: undefined }, { other: 1 }, {}]) expect(() => onSmaltdb(db, cypher, params), JSON.stringify(params)).toThrow(/year/);
+    same(cypher, { year: 1930 });
   });
 
-  test('what the compiler needs written out is compiled as written: degree()', () => {
-    const { db, prepared } = counting(b.db);
-    for (const name of ['Alan', 'Ada', 'Grace']) same(db, `MATCH (p:Person {name: '${name}'}) RETURN degree(p) AS all, degree(p, 'out', 'KNOWS') AS knowsOut`);
-    for (const dir of ['in', 'both']) same(db, `MATCH (p:Person {name: 'Alan'}) RETURN degree(p, '${dir}', 'KNOWS') AS n`);
-    // Never by a shape: the statements are smaltdb's, by their text.
-    expect(prepared()).toBe(0);
+  test('what the compiler needs written out is bound as written: degree()', () => {
+    // No shape: each text is a statement of its own, bound once.
+    const texts = ['Alan', 'Ada', 'Grace'].map((name) => `MATCH (p:Person {name: '${name}'}) RETURN degree(p) AS all, degree(p, 'out', 'KNOWS') AS knowsOut`);
+    texts.push(...['in', 'both'].map((dir) => `MATCH (p:Person {name: 'Alan'}) RETURN degree(p, '${dir}', 'KNOWS') AS n`));
+    expect(bound(() => texts.forEach((q) => same(q)))).toBe(5);
+    expect(bound(() => texts.forEach((q) => same(q)))).toBe(0);
   });
 
-  test('more values than a statement takes parameters for: compiled as written', () => {
-    const { db, prepared } = counting(b.db);
-    const many = Array.from({ length: 70 }, (_, i) => `p.born = ${1800 + 2 * i}`);
-    same(db, `MATCH (p:Person) WHERE ${many.join(' OR ')} RETURN p.name AS name ORDER BY name`);
-    expect(prepared()).toBe(0);
-    same(db, `MATCH (p:Person) WHERE ${many.slice(0, 60).join(' OR ')} RETURN p.name AS name ORDER BY name`);
-    expect(prepared()).toBe(1);
+  test('more values than a statement takes parameters for: bound as written', () => {
+    const where = (count: number, from: number) => Array.from({ length: count }, (_, i) => `p.born = ${from + 2 * i}`).join(' OR ');
+    const q = (count: number, from: number) => `MATCH (p:Person) WHERE ${where(count, from)} RETURN p.name AS name ORDER BY name`;
+    // 70 values: each text is bound. 60: one shape.
+    expect(bound(() => [1800, 1801, 1802].forEach((from) => same(q(70, from))))).toBe(3);
+    expect(bound(() => [1800, 1801, 1802].forEach((from) => same(q(60, from))))).toBe(1);
   });
 
   test('shapes with one hash are kept apart: names of one length with the same ends', () => {
-    const { db, prepared } = counting(b.db);
     // The hash takes a name's length and its first and last letter (shape.ts): these three queries have one hash.
     const keys = ['born', 'burn', 'bean'];
-    for (let round = 0; round < 3; round++) {
-      for (const key of keys) same(db, `MATCH (p:Person) RETURN p.name AS name, p.${key} AS x ORDER BY name`);
-      expect(keptShapes(db)).toEqual({ shapes: 3, hashes: 1 });
-    }
-    expect(prepared()).toBe(3);
-    // A value among them, with others of its shape in between.
-    for (const year of [1900, 1815, 1950]) {
-      for (const key of keys) same(db, `MATCH (p:Person) WHERE p.${key} < ${year} RETURN p.name AS name ORDER BY name`);
-    }
-    expect(prepared()).toBe(6);
-    expect(keptShapes(db)).toEqual({ shapes: 6, hashes: 2 });
+    const n = bound(() => {
+      for (const year of [1900, 1815, 1950]) {
+        for (const key of keys) same(`MATCH (p:Person) WHERE p.${key} < ${year} RETURN p.name AS who ORDER BY who`);
+      }
+    });
+    expect(n).toBe(3);
   });
 
   test('0 and -0 written in a list are two shapes: what stays written is compared as it is', () => {
-    const { db, prepared } = counting(b.db);
-    for (let round = 0; round < 2; round++) for (const zero of ['-0.0', '0.0']) onSmaltdb(db, b.tables, `RETURN [1.5, ${zero}] AS l`);
-    expect(prepared()).toBe(2);
+    // A tag beside the list gives the statement a shape: the list is part of it.
+    const q = (zero: string, tag: string) => `RETURN [1.5, ${zero}] AS l, '${tag}' AS tag`;
+    const n = bound(() => {
+      for (const tag of ['a', 'b', 'c']) for (const zero of ['-0.0', '0.0']) onSmaltdb(db, q(zero, tag));
+    });
+    expect(n).toBe(2);
   });
 
-  test('past 256 shapes the oldest goes, and is compiled again when it comes back', () => {
-    const { db, prepared } = counting(b.db);
+  test('past 256 shapes the oldest goes, and is bound again when it comes back', () => {
+    const b = both(social());
     // Each column name is a shape of its own. Some have one hash (a name's length and ends): c10, c20 and c30.
-    const run = (i: number) => expect(onSmaltdb(db, b.tables, `MATCH (p:Person {name: 'Ada'}) RETURN p.born AS c${i}`)).toEqual([{ [`c${i}`]: 1815 }]);
-    for (let i = 0; i <= 256; i++) run(i);
-    expect(prepared()).toBe(257);
-    expect(keptShapes(db).shapes).toBe(256);
-    expect(keptShapes(db).hashes).toBeLessThan(256);
-    // The newest and the oldest left are kept.
-    run(256);
-    run(1);
-    expect(prepared()).toBe(257);
-    // The first went: it is compiled again, and the oldest left goes for it.
-    run(0);
-    expect(prepared()).toBe(258);
-    run(1);
-    expect(prepared()).toBe(259);
+    const run = (i: number, name = 'Ada', born = 1815) => expect(onSmaltdb(b.db, `MATCH (p:Person {name: '${name}'}) RETURN p.born AS c${i}`)).toEqual([{ [`c${i}`]: born }]);
+    expect(bound(() => {
+      for (let i = 0; i <= 256; i++) run(i);
+    })).toBe(257);
+    // The newest and the oldest left are kept: another name runs what was bound for them.
+    expect(bound(() => [256, 1].forEach((i) => run(i, 'Alan', 1912)))).toBe(0);
+    // The first went: it is bound again, and the oldest left goes for it.
+    expect(bound(() => run(0, 'Alan', 1912))).toBe(1);
+    expect(bound(() => run(1, 'Grace', 1906))).toBe(1);
     // Ten more, and c3 to c12 go: c10 from among others of its hash, which stay.
-    for (let i = 300; i < 310; i++) run(i);
-    expect(prepared()).toBe(269);
-    for (const i of [20, 30, 13, 256, 0, 1, 309]) run(i);
-    expect(prepared()).toBe(269);
-    run(10);
-    expect(prepared()).toBe(270);
-    expect(keptShapes(db).shapes).toBe(256);
-  });
-
-  test('a database that can only run statements: the same rows', () => {
-    const plain: SmaltdbDatabase = { queryPlan: (stmt, params) => b.db.queryPlan(stmt, params as never) };
-    for (const name of ['Ada', 'Alan', 'Nobody']) same(plain, `MATCH (p:Person {name: '${name}'})-[:KNOWS]->(q) RETURN q.name AS name ORDER BY name`);
+    expect(bound(() => {
+      for (let i = 300; i < 310; i++) run(i);
+    })).toBe(10);
+    expect(bound(() => [20, 30, 13, 256, 0, 1, 309].forEach((i) => run(i, 'Grace', 1906)))).toBe(0);
+    expect(bound(() => run(10, 'Grace', 1906))).toBe(1);
   });
 });
 
 describe("a write's values are parameters of the statement it runs", () => {
-  /** A graph on both engines, with the texts of the statements that write which smaltdb is given. */
+  /** A graph on both engines. */
   function pair() {
     const g = social();
     const b = both(g);
-    const texts = new Set<string>();
-    let tables = b.tables;
-    const db: SmaltdbDatabase = {
-      queryPlan: (stmt, params) => {
-        if ((stmt as { kind: string }).kind === 'write') texts.add(JSON.stringify(stmt));
-        return b.db.queryPlan(stmt, params as never);
-      },
-      get inTransaction() {
-        return b.db.inTransaction;
-      },
-    };
     /** Runs a statement on both engines: the same rows and counts. */
     const run = (cypher: string, params: Record<string, unknown> = {}) => {
       const mine = g.run(cypher, params);
-      const theirs = runOnSmaltdb(db, compile(cypher).plan, tables, { params });
-      tables = theirs.tables;
+      const theirs = runOnSmaltdb(b.db, cypher, { params });
       expect(theirs.rows, cypher).toEqual(mine.rows);
       expect(theirs.counts, cypher).toEqual(mine.counts);
     };
-    const graph = () => expect(onSmaltdb(b.db, tables, 'MATCH (n) RETURN labels(n) AS l, properties(n) AS p ORDER BY id(n)')).toEqual(g.query('MATCH (n) RETURN labels(n) AS l, properties(n) AS p ORDER BY id(n)'));
-    return { run, graph, statements: () => texts.size };
+    const graph = () => expect(onSmaltdb(b.db, 'MATCH (n) RETURN labels(n) AS l, properties(n) AS p ORDER BY id(n)')).toEqual(g.query('MATCH (n) RETURN labels(n) AS l, properties(n) AS p ORDER BY id(n)'));
+    return { run, graph };
   }
 
   test('a MERGE of a node that is there: the same statement for every name', () => {
     const p = pair();
-    p.run("MERGE (n:Person {name: 'Ada'})");
-    expect(p.statements()).toBe(1);
-    for (const name of ['Alan', 'Grace', 'Edsger']) p.run(`MERGE (n:Person {name: '${name}'})`);
-    expect(p.statements()).toBe(1);
+    expect(bound(() => p.run("MERGE (n:Person {name: 'Ada'})"))).toBe(1);
+    expect(bound(() => ['Alan', 'Grace', 'Edsger'].forEach((name) => p.run(`MERGE (n:Person {name: '${name}'})`)))).toBe(0);
     // With a RETURN it is another statement, one for every name again: the same rows as smaltcy's.
-    for (const name of ['Ada', 'Barbara', 'Nobody']) p.run(`MERGE (n:Person {name: '${name}'}) RETURN n.born AS born`);
-    expect(p.statements()).toBe(2);
+    expect(bound(() => ['Ada', 'Barbara', 'Nobody'].forEach((name) => p.run(`MERGE (n:Person {name: '${name}'}) RETURN n.born AS born`)))).toBe(1);
     p.graph();
   });
 
   test('a SET of a node found by a value: the same statement for every value', () => {
     const p = pair();
-    p.run("MATCH (n:Person) WHERE n.name = 'Ada' AND n.born < 1900 SET n.seen = 1 RETURN count(*) AS c");
-    expect(p.statements()).toBe(1);
-    p.run("MATCH (n:Person) WHERE n.name = 'Grace' AND n.born < 1950 SET n.seen = 2 RETURN count(*) AS c");
-    expect(p.statements()).toBe(1);
+    expect(bound(() => p.run("MATCH (n:Person) WHERE n.name = 'Ada' AND n.born < 1900 SET n.seen = 1 RETURN count(*) AS c"))).toBe(1);
+    expect(bound(() => p.run("MATCH (n:Person) WHERE n.name = 'Grace' AND n.born < 1950 SET n.seen = 2 RETURN count(*) AS c"))).toBe(0);
     p.graph();
   });
 
@@ -296,29 +260,19 @@ describe("a write's values are parameters of the statement it runs", () => {
   });
 });
 
-describe('a shape is for the graph as it is: labels, types and indexes that come later', () => {
-  /** Runs a statement on both engines and keeps the tables `runOnSmaltdb` gives back. */
+describe('a statement kept is for the graph as it is: labels, types and indexes that come later', () => {
+  /** A graph on both engines, written and read in step. */
   class Pair {
     readonly g: Graph = open();
-    readonly db: SmaltdbDatabase;
-    readonly prepared: () => number;
-    tables: GraphTables;
-
-    constructor() {
-      const b = both(this.g);
-      const c = counting(b.db);
-      this.db = c.db;
-      this.prepared = c.prepared;
-      this.tables = b.tables;
-    }
+    readonly db: Database = both(this.g).db;
 
     write(cypher: string): void {
       this.g.run(cypher);
-      this.tables = runOnSmaltdb(this.db, compile(cypher).plan, this.tables).tables;
+      runOnSmaltdb(this.db, cypher);
     }
 
     same(cypher: string): void {
-      expect(onSmaltdb(this.db, this.tables, cypher), cypher).toEqual(this.g.query(cypher));
+      expect(onSmaltdb(this.db, cypher), cypher).toEqual(this.g.query(cypher));
     }
   }
 
@@ -340,14 +294,10 @@ describe('a shape is for the graph as it is: labels, types and indexes that come
     const q = (i: number) => `MATCH (n:N) WHERE n.i > ${i} RETURN count(n) AS c, sum(n.half) AS odd`;
     p.same(q(5));
     p.write('MATCH (n:N) WHERE n.i > 15 DETACH DELETE n');
-    // The writes keep statements of their own (test/smaltdb-kept-writes.test.ts): the read prepares no other.
-    let before = p.prepared();
-    p.same(q(5));
-    expect(p.prepared()).toBe(before);
+    // A write of rows changes no table's definition: nothing is bound again for the read.
+    expect(bound(() => p.same(q(5)))).toBe(0);
     p.write('MATCH (n:N) WHERE n.i < 3 SET n.i = 100');
-    before = p.prepared();
-    p.same(q(10));
-    expect(p.prepared()).toBe(before);
+    expect(bound(() => p.same(q(10)))).toBe(0);
   });
 
   test('an index made after the query first ran, and dropped again', () => {

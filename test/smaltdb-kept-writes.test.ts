@@ -1,59 +1,37 @@
 import { describe, expect, test } from 'vitest';
 import type { Database } from 'smaltdb-src/engine/database.js';
-import { compile } from '../src/cypher/index.js';
 import { Unsupported } from '../src/smaltdb/compile.js';
-import { keptShapes } from '../src/smaltdb/shape.js';
 import { runOnSmaltdb, type SmaltdbDatabase } from '../src/smaltdb/write.js';
+import { binds } from './helpers/smaltdb.js';
 import { WRITE_CASES } from './helpers/write-cases.js';
-import { type Pair, start as startPair } from './helpers/write-pair.js';
+import { type Pair, start } from './helpers/write-pair.js';
 
 /**
- * Writes kept by their shape (src/smaltdb/write.ts; ADR 0004, "Writes"). The smaltdb statement a Cypher write compiles
- * to is kept for the write's shape, prepared, with the write's values as its parameters, and the next write of the
- * shape runs it. Whether a write runs a statement made for it or one kept, it must give the rows and counts smaltcy's
- * engine gives and leave the same graph: `Pair.run` checks that after each one.
+ * Writes kept by their shape (ADR 0004, "Writes" and "A language of smaltdb"). smaltdb keeps what a Cypher write bound
+ * to, with the write's values as its parameters, and the next write of the shape runs it: the language binds nothing
+ * for it (`binds`). Whether a write runs what was bound for it or what was kept, it must give the rows and counts
+ * smaltcy's engine gives and leave the same graph: `Pair.run` checks that after each one.
  */
 
-const start = (graph: 'empty' | 'social', through?: (db: Database) => SmaltdbDatabase): Pair => startPair(graph, through);
-
-/** A smaltdb database that counts the statements it is asked to prepare. */
-function counting(counter: { n: number }): (db: Database) => SmaltdbDatabase {
-  return (db) => ({
-    queryPlan: (stmt, params) => db.queryPlan(stmt, params as never),
-    preparePlan: (stmt) => {
-      counter.n++;
-      return db.preparePlan(stmt);
-    },
-    get inTransaction() {
-      return db.inTransaction;
-    },
-  });
-}
-
-/** A smaltdb database that counts the statements it runs: those given as plans and those it prepared. */
+/** A smaltdb database that counts the statements it is given: Cypher texts and plans. */
 function countingRuns(counter: { n: number }): (db: Database) => SmaltdbDatabase {
   return (db) => ({
+    query: (text, params, options) => {
+      counter.n++;
+      return db.query(text, params, options);
+    },
     queryPlan: (stmt, params) => {
       counter.n++;
       return db.queryPlan(stmt, params as never);
     },
-    preparePlan: (stmt) => {
-      const prepared = db.preparePlan(stmt);
-      return { result: (params) => (counter.n++, prepared.result(params)) };
-    },
     get inTransaction() {
       return db.inTransaction;
     },
+    get catalog() {
+      return db.catalog;
+    },
   });
 }
-
-/** A smaltdb database that prepares nothing: every statement goes by its plan. */
-const unprepared = (db: Database): SmaltdbDatabase => ({
-  queryPlan: (stmt, params) => db.queryPlan(stmt, params as never),
-  get inTransaction() {
-    return db.inTransaction;
-  },
-});
 
 describe('the write cases, run again on the graph they leave: by the statement kept for each', () => {
   test.each(WRITE_CASES)('%s', (_name, graph, steps) => {
@@ -62,8 +40,8 @@ describe('the write cases, run again on the graph they leave: by the statement k
     for (let round = 0; round < 3; round++) for (const s of steps) p.run(s.cypher, s.params);
   });
 
-  test.each(WRITE_CASES)('%s, on a database that prepares nothing', (_name, graph, steps) => {
-    const p = start(graph, unprepared);
+  test.each(WRITE_CASES)('%s, on a database that keeps no statement', (_name, graph, steps) => {
+    const p = start(graph, undefined, { statementCacheSize: 0 });
     for (let round = 0; round < 2; round++) for (const s of steps) p.run(s.cypher, s.params);
   });
 });
@@ -98,58 +76,62 @@ const SHAPES: readonly [string, 'empty' | 'social', { first?: readonly string[];
 
 describe('a write with other values runs the statement kept for its shape', () => {
   test.each(SHAPES)('%s', (_name, graph, shape) => {
-    const prepared = { n: 0 };
-    const p = start(graph, counting(prepared));
+    const p = start(graph);
     const params = (i: number) => shape.params?.(i) ?? {};
     const run = (i: number) => {
       const texts = shape.text(i);
       for (const cypher of typeof texts === 'string' ? [texts] : texts) p.run(cypher, params(i));
     };
     for (const cypher of shape.first ?? []) p.run(cypher);
-    // The first of the shape makes its statement; one more, for a text whose values are of another kind the second
-    // time (a half that is whole, then not), which is a shape of its own.
+    // The first of the shape is bound; one more, for a text whose values are of another kind the second time (a half
+    // that is whole, then not), which is a shape of its own.
+    const before = binds();
     run(0);
     run(1);
-    const made = prepared.n;
-    expect(made, 'the shape keeps a statement').toBeGreaterThan(0);
+    const made = binds();
+    expect(made, 'the first write of the shape is bound').toBeGreaterThan(before);
     for (let i = 2; i < 9; i++) run(i);
-    expect(prepared.n, 'no statement is made for a write whose shape is kept').toBe(made);
+    expect(binds(), 'nothing is bound for a write whose shape is kept').toBe(made);
   });
 
   test('a value of another kind is another shape, with a statement of its own', () => {
-    const prepared = { n: 0 };
-    const p = start('social', counting(prepared));
+    const p = start('social');
     const set = (v: string) => p.run(`MATCH (p:Person {name: 'Ada'}) SET p.v = ${v} RETURN p.v AS v`);
     set('1');
     set('2');
-    const whole = prepared.n;
+    const whole = binds();
     set('3');
-    expect(prepared.n).toBe(whole);
+    expect(binds()).toBe(whole);
     // A text, then a float: each a shape of its own, kept in turn.
     set("'a'");
-    const text = prepared.n;
-    expect(text).toBeGreaterThan(whole);
+    const text = binds();
+    expect(text).toBe(whole + 1);
     set("'b'");
     set('1.5');
-    const float = prepared.n;
-    expect(float).toBeGreaterThan(text);
+    const float = binds();
+    expect(float).toBe(text + 1);
     set('2.5');
     set('4');
     set("'c'");
-    expect(prepared.n).toBe(float);
+    expect(binds()).toBe(float);
   });
 
-  test('the shapes kept are counted with the reads kept, and the oldest go first', () => {
+  test('smaltdb keeps 256 shapes, and the oldest go first', () => {
     const p = start('empty');
     p.run('CREATE (:N {i: 0})');
-    const before = keptShapes(p.db).shapes;
     // 300 shapes: a write that differs in a property's name.
     for (let i = 0; i < 300; i++) p.run(`MATCH (n:N) SET n.k${i} = ${i}`);
-    expect(keptShapes(p.db).shapes).toBe(256);
-    expect(before).toBeLessThan(256);
-    // A shape that went is made again and runs as before.
-    p.run('MATCH (n:N) SET n.k0 = -1 RETURN n.k0 AS k');
-    p.run('MATCH (n:N) SET n.k0 = -2 RETURN n.k0 AS k');
+    // The newest is kept, and so is the oldest of the 256 left.
+    const kept = binds();
+    p.run('MATCH (n:N) SET n.k299 = -1');
+    p.run('MATCH (n:N) SET n.k45 = -1');
+    expect(binds()).toBe(kept);
+    // One that went is bound again, runs as before, and is kept again.
+    p.run('MATCH (n:N) SET n.k0 = -1');
+    expect(binds()).toBe(kept + 1);
+    p.run('MATCH (n:N) SET n.k0 = -2');
+    expect(binds()).toBe(kept + 1);
+    p.run('MATCH (n:N) RETURN n.k0 AS k0, n.k45 AS k45, n.k299 AS k299');
   });
 });
 
@@ -174,18 +156,21 @@ describe('a label or a type added while a statement runs', () => {
   });
 
   test('a shape kept before a label came runs on, and the graph with the label has shapes of its own', () => {
-    const prepared = { n: 0 };
-    const p = start('social', counting(prepared));
+    const p = start('social');
     const set = (i: number) => p.run(`MATCH (p:Person {name: 'Ada'}) SET p.n = ${i} RETURN p.n AS n`);
     set(1);
+    const first = binds();
     set(2);
+    expect(binds()).toBe(first);
     p.run("MATCH (p:Person {name: 'Alan'}) SET p:Fellow");
-    // The graph's tables are others now: the write is compiled for them once, then kept again.
+    // The graph's tables are others now: smaltdb has the write bound for them once, then keeps that.
+    const before = binds();
     set(3);
-    const after = prepared.n;
+    const after = binds();
+    expect(after).toBe(before + 1);
     set(4);
     set(5);
-    expect(prepared.n).toBe(after);
+    expect(binds()).toBe(after);
   });
 
   test('a statement that adds a label and then fails leaves the graph, and what is kept, as they were', () => {
@@ -196,7 +181,7 @@ describe('a label or a type added while a statement runs', () => {
     // Adds a label, writes, then fails: all of it is undone, the label too.
     const tables = p.tables;
     p.run("MATCH (p:Person {name: 'Ada'}) CREATE (p)-[:OWNS]->(:Never {i: 1}) WITH p MATCH (q:Person {name: 'Alan'}) DELETE q");
-    expect(p.tables).toBe(tables);
+    expect(p.tables).toEqual(tables);
     expect(p.tables.labelTables.has('Never')).toBe(false);
     good(3);
     // The statement that failed runs again, to the same end, and one that works adds the label.
@@ -233,8 +218,8 @@ describe('a write whose rows are of several tables', () => {
 });
 
 describe('a write over many rows, below an operation that reads all its rows first', () => {
-  // `setup` makes the rows; `write` is the statement counted. A write is one smaltdb statement however many rows it
-  // writes (and a look at each table it named for a new label or type), so twice the rows are as many statements.
+  // `setup` makes the rows; `write` is the statement counted. A write is one statement to smaltdb however many rows
+  // it writes, so twice the rows are as many statements.
   const MANY: readonly [string, { setup?: (n: number) => string; write: string | ((n: number) => string) }][] = [
     ['CREATE of nodes', { write: (n) => `UNWIND range(1, ${n}) AS i CREATE (b:Many {i: i}) RETURN count(*) AS c` }],
     ['CREATE of relationships', { setup: (n) => `UNWIND range(1, ${n}) AS i CREATE (:Many {i: i})`, write: 'MATCH (b:Many) CREATE (b)-[:TO {i: b.i}]->(:End {i: b.i}) RETURN count(*) AS c' }],
@@ -245,7 +230,7 @@ describe('a write over many rows, below an operation that reads all its rows fir
     ['DETACH DELETE of nodes', { setup: (n) => `UNWIND range(1, ${n}) AS i CREATE (:Many {i: i})-[:TO]->(:Many {i: -i})`, write: 'MATCH (b:Many) DETACH DELETE b RETURN count(*) AS c' }],
     ['DELETE of relationships', { setup: (n) => `UNWIND range(1, ${n}) AS i CREATE (:Many {i: i})-[:TO]->(:Many {i: -i})`, write: 'MATCH (:Many)-[r:TO]->() DELETE r RETURN count(*) AS c' }],
   ];
-  test.each(MANY)('%s: as many statements for 40 rows as for 20', (_name, { setup, write }) => {
+  test.each(MANY)('%s: one statement for 20 rows, and for 40', (_name, { setup, write }) => {
     const statements = (n: number): number => {
       const ran = { n: 0 };
       const p = start('empty', countingRuns(ran));
@@ -254,9 +239,8 @@ describe('a write over many rows, below an operation that reads all its rows fir
       p.run(typeof write === 'string' ? write : write(n));
       return ran.n;
     };
-    const twenty = statements(20);
-    expect(twenty).toBeGreaterThan(0);
-    expect(statements(40)).toBe(twenty);
+    expect(statements(20)).toBe(1);
+    expect(statements(40)).toBe(1);
   });
 });
 
@@ -302,7 +286,7 @@ describe('errors, with a statement kept', () => {
     const p = start('empty');
     const create = 'CREATE (n:V {a: $a, b: $b}) RETURN n.a AS a, n.b AS b';
     p.run(create, { a: 1, b: 2 });
-    for (let i = 0; i < 2; i++) expect(() => runOnSmaltdb(p.db, compile(create).plan, p.tables, { params: { a: 3 } })).toThrow(Unsupported);
+    for (let i = 0; i < 2; i++) expect(() => runOnSmaltdb(p.db, create, { params: { a: 3 } })).toThrow(Unsupported);
     p.run(create, { a: 4, b: 5 });
     p.run('MATCH (n:V) RETURN count(*) AS c');
   });
@@ -392,7 +376,7 @@ describe('values of every kind, written by a statement kept', () => {
     const p = start('empty');
     p.run('CREATE (:V {v: $v})', { v: 1 });
     for (const v of [[1, 'a'], [], { a: 1 }]) {
-      for (let i = 0; i < 2; i++) expect(() => runOnSmaltdb(p.db, compile('CREATE (:V {v: $v, w: 1})').plan, p.tables, { params: { v } }), JSON.stringify(v)).toThrow(Unsupported);
+      for (let i = 0; i < 2; i++) expect(() => runOnSmaltdb(p.db, 'CREATE (:V {v: $v, w: 1})', { params: { v } }), JSON.stringify(v)).toThrow(Unsupported);
     }
     // Alone, a parameter is the value it holds: a list is a property.
     p.run('MATCH (n:V) SET n.v = $v RETURN n.v AS v', { v: [1, 'a'] });

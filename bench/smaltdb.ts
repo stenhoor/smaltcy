@@ -1,20 +1,24 @@
 /**
  * The same queries as bench/run.ts on smaltcy's MemoryStore and on smaltdb (the compiler to smaltdb plans, ADR 0004;
- * smaltdb ADR 0033 step 8), over the same generated network. Rows must agree; times are medians and include compiling
- * the Cypher, as Graph.run's include parsing and planning. `npm run bench:smaltdb`; BENCH_PEOPLE, BENCH_ROUNDS
+ * smaltdb ADR 0033 step 8), over the same generated network. Rows must agree; times are medians. Each run gives the
+ * engine the query's text: smaltcy's parses and plans it each time, and smaltdb, which Cypher is registered with as a
+ * language, keeps what a text it has seen bound to. `npm run bench:smaltdb`; BENCH_PEOPLE, BENCH_ROUNDS
  * (bench/timing.ts) and BENCH_INDEXES (smaltcy's property indexes on smaltdb too) size and shape it. Every query here is one text run again and again; bench/vary.ts runs statements that
  * differ each time. Method: docs/research/benchmarks.md.
  */
 import { writeFileSync, mkdirSync } from 'node:fs';
 import { Database } from 'smaltdb-src/engine/database.js';
-import { compile } from '../src/cypher/index.js';
+import { registerLanguage } from 'smaltdb-src/engine/plan/language.js';
 import { network } from '../src/datasets/index.js';
 import { dumpGraph } from '../src/engine/io.js';
 import { open } from '../src/index.js';
+import { cypherLanguage } from '../src/smaltdb/language.js';
 import { graphTablesFor, loadStatements, schemaStatements } from '../src/smaltdb/schema.js';
 import { indexStatement, runOnSmaltdb } from '../src/smaltdb/write.js';
 import { QUERIES } from './queries.js';
 import { METHOD, ROUNDS, rounds, timed } from './timing.js';
+
+registerLanguage(cypherLanguage());
 
 const PEOPLE = Number(process.env.BENCH_PEOPLE ?? 20000);
 let t0 = performance.now();
@@ -37,11 +41,11 @@ const dbLoadMs = performance.now() - t0;
 
 const st = mem.store.stats();
 console.log(`network(${PEOPLE}): ${st.nodes} nodes, ${st.rels} relationships; smaltcy load ${memLoadMs.toFixed(0)} ms, smaltdb load ${dbLoadMs.toFixed(0)} ms`);
-console.log(`${METHOD} (each run includes compiling the Cypher)\n`);
+console.log(`${METHOD} (each run gives the engine the query's text)\n`);
 console.log('query'.padEnd(28), 'smaltcy'.padStart(10), 'smaltdb'.padStart(10), 'ratio'.padStart(8), ' rows');
 
-// As an application runs a query (`runOnSmaltdb`).
-const onDb = (cypher: string) => [...runOnSmaltdb(db, compile(cypher).plan, tables).rows] as unknown[];
+// As an application runs a query (`runOnSmaltdb`): smaltdb is given its text.
+const onDb = (cypher: string) => [...runOnSmaltdb(db, cypher).rows] as unknown[];
 const results: Record<string, { smaltcy: number; smaltdb: number | null; ratio?: number; note?: string }> = {};
 for (const [name, q] of QUERIES) {
   const a = [...mem.run(q).rows] as unknown[];

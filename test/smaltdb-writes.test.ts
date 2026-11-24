@@ -1,7 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import type { Database } from 'smaltdb-src/engine/database.js';
 import type { PlanStatementInput } from 'smaltdb/engine';
-import { compile } from '../src/cypher/index.js';
 import { open } from '../src/index.js';
 import { Unsupported } from '../src/smaltdb/compile.js';
 import { runOnSmaltdb, type SmaltdbDatabase } from '../src/smaltdb/write.js';
@@ -259,7 +258,7 @@ describe('writes refused on smaltdb', () => {
     const labels = p.db.catalog.graph('graph')!.nodes.map((n) => n.label);
     let error: unknown;
     try {
-      runOnSmaltdb(p.db, compile(cypher).plan, p.tables, { params: PARAMS });
+      runOnSmaltdb(p.db, cypher, { params: PARAMS });
     } catch (e) {
       error = e;
     }
@@ -271,47 +270,51 @@ describe('writes refused on smaltdb', () => {
 });
 
 describe('transactions on smaltdb', () => {
-  test('a failing statement rolls back its rows, its new labels and types, and the tables it was given are unchanged', () => {
+  test('a failing statement rolls back its rows and its new labels and types', () => {
     const p = start('social');
     const graph = () => p.db.catalog.graph('graph')!;
     const labels = graph().nodes.map((n) => n.label);
     const types = graph().edges.map((e) => e.type);
     const before = stateIn(p.db, p.tables);
-    const tables = p.tables;
     const cypher = "CREATE (:Brand {x: 1})-[:MADE]->(:Thing) WITH 1 AS x MATCH (q:Person {name: 'Ada'}) DELETE q";
-    expect(() => runOnSmaltdb(p.db, compile(cypher).plan, p.tables)).toThrow(/DETACH/);
+    expect(() => runOnSmaltdb(p.db, cypher)).toThrow(/DETACH/);
     expect(stateIn(p.db, p.tables)).toEqual(before);
     expect(graph().nodes.map((n) => n.label)).toEqual(labels);
     expect(graph().edges.map((e) => e.type)).toEqual(types);
-    expect(tables.labelTables.has('Brand')).toBe(false);
+    expect(p.tables.labelTables.has('Brand')).toBe(false);
     expect(p.db.inTransaction).toBe(false);
   });
 
   test("inside the caller's transaction: the statement's savepoint, then the caller's commit or rollback", () => {
     const p = start('empty');
     p.db.queryPlan({ kind: 'transaction', action: 'begin', mode: 'deferred' });
-    const r = runOnSmaltdb(p.db, compile('CREATE (:A {k: 1})').plan, p.tables);
-    expect(() => runOnSmaltdb(p.db, compile('CREATE (:A {k: 2}) WITH 1 AS x RETURN 1 / 0 AS boom').plan, r.tables)).toThrow();
+    runOnSmaltdb(p.db, 'CREATE (:A {k: 1})');
+    expect(() => runOnSmaltdb(p.db, 'CREATE (:A {k: 2}) WITH 1 AS x RETURN 1 / 0 AS boom')).toThrow();
     expect(p.db.inTransaction).toBe(true);
-    expect(stateIn(p.db, r.tables).nodes.map((n) => n.properties)).toEqual([{ k: 1 }]);
+    expect(stateIn(p.db, p.tables).nodes.map((n) => n.properties)).toEqual([{ k: 1 }]);
     p.db.queryPlan({ kind: 'transaction', action: 'rollback' });
     expect(stateIn(p.db, p.tables).nodes).toEqual([]);
   });
 
   test('a statement that only reads is one query', () => {
     const p = start('social');
-    const r = runOnSmaltdb(p.db, compile("MATCH (n:Person {name: 'Ada'}) RETURN n.born AS b").plan, p.tables);
+    const r = runOnSmaltdb(p.db, "MATCH (n:Person {name: 'Ada'}) RETURN n.born AS b");
     expect(r.rows).toEqual([[1815]]);
-    expect(r.tables).toBe(p.tables);
+    expect(r.counts).toEqual({ nodesCreated: 0, nodesDeleted: 0, relationshipsCreated: 0, relationshipsDeleted: 0, propertiesSet: 0, labelsAdded: 0, labelsRemoved: 0 });
   });
 });
 
 describe('new ids on smaltdb', () => {
-  /** A database that keeps the statements it is given. */
-  function recording(db: Database): { db: SmaltdbDatabase; statements: PlanStatementInput[] } {
+  /** A database that keeps what it is given: the texts of Cypher statements, and the statements given as plans. */
+  function recording(db: Database): { db: SmaltdbDatabase; texts: string[]; statements: PlanStatementInput[] } {
+    const texts: string[] = [];
     const statements: PlanStatementInput[] = [];
     return {
       db: {
+        query: (text, params, options) => {
+          texts.push(text);
+          return db.query(text, params, options);
+        },
         queryPlan: (stmt, params) => {
           statements.push(stmt);
           return db.queryPlan(stmt, params as never);
@@ -319,26 +322,32 @@ describe('new ids on smaltdb', () => {
         get inTransaction() {
           return db.inTransaction;
         },
+        get catalog() {
+          return db.catalog;
+        },
       },
+      texts,
       statements,
     };
   }
   test('smaltdb numbers what a CREATE makes, as smaltcy does: the statement is all it is given', () => {
     const p = start('social');
     const r = recording(p.db);
-    const created = runOnSmaltdb(r.db, compile("CREATE (a:Person {name: 'New'})-[:KNOWS]->(b:City {name: 'Newer'}) RETURN id(a) AS a, id(b) AS b").plan, p.tables);
-    const mine = p.g.run("CREATE (a:Person {name: 'New'})-[:KNOWS]->(b:City {name: 'Newer'}) RETURN id(a) AS a, id(b) AS b");
+    const cypher = "CREATE (a:Person {name: 'New'})-[:KNOWS]->(b:City {name: 'Newer'}) RETURN id(a) AS a, id(b) AS b";
+    const created = runOnSmaltdb(r.db, cypher);
+    const mine = p.g.run(cypher);
     expect(created.rows).toEqual(mine.rows);
-    expect(stateIn(p.db, created.tables)).toEqual(stateOf(p.g));
-    // One statement, the write: none reads a table for its largest id.
-    expect(r.statements.map((s) => (s as { kind: string }).kind)).toEqual(['write']);
+    expect(stateIn(p.db, p.tables)).toEqual(stateOf(p.g));
+    // The statement's text and nothing else: no statement reads a table for its largest id.
+    expect(r.texts).toEqual([cypher]);
+    expect(r.statements).toEqual([]);
   });
 
   test('which ids a statement that fails had taken can differ (ADR 0004, known differences)', () => {
-    const next = (p: Pair, cypher: string) => [p.g.run(cypher).rows, runOnSmaltdb(p.db, compile(cypher).plan, p.tables).rows];
+    const next = (p: Pair, cypher: string) => [p.g.run(cypher).rows, runOnSmaltdb(p.db, cypher).rows];
     const fails = (p: Pair, cypher: string, message: string) => {
       expect(() => p.g.run(cypher), cypher).toThrow(message);
-      expect(() => runOnSmaltdb(p.db, compile(cypher).plan, p.tables), cypher).toThrow(message);
+      expect(() => runOnSmaltdb(p.db, cypher), cypher).toThrow(message);
     };
     // smaltcy makes a write's rows one at a time: the two before the one that fails took their ids. smaltdb computes
     // every row's values before it writes any of them, and took none.
@@ -352,7 +361,7 @@ describe('new ids on smaltdb', () => {
     expect(next(gone, "MATCH (a:Person {name: 'Alan'}), (b:Person {name: 'Grace'}) CREATE (a)-[r:AFTER]->(b) RETURN id(r) AS r")).toEqual([[[9]], [[10]]]);
     // On either, no id is given twice.
     for (const p of [rows, gone]) {
-      const ids = (cypher: string) => (runOnSmaltdb(p.db, compile(cypher).plan, p.tables).rows as number[][]).map((r) => r[0]!);
+      const ids = (cypher: string) => (runOnSmaltdb(p.db, cypher).rows as number[][]).map((r) => r[0]!);
       for (const all of [ids('MATCH (n) RETURN id(n) AS id'), ids('MATCH ()-[r]->() RETURN id(r) AS id')]) expect(new Set(all).size).toBe(all.length);
     }
   });
