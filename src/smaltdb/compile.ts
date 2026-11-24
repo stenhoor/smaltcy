@@ -18,7 +18,7 @@
  */
 import type { plan, PlanColumn, PlanStatementInput } from 'smaltdb/engine';
 import { SmaltcyError, type ErrorCode } from '../errors.js';
-import type { Expr } from '../plan/expr.js';
+import { slotsRead, type Expr } from '../plan/expr.js';
 import type { AggCall, Direction, GraphPlan, Op, Pattern, PatternRel, Projection, SortKey } from '../plan/ops.js';
 import type { GraphTables } from './schema.js';
 
@@ -1002,6 +1002,30 @@ function floatModulo(x: PlanExpr, y: PlanExpr, t: PlanType): PlanExpr {
   );
 }
 
+/**
+ * Whether a plan expression reads a column of its own row, as smaltdb tells a function that is run for each row of
+ * the input beside it (its plan-normalize.ts, `readsInput`): outside any nested plan, and through the kinds of
+ * expression smaltdb looks through. One it doesn't look through counts as reading none.
+ */
+function readsRow(e: PlanExpr): boolean {
+  switch (e.k) {
+    case 'col':
+      return e.depth === 0;
+    case 'call':
+    case 'and':
+    case 'or':
+      return e.args.some(readsRow);
+    case 'cast':
+    case 'not':
+    case 'isNull':
+      return readsRow(e.arg);
+    case 'case':
+      return e.whens.some((w) => readsRow(w.when) || readsRow(w.then)) || readsRow(e.else);
+    default:
+      return false;
+  }
+}
+
 /** Compiles graph plans and expressions over a graph's tables (`compileQuery`; the write compiler in write-plan.ts). */
 export class Compiler {
   readonly paramNames: string[] = [];
@@ -1845,6 +1869,8 @@ export class Compiler {
   }
 
   private unwind(r: Rel, list: Expr, slot: number): Rel {
+    const numbers = this.unwindRange(r, list, slot);
+    if (numbers !== null) return numbers;
     const v = this.expr(list, r.frame);
     if (v.k !== 'value') return unsupported(`UNWIND of ${entity(v)}`);
     const exprs = r.frame.types.map((t, i) => colRef(i, t));
@@ -1864,6 +1890,31 @@ export class Compiler {
     slots.set(slot, { k: 'value', col, type: elem });
     const plan: PlanOp = { op: 'explode', input: { op: 'project', input: r.plan, exprs: [...exprs, v.e] }, column: col, type: v.t, keepNulls: false };
     return { plan, frame: { types: [...r.frame.types, elem], slots } };
+  }
+
+  /**
+   * `UNWIND range(a, b[, step])` where the numbers can be read as rows of smaltdb's `range`, with no list made of them
+   * to take apart again; null where they can't, and the list is unwound as any other. They can from the one row a
+   * statement starts with, where the function's rows are the rows, and beside rows whose columns the arguments read,
+   * where smaltdb runs the function for each row in the rows' order. A NULL argument gives no rows either way, and
+   * an argument that may not be a whole number is refused where `range()` is compiled.
+   */
+  private unwindRange(r: Rel, list: Expr, slot: number): Rel | null {
+    if (list.k !== 'call' || list.fn !== 'range' || list.args.length < 2 || list.args.length > 3) return null;
+    const first = r.plan.op === 'values' && r.plan.rows.length === 1 && r.plan.rows[0]!.length === 0;
+    if (!first && !list.args.some((a) => slotsRead(a).size > 0)) return null;
+    const vs = list.args.map((a) => this.expr(a, r.frame));
+    const args: PlanExpr[] = [];
+    for (const v of vs) {
+      if (v.k !== 'value' || (v.t !== 'int' && v.t !== 'null')) return null;
+      args.push(v.e);
+    }
+    // smaltdb takes a function for one run for each row only where an argument reads the row's own columns.
+    if (!first && !args.some(readsRow)) return null;
+    const numbers: PlanOp = { op: 'source', kind: 'function', name: 'range', args, types: ['int'] };
+    const slots = new Map(r.frame.slots);
+    slots.set(slot, { k: 'value', col: r.frame.types.length, type: 'int' });
+    return { plan: first ? numbers : { op: 'join', kind: 'cross', inputs: [r.plan, numbers], ordered: true }, frame: { types: [...r.frame.types, 'int'], slots } };
   }
 
   private union(op: Extract<Op, { op: 'union' }>, ordered: boolean): Rel {
