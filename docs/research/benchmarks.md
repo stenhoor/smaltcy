@@ -1651,3 +1651,133 @@ What it says:
     ms, which no longer makes strings (7.9 ms over 44,000 statements in a later profile).
   - **What is left to take** is the parse: the Cypher's parse and bind are 284 of the 643 ms now, for a text whose shape
     smaltdb already has. Finding such a statement from its text without parsing it is not built.
+
+## A statement told from its text (2026-11-24)
+
+stenhoor/smaltdb#274. A text that is a known one but for its strings and numbers is not parsed: the language keeps a
+template for its skeleton, the text outside those values, and gives the statement that one was with its own values (ADR
+0004, "A statement told from its text"; `src/smaltdb/template.ts`). It is what the section above ends on. The pin does
+not move.
+
+The same method. Before and now were run in turns in one series, both bundled with the pin's smaltdb source
+(`a315b55`). **Before** is Cypher as a language as the section above has it, smaltcy's `main` at `f20703c`: every text
+smaltdb has not kept is parsed. **Now** is this change on it. Four turns each way for the statements that differ and for
+the writes, three for the reads with the same text. A ratio is smaltdb's time over the time of smaltcy's in-memory
+engine on the same Cypher; the bar is 1.00x. (The series was first run before the section above was merged, on the
+branch of stenhoor/smaltdb#305, and read as this one does: 19 of the 23 under the bar with a literal. The tables are
+the runs after the merge.)
+
+The runs this is about are those whose text is new, which the benchmarks have with a literal that differs. There the
+first statement of a case is parsed, the second makes the template, and the others are told from their text: in every
+case the 200 that are timed are (counted: 218 of a case's 220, and 216 where whole numbers and floats are two
+templates). With the same text, and with one text and a parameter, smaltdb finds the text, and the language is not
+asked.
+
+**Statements that differ** (`BENCH_ENTRY=bench/vary.ts`; four turns before, four now; the median of the four turns, with
+the lowest and the highest):
+
+| Statement | Before: a literal | Now: a literal | Before: a parameter | Now: a parameter |
+|---|---|---|---|---|
+| seek by name | 1.07x (1.05 to 1.11) | 0.47x (0.42 to 0.48) | 0.32x (0.30 to 0.33) | 0.32x (0.30 to 0.33) |
+| 1 hop | 0.58x (0.52 to 0.61) | 0.30x (0.28 to 0.33) | 0.22x (0.17 to 0.23) | 0.18x (0.17 to 0.26) |
+| 2 hops | 0.35x (0.32 to 0.36) | 0.23x (0.21 to 0.23) | 0.20x (0.20 to 0.22) | 0.20x (0.18 to 0.21) |
+| 3 hops | 0.23x (0.23 to 0.25) | 0.21x (0.21 to 0.24) | 0.23x (0.21 to 0.24) | 0.21x (0.21 to 0.23) |
+| 3 hops, directed | 0.27x (0.26 to 0.29) | 0.21x (0.19 to 0.23) | 0.20x (0.19 to 0.22) | 0.21x (0.20 to 0.22) |
+| 2 hops to a label | 0.18x (0.17 to 0.19) | 0.14x (0.12 to 0.15) | 0.12x (0.12 to 0.13) | 0.12x (0.12 to 0.13) |
+| 2 hops, relationship filter | 0.69x (0.63 to 0.74) | 0.52x (0.50 to 0.55) | 0.50x (0.44 to 0.50) | 0.46x (0.43 to 0.53) |
+| var-length 1..3, distinct | 0.42x (0.39 to 0.44) | 0.40x (0.39 to 0.40) | 0.39x (0.36 to 0.42) | 0.40x (0.38 to 0.40) |
+| shortest path | 0.10x (0.09 to 0.10) | 0.08x (0.08 to 0.08) | 0.11x (0.10 to 0.11) | 0.10x (0.09 to 0.10) |
+| shortest path, directed | 0.82x (0.74 to 0.86) | 0.39x (0.39 to 0.41) | 0.24x (0.22 to 0.27) | 0.21x (0.21 to 0.23) |
+| shortest path, none | 0.17x (0.17 to 0.18) | 0.17x (0.16 to 0.17) | 0.17x (0.16 to 0.18) | 0.17x (0.16 to 0.17) |
+| label scan + filter | 0.50x (0.46 to 0.54) | 0.46x (0.44 to 0.49) | 0.31x (0.26 to 0.35) | 0.33x (0.32 to 0.35) |
+| node of a small label | 0.94x (0.81 to 0.99) | 0.53x (0.49 to 0.55) | 0.46x (0.42 to 0.49) | 0.45x (0.42 to 0.48) |
+| create 1 node | 2.20x (2.11 to 2.30) | 1.54x (1.53 to 1.57) | 1.39x (1.33 to 1.43) | 1.27x (1.24 to 1.30) |
+| create 1,000 nodes | 1.58x (1.51 to 1.64) | 1.47x (1.44 to 1.51) | 1.45x (1.40 to 1.60) | 1.39x (1.32 to 1.57) |
+| create 1 relationship | 1.38x (1.33 to 1.90) | 0.93x (0.89 to 0.96) | 0.73x (0.69 to 0.75) | 0.72x (0.70 to 0.76) |
+| create 1,000 relationships | 0.85x (0.80 to 0.88) | 0.79x (0.71 to 0.83) | 0.80x (0.77 to 0.81) | 0.77x (0.72 to 0.86) |
+| set 1 property by name | 1.39x (1.26 to 1.46) | 0.87x (0.71 to 0.89) | 0.60x (0.59 to 0.62) | 0.60x (0.55 to 0.63) |
+| set 1,000 properties | 5.58x (5.47 to 5.78) | 5.47x (5.27 to 5.54) | 5.28x (5.12 to 5.52) | 5.33x (5.18 to 5.44) |
+| merge existing node | 1.19x (1.17 to 1.24) | 0.89x (0.85 to 0.92) | 0.65x (0.63 to 0.67) | 0.65x (0.62 to 0.70) |
+| merge 1,000 new nodes | 0.16x (0.16 to 0.16) | 0.15x (0.15 to 0.16) | 0.15x (0.15 to 0.15) | 0.15x (0.15 to 0.15) |
+| delete 1 node | 1.06x (0.92 to 1.08) | 0.67x (0.65 to 0.69) | 0.63x (0.60 to 0.65) | 0.62x (0.58 to 0.64) |
+| delete 1,000 nodes | 1.52x (1.50 to 1.60) | 1.46x (1.44 to 1.50) | 1.48x (1.34 to 1.55) | 1.48x (1.37 to 1.52) |
+
+**The same text every run: writes** (`BENCH_ENTRY=bench/writes.ts`; four turns before, four now):
+
+| Write | Before | Now | smaltdb before, now (ms, medians) |
+|---|---|---|---|
+| create 1 node | 0.82x, 0.88x, 0.89x, 0.81x | 0.87x, 0.86x, 0.85x, 0.74x | 0.006, 0.007 |
+| create 1,000 nodes | 1.14x, 1.27x, 1.10x, 1.15x | 1.19x, 1.12x, 1.26x, 1.16x | 1.41, 1.42 |
+| create 1 relationship | 0.64x, 0.62x, 0.64x, 0.64x | 0.62x, 0.60x, 0.62x, 0.66x | 0.009, 0.009 |
+| create 1,000 relationships | 0.65x, 0.66x, 0.70x, 0.67x | 0.64x, 0.67x, 0.66x, 0.66x | 1.40, 1.40 |
+| set 1 property by name | 0.44x, 0.46x, 0.42x, 0.44x | 0.45x, 0.46x, 0.45x, 0.47x | 0.005, 0.005 |
+| set 1,000 properties | 1.87x, 2.09x, 2.31x, 2.12x | 1.84x, 2.10x, 2.03x, 1.87x | 1.55, 1.53 |
+| merge existing node | 0.48x, 0.46x, 0.48x, 0.50x | 0.50x, 0.49x, 0.49x, 0.49x | 0.005, 0.006 |
+| merge 1,000 new nodes | 0.15x, 0.15x, 0.14x, 0.15x | 0.15x, 0.16x, 0.16x, 0.15x | 2.18, 2.17 |
+| delete 1,000 nodes | 1.51x, 1.51x, 1.50x, 1.39x | 1.44x, 1.46x, 1.47x, 1.51x | 0.933, 0.947 |
+
+**The same text every run: reads** (`BENCH_INDEXES=1`; three turns before, three now; the times are the medians of the
+three turns now):
+
+| Query | Before | Now | smaltcy, smaltdb now (ms) |
+|---|---|---|---|
+| seek by name | 0.29x, 0.26x, 0.25x | 0.25x, 0.26x, 0.26x | 0.019, 0.006 |
+| 1 hop | 0.21x, 0.21x, 0.23x | 0.23x, 0.22x, 0.22x | 0.036, 0.008 |
+| 2 hops | 0.20x, 0.22x, 0.21x | 0.23x, 0.22x, 0.22x | 0.370, 0.083 |
+| 3 hops | 0.17x, 0.15x, 0.17x | 0.16x, 0.16x, 0.15x | 6.41, 1.05 |
+| 1 hop, directed | 0.23x, 0.21x, 0.22x | 0.22x, 0.21x, 0.21x | 0.029, 0.006 |
+| 3 hops, directed | 0.18x, 0.17x, 0.17x | 0.16x, 0.18x, 0.17x | 2.85, 0.506 |
+| 2 hops to a label | 0.14x, 0.14x, 0.14x | 0.14x, 0.16x, 0.15x | 0.874, 0.136 |
+| 2 hops, relationship filter | 0.44x, 0.44x, 0.42x | 0.41x, 0.44x, 0.42x | 0.691, 0.309 |
+| var-length 1..3, distinct | 0.36x, 0.37x, 0.37x | 0.39x, 0.38x, 0.37x | 18.22, 7.04 |
+| shortest path | 0.20x, 0.23x, 0.21x | 0.21x, 0.22x, 0.21x | 0.050, 0.010 |
+| shortest path, 5 hops | 0.11x, 0.12x, 0.12x | 0.12x, 0.13x, 0.11x | 45.70, 5.77 |
+| shortest path, none (out) | 0.29x, 0.26x, 0.27x | 0.25x, 0.26x, 0.25x | 0.030, 0.007 |
+| shortest path, none (all) | 0.17x, 0.18x, 0.18x | 0.17x, 0.18x, 0.17x | 47.53, 8.32 |
+| label scan + filter | 0.30x, 0.33x, 0.34x | 0.32x, 0.35x, 0.33x | 2.52, 0.914 |
+| small label + filter | 0.26x, 0.28x, 0.27x | 0.29x, 0.28x, 0.27x | 0.014, 0.003 |
+| small label | 0.46x, 0.48x, 0.49x | 0.47x, 0.50x, 0.51x | 0.009, 0.004 |
+| group by city | 0.51x, 0.44x, 0.49x | 0.49x, 0.50x, 0.48x | 30.36, 14.48 |
+| all relationships | 0.10x, 0.09x, 0.09x | 0.09x, 0.09x, 0.09x | 22.08, 2.18 |
+| triangles (bounded) | 0.31x, 0.28x, 0.28x | 0.27x, 0.29x, 0.28x | 18.24, 5.20 |
+
+**The two ways in one process**, on smaltdb alone (the pin's source): Cypher registered twice, with templates and
+without, each on a database of its own with the same graph, taking turns in blocks of 100 statements. Three runs of 60
+pairs of blocks; a run's figure is the median of its pairs' ratios, with templates over without, and a range is the
+lowest and the highest of the three runs. The µs are the lowest of the runs' medians.
+
+| Statement | A new text each time | Its µs: parsed, told | The same text | One text, a parameter | The same language on both sides |
+|---|---|---|---|---|---|
+| seek by name | 0.34x to 0.36x | 12.9, 4.5 | 0.95x to 1.04x | 0.98x to 1.00x | 0.98x to 1.03x |
+| 1 hop | 0.35x | 17.1, 6.1 | 0.99x to 1.01x | 0.97x to 1.02x | 0.98x to 1.01x |
+| 2 hops | 0.46x to 0.47x | 26.4, 12.2 | 0.98x to 1.00x | 0.96x to 1.03x | 0.99x to 1.03x |
+| node of a small label | 0.64x to 0.66x | 20.8, 13.5 | 1.00x | 1.00x to 1.01x | 1.00x to 1.02x |
+| create 1 node | 0.53x to 0.56x | 12.0, 6.5 | 0.94x to 1.01x | 0.99x to 1.01x | 1.00x to 1.01x |
+| create 1 relationship | 0.50x to 0.51x | 27.3, 13.4 | 0.98x to 1.00x | 0.96x to 1.03x | 0.96x to 1.02x |
+| set 1 property by name | 0.52x to 0.54x | 18.2, 9.0 | 0.97x to 1.01x | 0.99x to 1.02x | 0.99x to 1.02x |
+| merge existing node | 0.53x to 0.58x | 11.3, 6.3 | 1.00x to 1.02x | 0.97x to 1.01x | 0.99x to 1.03x |
+
+What it says:
+
+- **With a literal that differs, 19 of the 23 are under the bar** (14 before, and one at it), and 14 lines have every
+  turn now under every turn before. Under it now where they were over it or at it: seek by name 1.05x to 1.11x before
+  and 0.42x to 0.48x now, creating 1 relationship 1.33x to 1.90x and 0.89x to 0.96x, setting 1 property 1.26x to 1.46x
+  and 0.71x to 0.89x, merging a node that is there 1.17x to 1.24x and 0.85x to 0.92x, deleting 1 node 0.92x to 1.08x and
+  0.65x to 0.69x. The reads that take least were under it and are further under: 1 hop 0.52x to 0.61x and 0.28x to
+  0.33x, a node of a small label 0.81x to 0.99x and 0.49x to 0.55x, a shortest path with a direction 0.74x to 0.86x and
+  0.39x to 0.41x.
+- **Over the bar with a literal: the four that are over it with a parameter.** Creating 1 node 2.11x to 2.30x before and
+  1.53x to 1.57x now (1.24x to 1.30x with a parameter), and three writes of 1,000 rows, where they were: creating 1,000
+  nodes 1.44x to 1.51x, setting 1,000 properties 5.27x to 5.54x, deleting 1,000 nodes 1.44x to 1.50x. What is left over
+  the bar is smaltdb's run of those statements, with any text. (The pin is smaltdb before stenhoor/smaltdb#307 and
+  stenhoor/smaltdb#308, which are for setting 1,000 properties.)
+- **A statement told from its text still costs more than one whose text smaltdb has:** seek by name 0.42x to 0.48x with
+  a literal and 0.30x to 0.33x with a parameter, setting 1 property 0.71x to 0.89x and 0.55x to 0.63x. The text is
+  scanned for its values, a statement is made for it, and smaltdb looks its shape up.
+- **Nothing else moved.** With the same text all 28 lines' turns overlap before and now. With a parameter 22 of the 23
+  do; creating 1 node read 1.33x to 1.43x before and 1.24x to 1.30x now, with smaltdb's own time 0.017 to 0.018 ms both
+  ways: the difference is in the times of smaltcy's engine. Nothing of this change runs for a text smaltdb has.
+- **In one process the two ways are compared with each other**, on smaltdb alone: a statement told from its text takes
+  0.34x to 0.66x of the time of one that is parsed (seek by name 12.9 and 4.5 µs, creating 1 node 12.0 and 6.5 µs). With
+  the same text it is 0.94x to 1.04x, with a parameter 0.96x to 1.03x, and with the same language on both sides 0.96x to
+  1.03x, which is the harness's own noise.

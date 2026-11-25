@@ -63,10 +63,11 @@ and `packed.json` are deleted and the pin becomes a dependency.
 its plans as data, so smaltdb is not a runtime dependency; it isn't an entry point yet, and the build leaves it out.
 Cypher is a language registered with smaltdb (`cypherLanguage`, `src/smaltdb/language.ts`): whoever has the engine
 registers it (the tests in `test/helpers/smaltdb.ts`, each benchmark at its top), and `runOnSmaltdb` gives smaltdb a
-statement's text. smaltdb keeps statements; nothing here does. Tests run smaltdb from the source in its packed build
-(`smaltdb-src/…`, aliased in `vitest.config.ts`). `test/smaltdb-differential.test.ts`
-runs the Cypher read cases on both engines: a case the compiler can't compile yet is listed there, and refused with
-`Unsupported`, never answered differently.
+statement's text. smaltdb keeps what statements bind to; the language keeps only what a text's skeleton parses to
+(`src/smaltdb/template.ts`), and every statement a test runs on smaltdb is checked against a parse of its text. Tests
+run smaltdb from the source in its packed build (`smaltdb-src/…`, aliased in `vitest.config.ts`).
+`test/smaltdb-differential.test.ts` runs the Cypher read cases on both engines: a case the compiler can't compile yet is
+listed there, and refused with `Unsupported`, never answered differently.
 
 ## Layers and rules
 

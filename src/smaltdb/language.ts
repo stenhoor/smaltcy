@@ -3,7 +3,7 @@
  * section 4). Registered (`registerLanguage(cypherLanguage())`, from `smaltdb/language`), smaltdb's entry points that
  * take a statement's text take Cypher: `db.query(text, params, { language: 'cypher' })`.
  *
- * Nothing here runs a statement or keeps one: smaltdb does both. It keeps what a statement bound to
+ * Nothing here runs a statement or keeps what one bound to: smaltdb does both. It keeps what a statement bound to
  *
  * - **by its text:** a text it has seen is not parsed again;
  * - **by its shape** (shape.ts): a statement that differs from one it has seen in its strings and numbers runs what
@@ -15,6 +15,9 @@
  * graph's tables as smaltdb's catalog has them when it binds. smaltdb binds a statement again when the schema changes,
  * so a statement kept from before a label, a type or an index was added reads the graph as it is.
  *
+ * A statement whose text is new is parsed, which is where its shape comes from: unless its text is a known one but for
+ * its strings and numbers (template.ts), when it is told from the text, with its own values, and not parsed.
+ *
  * Refused (`Unsupported`): `EXPLAIN`, which smaltdb answers for its own plans; and `AT VERSION` and `AT TIME`. The
  * version such a statement reads is found before it is compiled (write.ts, `runOnSmaltdb`, which runs it), and a
  * statement given to smaltdb as text has nothing to find it with.
@@ -25,6 +28,7 @@ import type { GraphPlan, QueryPlan } from '../plan/ops.js';
 import { compileQuery, paramKind, Unsupported } from './compile.js';
 import { graphTablesIn, LANGUAGE } from './schema.js';
 import { HOLE, holedPlan, MAX_HOLES, statementShape } from './shape.js';
+import { Templates } from './template.js';
 import { compileWrite, writes } from './write-plan.js';
 import { indexStatement } from './write.js';
 
@@ -76,9 +80,11 @@ class CypherStatement implements LanguageStatement, StatementShape {
     /** Those of its parameters whose values are part of what it compiles to (a SKIP's or a LIMIT's count). */
     private readonly pinned: readonly string[],
     asWritten: boolean,
+    /** `paramNames`, where a statement with these parameters has made it. */
+    paramNames?: ReadonlyMap<string, number>,
   ) {
     this.paramCount = names.length;
-    this.paramNames = names.length === 0 ? NO_NAMES : new Map(names.map((name, i) => [`$${name}`, i + 1]));
+    this.paramNames = paramNames ?? (names.length === 0 ? NO_NAMES : new Map(names.map((name, i) => [`$${name}`, i + 1])));
     if (values.length > 0 && values.length <= MAX_HOLES && !asWritten) this.shape = this;
     if (names.length > 0) this.variant = this.kinds;
   }
@@ -86,6 +92,8 @@ class CypherStatement implements LanguageStatement, StatementShape {
   same(other: LanguageStatement): boolean {
     const mine = this.tokens;
     const theirs = (other as Partial<CypherStatement>).tokens;
+    // The statements told from one template's texts share their tokens.
+    if (theirs === mine) return true;
     if (theirs === undefined || theirs.length !== mine.length) return false;
     for (let i = 0; i < mine.length; i++) if (theirs[i] !== mine[i]) return false;
     return true;
@@ -148,13 +156,31 @@ function indexChange(text: string, gp: Extract<GraphPlan, { kind: 'createIndex' 
   return { text, paramCount: 0, paramNames: NO_NAMES, bind: (ctx) => indexStatement(gp, graphTablesIn(ctx.catalog, graph)) };
 }
 
-function statement(text: string, graph: string | undefined): LanguageStatement {
+function statement(text: string, graph: string | undefined, templates: Templates | undefined): LanguageStatement {
+  // A text that is a known one but for its strings and numbers is the statement that one was, with its own values.
+  const told = templates?.tell(text);
+  if (told !== undefined) {
+    const t = told.statement;
+    const st = new CypherStatement(text, t.plan, graph, t.hash, t.tokens, told.values, t.params, t.pinned, false, t.paramNames);
+    t.paramNames ??= st.paramNames;
+    return st;
+  }
   const { plan: gp, explain } = compile(text);
   if (explain) throw new Unsupported('EXPLAIN (smaltdb explains the plan a statement binds to)');
   if (gp.kind !== 'query') return indexChange(text, gp, graph);
   if (gp.asOf) throw new Unsupported('AT VERSION and AT TIME in a statement given to smaltdb as text (runOnSmaltdb finds the version to read, then runs it)');
   const s = statementShape(gp);
+  templates?.parsed(text, gp, s);
   return new CypherStatement(text, gp, graph, s.hash, s.tokens, s.values, s.params, s.pinned, s.asWritten);
+}
+
+/** How a language made by `cypherLanguage` reads its statements. */
+export interface CypherLanguageOptions {
+  /**
+   * Whether a statement is told from its text where that is a known one but for its strings and numbers
+   * (template.ts), and so not parsed. On unless `false`: without it every text smaltdb has not kept is parsed.
+   */
+  readonly templates?: boolean;
 }
 
 /**
@@ -162,12 +188,13 @@ function statement(text: string, graph: string | undefined): LanguageStatement {
  * statements read and write, by name; without it, the database's only graph made for Cypher (schema.ts,
  * `schemaStatements`).
  */
-export function cypherLanguage(graph?: string): SmaltLanguage {
+export function cypherLanguage(graph?: string, options: CypherLanguageOptions = {}): SmaltLanguage {
+  const templates = options.templates === false ? undefined : new Templates();
   return {
     name: LANGUAGE,
     plans: 'data',
-    parseOne: (text) => statement(text, graph),
+    parseOne: (text) => statement(text, graph, templates),
     // A Cypher text is one statement.
-    parse: (text) => [statement(text, graph)],
+    parse: (text) => [statement(text, graph, templates)],
   };
 }
